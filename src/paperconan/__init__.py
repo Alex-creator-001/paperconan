@@ -1,0 +1,12 @@
+"""paperconan — 论文数据 sanity check.
+
+Run on a directory of supplementary source-data xlsx files and surface
+numeric patterns that warrant a closer look (identical columns, byte-identical
+replicates, fixed arithmetic grids, last-digit anomalies, …).
+
+The output is a *signal*, not a verdict — final adjudication belongs to
+journal editors and the original authors. See README for full usage.
+"""
+from ._audit import scan_dir, main  # noqa: F401
+
+__version__ = "0.1.0"
