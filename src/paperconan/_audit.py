@@ -141,6 +141,65 @@ def col_array(rows, r0, r1, c):
     return np.array(out, dtype=float)
 
 
+# ---------- evidence helpers ----------
+
+def _cell_value(v):
+    """JSON-serializable cell value: keep numbers as-is, stringify dates/objects, None stays None."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        return v
+    return str(v)
+
+
+def _block_evidence(rows, r0, r1, c0, c1, header, highlight_cols, highlight_rows=None):
+    """Slice a numeric block (with 1 row of context above/below if available) into a
+    JSON-friendly evidence dict that the HTML renderer can show as a table."""
+    r_start = max(0, r0 - 1)
+    r_end = min(len(rows), r1 + 1)
+    data_rows = []
+    for r in range(r_start, r_end):
+        vals = [_cell_value(rows[r][c]) if c < len(rows[r]) else None for c in range(c0, c1)]
+        data_rows.append({
+            "row_idx": r + 1,
+            "is_context": r < r0 or r >= r1,
+            "values": vals,
+        })
+    return {
+        "headers": list(header),
+        "col_offset": c0,
+        "highlight_cols": list(highlight_cols),
+        "highlight_rows": list(highlight_rows) if highlight_rows else [],
+        "rows": data_rows,
+    }
+
+
+def _attach_evidence(findings, rows, r0, r1, c0, c1, header):
+    """Mutate each finding in-place to add an `evidence` field, derived from the same
+    block coordinates the detector was scanning. Highlight columns come from the
+    finding's own col_*_idx / col_idx fields."""
+    for f in findings:
+        hi_cols = []
+        for k in ("col_a_idx", "col_b_idx", "col_idx"):
+            if k in f and isinstance(f[k], int):
+                hi_cols.append(f[k])
+        hi_rows = []
+        # identical_after_rounding lists specific (row, col) example cells (1-based).
+        for ex in f.get("example_cells", []) or []:
+            try:
+                hi_rows.append(int(ex[0]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        f["evidence"] = _block_evidence(rows, r0, r1, c0, c1, header,
+                                        highlight_cols=hi_cols,
+                                        highlight_rows=hi_rows)
+    return findings
+
+
 # ---------- detectors ----------
 
 def detect_relations(rows, r0, r1, c0, c1, header):
@@ -451,7 +510,7 @@ def detect_cross_sheet_collisions(xlsx_path, min_decimal_places=3):
     return findings
 
 
-def scan_dir(in_dir, out_dir):
+def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
     xlsx_files = sorted(glob.glob(os.path.join(in_dir, "*.xlsx")))
     if not xlsx_files:
         sys.exit(f"no .xlsx files in {in_dir}")
@@ -483,6 +542,8 @@ def scan_dir(in_dir, out_dir):
                 wc = detect_within_column_patterns(rows, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(rows, r0, r1, c0, c1, header)
                 if rel or ap or eq or wc or iar:
+                    for group in (rel, ap, eq, wc, iar):
+                        _attach_evidence(group, rows, r0, r1, c0, c1, header)
                     report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
                                               relations=rel, progressions=ap, equal_pairs=eq,
@@ -507,7 +568,11 @@ def scan_dir(in_dir, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "scan.json"), "w") as fh:
         json.dump(out, fh, indent=2, default=str)
-    write_markdown_report(out, os.path.join(out_dir, "REPORT.md"))
+    if write_md:
+        write_markdown_report(out, os.path.join(out_dir, "REPORT.md"))
+    if write_html:
+        from ._html import write_html_report
+        write_html_report(out, os.path.join(out_dir, "report.html"))
     return out
 
 
@@ -588,10 +653,20 @@ def main():
     ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for fabrication red flags")
     ap.add_argument("in_dir", help="Directory containing the paper's *.xlsx source data files")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")
+    ap.add_argument("--md", action="store_true",
+                    help="Also write REPORT.md (default: only scan.json + report.html)")
+    ap.add_argument("--no-html", action="store_true",
+                    help="Skip the HTML report (only scan.json, plus REPORT.md if --md)")
     args = ap.parse_args()
     out_dir = args.out or os.path.join(args.in_dir, "audit")
-    res = scan_dir(args.in_dir, out_dir)
-    print(f"wrote {out_dir}/scan.json and {out_dir}/REPORT.md")
+    write_html = not args.no_html
+    res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html)
+    outputs = [f"{out_dir}/scan.json"]
+    if write_html:
+        outputs.append(f"{out_dir}/report.html")
+    if args.md:
+        outputs.append(f"{out_dir}/REPORT.md")
+    print("wrote " + ", ".join(outputs))
     print(f"  files: {res['n_files']}, blocks with findings: {res['n_blocks_with_findings']}")
     print(f"  digit anomaly sheets: {len(res['digit_distribution'])}, decimal anomaly sheets: {len(res['decimal_endings'])}")
 

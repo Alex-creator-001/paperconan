@@ -16,7 +16,7 @@
 
 `paperconan` 是一个 **论文数据 sanity check** 小工具。
 
-喂一份 supplementary source data（一个目录，里面装着 `.xlsx`）进去，它会跑十几组数值取证检测器，输出 **scan.json**（结构化的全部命中）+ **REPORT.md**（按严重度排序的人类可读报告），告诉你哪些位置值得人工再看一眼。
+喂一份 supplementary source data（一个目录，里面装着 `.xlsx`）进去，它会跑十几组数值取证检测器，输出 **scan.json**（结构化的全部命中）+ **report.html**（自包含的可交互法证报告，每条 finding 直接嵌可疑表格片段并高亮可疑列/行），告诉你哪些位置值得人工再看一眼。
 
 **适合谁**：
 
@@ -69,26 +69,47 @@ python -m paperconan path/to/paper_dir/
 
 # 输出（默认在 <in_dir>/audit/）：
 #   scan.json      — 完整结构化 findings
-#   REPORT.md      — 排好序的 markdown 报告
+#   report.html    — 自包含的人类可读 HTML 报告（浏览器打开即可）
 #
-# 或显式指定输出目录：
+# 可选：
+paperconan path/to/paper_dir/ --md            # 额外生成 REPORT.md
+paperconan path/to/paper_dir/ --no-html       # 跳过 HTML（CI / 脚本场景）
 paperconan path/to/paper_dir/ --out /tmp/audit-of-this-paper
 ```
 
-REPORT.md 长这样：
+**report.html** 长这样（单文件、无外部依赖、可直接邮件/PubPeer 附件分享）：
 
-```markdown
-# Paper audit · 3 files · 7 sheets · 14 high-severity findings
+- 顶部摘要：n_files / n_sheets / high / medium / low 计数
+- 左侧边栏：按 severity / detector 类型 / 文件 勾选过滤 + 关键字搜索
+- 主区域：每条 finding 是一张可折叠卡片，里面直接渲染出**可疑表格片段**，高亮可疑列（黄底）和高亮行（红边）—— 用户不需要再打开 xlsx 翻位置
+- 末位数字 χ² 异常自带 0-9 inline 直方图
+- 跨 sheet bit-identical collisions 单独成段，最高优先级展示
 
-## ⚠️ Cross-sheet bit-identical collisions (2)
-- **[cross_sheet_position_identical]** (high) `ED_Fig8b.xlsx` …
-- …
+---
 
-## High-severity findings (14)
-- **[many_equal_pairs]** `ED_Fig8b.xlsx::Sheet1` rows 6-15, n=10
-  → `col 27 ≡ col 28 in 9/10 rows; only row 6 differs`
-- …
+## 作为 skill 使用（被 Claude Code / Codex / 其他 agent 调用）
+
+仓库根目录的 [`SKILL.md`](SKILL.md) 是给 agent 看的入口，自带 YAML frontmatter（name + 触发关键词）和怎么解读 `scan.json` 的指引。`skill/references/` 下有：
+
+- [`detectors.md`](skill/references/detectors.md) — 每个检测器的原理 / 典型命中 / **常见误报**
+- [`interpretation.md`](skill/references/interpretation.md) — severity 语义 + "signal not verdict" 红线 + 推荐回复话术
+
+### 安装
+
+```bash
+# 1. 装 CLI
+pip install -e /path/to/paperconan       # 本地开发；发到 PyPI 后改成 pip install paperconan
+
+# 2a. Claude Code: 软链 / 拷贝 SKILL.md 到 skills 目录
+mkdir -p ~/.claude/skills/paperconan
+ln -s /path/to/paperconan/SKILL.md   ~/.claude/skills/paperconan/SKILL.md
+ln -s /path/to/paperconan/skill      ~/.claude/skills/paperconan/skill
+
+# 2b. Codex / 其他 agent: 在 AGENTS.md / CLAUDE.md / GEMINI.md 里引用
+echo '@/path/to/paperconan/SKILL.md' >> AGENTS.md
 ```
+
+之后在 agent 会话里说"我有一篇论文的 source data 在 /path/to/data，帮我做个 sanity check"，agent 会自动调用 paperconan 并按 SKILL.md 的解读规则向你汇报。
 
 ---
 
@@ -166,8 +187,9 @@ REPORT.md 长这样：
 短期：
 
 - [ ] CSV / TSV 输入（目前只支持 xlsx）
-- [ ] HTML 报告（在 REPORT.md 之外）
-- [ ] 把每条 finding 嵌入对应的表格片段截图
+- [x] HTML 报告（在 REPORT.md 之外）— v0.2 已实现，并取代 REPORT.md 成为默认人类可读输出
+- [x] 把每条 finding 嵌入对应的表格片段 — v0.2 实现为可交互 HTML 表格（不是截图）
+- [x] 作为 skill 给 agent 调用 — v0.2 已实现，见 SKILL.md
 - [ ] PubPeer 风格的 "为什么这值得复核" 旁注（LLM 生成的可选）
 
 中长期：

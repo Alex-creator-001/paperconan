@@ -8,5 +8,6 @@ The output is a *signal*, not a verdict — final adjudication belongs to
 journal editors and the original authors. See README for full usage.
 """
 from ._audit import scan_dir, main  # noqa: F401
+from ._html import write_html_report  # noqa: F401
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

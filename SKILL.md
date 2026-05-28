@@ -1,0 +1,120 @@
+---
+name: paperconan
+description: Paper data sanity check — scan supplementary source data (xlsx files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary xlsx and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser.
+---
+
+# paperconan — paper data sanity check
+
+Tool repository: https://github.com/zixixr/paperconan
+
+## When to use
+
+Use this skill when the user:
+
+- Hands over a directory of `.xlsx` supplementary source data and asks for a data integrity / sanity check
+- Wants to prep a PubPeer post and asks you to surface suspicious numeric patterns first
+- Asks about a paper they suspect has fabricated data and wants statistical signal before deciding next step
+- Says things like "帮我看看这篇论文数据有没有问题", "扫一下这个 source data", "查查这些表格的可疑模式", "audit this paper's data"
+
+## When NOT to use
+
+- The concern is image fraud (Western blot, microscopy, gel splicing) — paperconan only inspects numeric tables
+- The data is CSV / TSV / not in `.xlsx` format — current version only reads xlsx
+- The user wants statistical methodology review or peer-review-style scrutiny — paperconan is forensic, not statistical
+
+## Prerequisites
+
+```bash
+pip install paperconan        # from PyPI (when published)
+# OR, from a local clone:
+pip install -e /path/to/paperconan
+```
+
+Verify with `paperconan --help`.
+
+## How to invoke
+
+Single command, takes a directory of xlsx files:
+
+```bash
+paperconan <input-dir>
+# Default output: <input-dir>/audit/scan.json + <input-dir>/audit/report.html
+```
+
+Common variants:
+
+```bash
+paperconan <input-dir> --out /tmp/audit-X     # custom output dir
+paperconan <input-dir> --md                   # also write REPORT.md
+paperconan <input-dir> --no-html              # only scan.json (CI / scripted use)
+```
+
+Exit code is 0 even when findings are present — findings are not errors.
+
+## How to read the output
+
+Three artifacts may exist in the output dir:
+
+| File | Audience | Purpose |
+|---|---|---|
+| `scan.json` | **you (the agent)** | full structured findings — parse this when analyzing |
+| `report.html` | **the user** | self-contained interactive HTML report — tell the user to open it in a browser |
+| `REPORT.md` | optional | markdown report; only present with `--md` |
+
+### scan.json top-level schema
+
+```json
+{
+  "input_dir": "...",
+  "n_files": 3,
+  "n_blocks_with_findings": 8,
+  "relations_blocks": [
+    {
+      "file": "ED_Fig8b.xlsx",
+      "sheet": "Sheet1",
+      "block": {"rows": "6-15", "cols": "1-30", "header": [...]},
+      "relations": [...],              // cross-column relations
+      "progressions": [...],           // arithmetic progressions
+      "equal_pairs": [...],            // pairs of columns with many equal rows
+      "within_col": [...],             // within-column anomalies
+      "identical_after_rounding": [...] // cells matching after rounding
+    }
+  ],
+  "digit_distribution": [...],   // per-sheet last-digit χ² (flag p < 1e-6)
+  "decimal_endings": [...],      // per-sheet two-decimal ending over-representation
+  "cross_sheet_findings": [...]  // bit-identical / value-overlap across sheets in same file
+}
+```
+
+### Every finding has
+
+- `kind`: detector name (see [skill/references/detectors.md](skill/references/detectors.md))
+- `severity`: `"high"` | `"medium"` | `"low"`
+- `rule`: human-readable rule string e.g. `col[27] ≡ col[28] in 9/10 rows`
+- `n`: sample size for the rule
+- `evidence`: block snippet `{headers, rows, highlight_cols, ...}` — used by report.html, but you can also surface a few highlighted values if useful
+
+### What to surface to the user
+
+1. **Cross-sheet findings first.** `cross_sheet_position_identical` is the single most-investigated paperconan signal — same position, same value, across "independent" sheets.
+2. **Group by file, then by severity.** Most users want "which figure should I look at first."
+3. **Always include severity badges in your summary.** Don't flatten `high` and `medium` together.
+4. **Point them to `report.html`.** That file has the actual table snippets with the suspicious cells highlighted — much easier for the user than re-reading xlsx.
+5. **Read [skill/references/interpretation.md](skill/references/interpretation.md)** for the response template and the red lines.
+
+## CRITICAL: signal, not verdict
+
+paperconan output is a **statistical anomaly**, NOT a determination of misconduct. Do not:
+
+- ❌ Say "this paper is fake / fabricated / fraudulent"
+- ❌ Name authors as having "fabricated data"
+- ❌ Suggest the user post accusations on Weibo / Twitter / Zhihu
+- ❌ Use the word "实锤" (rock-solid proof) — it isn't
+
+Do:
+
+- ✅ Report as "N high-severity suspicious patterns" with concrete locations
+- ✅ Surface common false positives (shared controls, dose-axis duplication, count quantization)
+- ✅ Recommend the user verify against figure legend + Methods, then escalate via PubPeer / journal editor / research integrity office
+
+Full response template lives in [skill/references/interpretation.md](skill/references/interpretation.md).

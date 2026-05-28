@@ -1,0 +1,114 @@
+"""End-to-end smoke test for paperconan.
+
+Builds a synthetic xlsx fixture that's designed to trip three core detectors
+and asserts both the scan.json structure and that report.html is well-formed.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+import pytest
+
+# Make tests/build_fixture importable when running pytest from repo root.
+sys.path.insert(0, os.path.dirname(__file__))
+from build_fixture import build  # noqa: E402
+
+from paperconan import scan_dir, write_html_report  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def tiny_paper(tmp_path_factory):
+    d = tmp_path_factory.mktemp("tiny_paper")
+    build(str(d))
+    return str(d)
+
+
+def _collect_kinds(scan: dict) -> set[str]:
+    kinds = set()
+    for blk in scan.get("relations_blocks") or []:
+        for group in ("relations", "progressions", "equal_pairs",
+                      "within_col", "identical_after_rounding"):
+            for f in blk.get(group, []) or []:
+                kinds.add(f["kind"])
+    for cf in scan.get("cross_sheet_findings") or []:
+        kinds.add(cf["kind"])
+    return kinds
+
+
+def test_scan_dir_finds_expected_detectors(tiny_paper, tmp_path):
+    out_dir = tmp_path / "out"
+    res = scan_dir(tiny_paper, str(out_dir))
+
+    assert (out_dir / "scan.json").exists()
+    assert (out_dir / "report.html").exists(), "report.html should be the default output"
+    assert not (out_dir / "REPORT.md").exists(), "REPORT.md should be opt-in via --md"
+
+    kinds = _collect_kinds(res)
+    assert "identical_column" in kinds, f"expected identical_column, got: {kinds}"
+    assert "arithmetic_progression" in kinds, f"expected arithmetic_progression, got: {kinds}"
+    assert "cross_sheet_position_identical" in kinds, \
+        f"expected cross_sheet_position_identical, got: {kinds}"
+
+
+def test_findings_carry_evidence(tiny_paper, tmp_path):
+    out_dir = tmp_path / "out"
+    res = scan_dir(tiny_paper, str(out_dir))
+
+    block_findings = []
+    for blk in res["relations_blocks"]:
+        for group in ("relations", "progressions", "equal_pairs",
+                      "within_col", "identical_after_rounding"):
+            block_findings.extend(blk.get(group, []) or [])
+
+    assert block_findings, "expected at least one block-level finding"
+    for f in block_findings:
+        ev = f.get("evidence")
+        assert ev, f"finding {f['kind']} missing evidence"
+        assert ev["rows"], f"evidence on {f['kind']} has no rows"
+        assert isinstance(ev["highlight_cols"], list)
+        assert ev["headers"], "evidence headers should not be empty"
+
+
+def test_html_report_is_well_formed(tiny_paper, tmp_path):
+    out_dir = tmp_path / "out"
+    scan_dir(tiny_paper, str(out_dir))
+
+    html_path = out_dir / "report.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert html.startswith("<!DOCTYPE html>")
+    assert "<table" in html, "expected at least one evidence table"
+    assert "identical_column" in html
+    assert "cross_sheet_position_identical" in html
+    assert len(html) > 5000, "report seems too small to contain rendered findings"
+
+
+def test_md_flag_writes_report_md(tiny_paper, tmp_path):
+    out_dir = tmp_path / "out"
+    scan_dir(tiny_paper, str(out_dir), write_md=True, write_html=True)
+    assert (out_dir / "REPORT.md").exists()
+    assert (out_dir / "report.html").exists()
+
+
+def test_no_html_flag_skips_html(tiny_paper, tmp_path):
+    out_dir = tmp_path / "out"
+    scan_dir(tiny_paper, str(out_dir), write_md=False, write_html=False)
+    assert (out_dir / "scan.json").exists()
+    assert not (out_dir / "report.html").exists()
+
+
+def test_write_html_report_handles_empty_scan(tmp_path):
+    out_path = tmp_path / "empty.html"
+    write_html_report({
+        "input_dir": "/tmp/nothing",
+        "n_files": 0,
+        "n_blocks_with_findings": 0,
+        "relations_blocks": [],
+        "digit_distribution": [],
+        "decimal_endings": [],
+        "cross_sheet_findings": [],
+    }, str(out_path))
+    html = out_path.read_text(encoding="utf-8")
+    assert "no findings" in html
+    assert "<!DOCTYPE html>" in html
