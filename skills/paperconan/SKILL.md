@@ -1,6 +1,6 @@
 ---
 name: paperconan
-description: Paper data sanity check — scan supplementary source data (.xlsx / .csv / .tsv files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary data tables and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser.
+description: Paper data sanity check — scan supplementary source data (.xlsx / .csv / .tsv files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary data tables and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser, 从数据库下载论文数据, 找源数据, fetch paper data, download source data and analyze.
 ---
 
 # paperconan — paper data sanity check
@@ -55,6 +55,30 @@ paperconan <input-dir> --no-html              # only scan.json (CI / scripted us
 ```
 
 Exit code is 0 even when findings are present — findings are not errors.
+
+## Fetching a paper's data automatically
+
+If the user gives a paper (DOI or title) instead of a local directory:
+
+```bash
+paperconan fetch "<DOI or title>"                 # list candidate datasets + match signals
+paperconan fetch "<DOI>" --download <cand_id> --out data/   # download chosen candidate's tabular files
+paperconan data/                                  # then audit as usual
+```
+
+Workflow:
+1. Run `paperconan fetch "<DOI>"`. Each candidate has `match_signals`
+   (`doi_in_related`, `title_overlap`, `author_overlap`).
+2. **You decide the match** — prefer `doi_in_related: true`; otherwise weigh title/author
+   overlap. If unsure, show the user the candidates and ask.
+3. Download the chosen candidate, then run `paperconan <dir>` on the output.
+
+### Honesty rules (REQUIRED)
+- Searched repositories are Zenodo / Figshare / Dryad only.
+- If a candidate has no `.xlsx/.csv/.tsv`, say so and name the other file types.
+- If nothing matches, tell the user the data may be in journal supplementary
+  (paywalled) or simply not deposited — never imply "checked = clean".
+- Do not bypass paywalls or scrape publisher sites.
 
 ## How to read the output
 
