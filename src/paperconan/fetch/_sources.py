@@ -32,3 +32,21 @@ def search_zenodo(query, size=5):
             [c.get("name") for c in md.get("creators", []) if c.get("name")],
             md.get("publication_date"), all_files, related))
     return out
+
+
+def search_figshare(query, size=5):
+    arts = _http.post_json("https://api.figshare.com/v2/articles/search",
+                           {"search_for": query, "page_size": size})
+    out = []
+    for a in arts[:size]:
+        aid = a.get("id")
+        if aid is None:
+            continue
+        full = _http.get_json(f"https://api.figshare.com/v2/articles/{aid}")
+        all_files = [make_fileref(f.get("name"), f.get("size"), f.get("download_url"))
+                     for f in full.get("files", [])]
+        authors = [au.get("full_name") for au in full.get("authors", []) if au.get("full_name")]
+        out.append(_candidate(
+            "figshare", aid, full.get("doi") or None, full.get("title"),
+            authors, full.get("published_date"), all_files, []))
+    return out
