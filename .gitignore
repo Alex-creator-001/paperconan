@@ -29,3 +29,9 @@ audit/
 *.xlsx
 scan.json
 REPORT.md
+
+# …but the committed demo example is exempt (must come after the rules above)
+!examples/demo_paper/audit/
+!examples/**/*.xlsx
+!examples/**/scan.json
+!examples/**/report.html

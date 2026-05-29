@@ -21,6 +21,7 @@ Dependencies: openpyxl, numpy, scipy
 """
 from __future__ import annotations
 import argparse
+import datetime
 import glob
 import json
 import math
@@ -32,6 +33,15 @@ from fractions import Fraction
 import openpyxl
 import numpy as np
 from scipy import stats
+
+
+def _version():
+    """paperconan version, resolved lazily to avoid an import cycle with __init__."""
+    try:
+        from . import __version__
+        return __version__
+    except Exception:
+        return "unknown"
 
 
 # ---------- value helpers ----------
@@ -513,7 +523,8 @@ def detect_cross_sheet_collisions(xlsx_path, min_decimal_places=3):
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
     xlsx_files = sorted(glob.glob(os.path.join(in_dir, "*.xlsx")))
     if not xlsx_files:
-        sys.exit(f"no .xlsx files in {in_dir}")
+        sys.exit(f"no .xlsx files in {in_dir}\n"
+                 f"(paperconan currently reads only .xlsx — CSV/TSV support is on the roadmap)")
 
     report_blocks = []
     per_sheet_numbers = {}
@@ -558,7 +569,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
         if dec:
             decimal_reports.append(dec)
 
-    out = dict(input_dir=in_dir,
+    out = dict(tool="paperconan",
+               tool_version=_version(),
+               scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+               input_dir=in_dir,
                n_files=len(xlsx_files),
                n_blocks_with_findings=len(report_blocks),
                relations_blocks=report_blocks,
@@ -657,6 +671,7 @@ def main():
                     help="Also write REPORT.md (default: only scan.json + report.html)")
     ap.add_argument("--no-html", action="store_true",
                     help="Skip the HTML report (only scan.json, plus REPORT.md if --md)")
+    ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
     out_dir = args.out or os.path.join(args.in_dir, "audit")
     write_html = not args.no_html
@@ -669,6 +684,8 @@ def main():
     print("wrote " + ", ".join(outputs))
     print(f"  files: {res['n_files']}, blocks with findings: {res['n_blocks_with_findings']}")
     print(f"  digit anomaly sheets: {len(res['digit_distribution'])}, decimal anomaly sheets: {len(res['decimal_endings'])}")
+    if write_html:
+        print(f"\n  → open {out_dir}/report.html in a browser to review findings")
 
 
 if __name__ == "__main__":

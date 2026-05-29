@@ -30,7 +30,11 @@ pip install paperconan        # from PyPI (when published)
 pip install -e /path/to/paperconan
 ```
 
-Verify with `paperconan --help`.
+Verify with `paperconan --help` (or `paperconan --version`).
+
+A complete worked example — synthetic data + the report it produces + a guided
+walkthrough of every finding — lives in [examples/](examples/README.md). Read it
+to see the output shape before running on real data.
 
 ## How to invoke
 
@@ -65,6 +69,9 @@ Three artifacts may exist in the output dir:
 
 ```json
 {
+  "tool": "paperconan",
+  "tool_version": "0.2.0",        // for provenance when the report is archived / shared
+  "scanned_at": "2026-05-29T02:08:53+00:00",
   "input_dir": "...",
   "n_files": 3,
   "n_blocks_with_findings": 8,

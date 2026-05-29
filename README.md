@@ -51,6 +51,12 @@
 
 ---
 
+## 想先看看效果？
+
+[`examples/`](examples/) 里有一份完整的可跑示例：一份**合成的**"假论文" source data（埋了各类造假模式）+ paperconan 跑出来的报告 + 每条 finding 的逐条走查。直接看 [examples/README.md](examples/README.md) 和报告截图 [examples/report-preview.png](examples/report-preview.png)，不装也能感受输出长什么样。
+
+---
+
 ## 安装 & 跑
 
 需要 Python ≥ 3.10。

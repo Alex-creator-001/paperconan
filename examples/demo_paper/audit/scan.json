@@ -1,0 +1,1885 @@
+{
+  "tool": "paperconan",
+  "tool_version": "0.2.0",
+  "scanned_at": "2026-05-29T02:14:05+00:00",
+  "input_dir": "examples/demo_paper",
+  "n_files": 2,
+  "n_blocks_with_findings": 3,
+  "relations_blocks": [
+    {
+      "file": "ED_Fig2_tumor_volume.xlsx",
+      "sheet": "growth_curve",
+      "block": {
+        "rows": "2-9",
+        "cols": "1-6",
+        "header": [
+          "day",
+          "ctrl_volume",
+          "treat_volume",
+          "ctrl_replicate",
+          "tumor_length",
+          "tumor_width"
+        ]
+      },
+      "relations": [
+        {
+          "kind": "constant_offset",
+          "col_a": "ctrl_volume",
+          "col_b": "treat_volume",
+          "col_a_idx": 1,
+          "col_b_idx": 2,
+          "n": 8,
+          "offset": 120.0,
+          "severity": "high",
+          "rule": "col[2] = col[1] + 120",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              1,
+              2
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "kind": "identical_column",
+          "col_a": "ctrl_volume",
+          "col_b": "ctrl_replicate",
+          "col_a_idx": 1,
+          "col_b_idx": 3,
+          "n": 8,
+          "severity": "high",
+          "rule": "col[3] == col[1]",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              1,
+              3
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "kind": "constant_offset",
+          "col_a": "treat_volume",
+          "col_b": "ctrl_replicate",
+          "col_a_idx": 2,
+          "col_b_idx": 3,
+          "n": 8,
+          "offset": -120.0,
+          "severity": "high",
+          "rule": "col[3] = col[2] + -120",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              2,
+              3
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "kind": "small_diff_set",
+          "col_a": "tumor_length",
+          "col_b": "tumor_width",
+          "col_a_idx": 4,
+          "col_b_idx": 5,
+          "n": 8,
+          "unique_diffs": [
+            0.0,
+            0.21
+          ],
+          "severity": "medium",
+          "rule": "col[5] - col[4] only takes 2 discrete values",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              4,
+              5
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "progressions": [
+        {
+          "kind": "arithmetic_progression",
+          "col": "day",
+          "col_idx": 0,
+          "n": 8,
+          "step": 3.0,
+          "first": 0.0,
+          "severity": "medium",
+          "rule": "col[0] = arithmetic progression, step=3",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              0
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "equal_pairs": [
+        {
+          "kind": "many_equal_pairs",
+          "col_a": "tumor_length",
+          "col_b": "tumor_width",
+          "col_a_idx": 4,
+          "col_b_idx": 5,
+          "n": 8,
+          "equal": 7,
+          "severity": "medium",
+          "rule": "col[4] == col[5] in 7/8 rows",
+          "evidence": {
+            "headers": [
+              "day",
+              "ctrl_volume",
+              "treat_volume",
+              "ctrl_replicate",
+              "tumor_length",
+              "tumor_width"
+            ],
+            "col_offset": 0,
+            "highlight_cols": [
+              4,
+              5
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "day",
+                  "ctrl_volume",
+                  "treat_volume",
+                  "ctrl_replicate",
+                  "tumor_length",
+                  "tumor_width"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  0,
+                  98.2156,
+                  218.2156,
+                  98.2156,
+                  4.2156,
+                  4.2156
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  3,
+                  142.8923,
+                  262.8923,
+                  142.8923,
+                  5.8923,
+                  5.8923
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  6,
+                  201.5347,
+                  321.5347,
+                  201.5347,
+                  6.5347,
+                  6.5347
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  9,
+                  268.7412,
+                  388.7412,
+                  268.7412,
+                  7.1412,
+                  7.1412
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  12,
+                  339.2588,
+                  459.2588,
+                  339.2588,
+                  7.9588,
+                  7.9588
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  15,
+                  418.6071,
+                  538.6071,
+                  418.6071,
+                  8.6071,
+                  8.8171
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  18,
+                  502.4419,
+                  622.4419,
+                  502.4419,
+                  9.4419,
+                  9.4419
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  21,
+                  591.8364,
+                  711.8364,
+                  591.8364,
+                  10.1364,
+                  10.1364
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "within_col": [],
+      "identical_after_rounding": []
+    },
+    {
+      "file": "ED_Fig4_qPCR.xlsx",
+      "sheet": "donor_A",
+      "block": {
+        "rows": "2-13",
+        "cols": "2-5",
+        "header": [
+          "rel_expr",
+          "ct_value",
+          "efficiency",
+          "input_ng"
+        ]
+      },
+      "relations": [],
+      "progressions": [],
+      "equal_pairs": [],
+      "within_col": [
+        {
+          "kind": "within_col_value_duplication",
+          "col": "rel_expr",
+          "col_idx": 1,
+          "n": 12,
+          "dup_value": 1.0837,
+          "dup_count": 8,
+          "severity": "high",
+          "rule": "col[1] has value 1.0837 repeated 8/12 times",
+          "evidence": {
+            "headers": [
+              "rel_expr",
+              "ct_value",
+              "efficiency",
+              "input_ng"
+            ],
+            "col_offset": 1,
+            "highlight_cols": [
+              1
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "rel_expr",
+                  "ct_value",
+                  "efficiency",
+                  "input_ng"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  20,
+                  0.9812,
+                  10.2371
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  2.4519,
+                  22.5,
+                  0.9743,
+                  10.4188
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25,
+                  0.9881,
+                  9.8642
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  3.1142,
+                  27.5,
+                  0.9659,
+                  10.1095
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30,
+                  0.9927,
+                  9.9523
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  0.8734,
+                  32.5,
+                  0.9788,
+                  10.3367
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35,
+                  0.9834,
+                  10.0814
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  2.9913,
+                  20.5,
+                  0.9716,
+                  9.7459
+                ]
+              },
+              {
+                "row_idx": 10,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25.5,
+                  0.9902,
+                  10.2956
+                ]
+              },
+              {
+                "row_idx": 11,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30.5,
+                  0.9771,
+                  9.9138
+                ]
+              },
+              {
+                "row_idx": 12,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35.5,
+                  0.9845,
+                  10.1772
+                ]
+              },
+              {
+                "row_idx": 13,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  22.5,
+                  0.9693,
+                  10.0285
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "kind": "within_col_decimal_repetition",
+          "col": "rel_expr",
+          "col_idx": 1,
+          "n": 12,
+          "ending": "37",
+          "count": 8,
+          "severity": "high",
+          "rule": "col[1]: 8/12 values share last-2 decimals '.37'",
+          "evidence": {
+            "headers": [
+              "rel_expr",
+              "ct_value",
+              "efficiency",
+              "input_ng"
+            ],
+            "col_offset": 1,
+            "highlight_cols": [
+              1
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "rel_expr",
+                  "ct_value",
+                  "efficiency",
+                  "input_ng"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  20,
+                  0.9812,
+                  10.2371
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  2.4519,
+                  22.5,
+                  0.9743,
+                  10.4188
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25,
+                  0.9881,
+                  9.8642
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  3.1142,
+                  27.5,
+                  0.9659,
+                  10.1095
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30,
+                  0.9927,
+                  9.9523
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  0.8734,
+                  32.5,
+                  0.9788,
+                  10.3367
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35,
+                  0.9834,
+                  10.0814
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  2.9913,
+                  20.5,
+                  0.9716,
+                  9.7459
+                ]
+              },
+              {
+                "row_idx": 10,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25.5,
+                  0.9902,
+                  10.2956
+                ]
+              },
+              {
+                "row_idx": 11,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30.5,
+                  0.9771,
+                  9.9138
+                ]
+              },
+              {
+                "row_idx": 12,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35.5,
+                  0.9845,
+                  10.1772
+                ]
+              },
+              {
+                "row_idx": 13,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  22.5,
+                  0.9693,
+                  10.0285
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "kind": "rounded_to_half_or_int",
+          "col": "ct_value",
+          "col_idx": 2,
+          "n": 12,
+          "count_05": 12,
+          "severity": "medium",
+          "rule": "col[2]: 12/12 values end in 0 or 5",
+          "evidence": {
+            "headers": [
+              "rel_expr",
+              "ct_value",
+              "efficiency",
+              "input_ng"
+            ],
+            "col_offset": 1,
+            "highlight_cols": [
+              2
+            ],
+            "highlight_rows": [],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "rel_expr",
+                  "ct_value",
+                  "efficiency",
+                  "input_ng"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  20,
+                  0.9812,
+                  10.2371
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  2.4519,
+                  22.5,
+                  0.9743,
+                  10.4188
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25,
+                  0.9881,
+                  9.8642
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  3.1142,
+                  27.5,
+                  0.9659,
+                  10.1095
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30,
+                  0.9927,
+                  9.9523
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  0.8734,
+                  32.5,
+                  0.9788,
+                  10.3367
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35,
+                  0.9834,
+                  10.0814
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  2.9913,
+                  20.5,
+                  0.9716,
+                  9.7459
+                ]
+              },
+              {
+                "row_idx": 10,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25.5,
+                  0.9902,
+                  10.2956
+                ]
+              },
+              {
+                "row_idx": 11,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30.5,
+                  0.9771,
+                  9.9138
+                ]
+              },
+              {
+                "row_idx": 12,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35.5,
+                  0.9845,
+                  10.1772
+                ]
+              },
+              {
+                "row_idx": 13,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  22.5,
+                  0.9693,
+                  10.0285
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "identical_after_rounding": [
+        {
+          "kind": "identical_after_rounding",
+          "rounded_to": 1.0,
+          "n_cells": 12,
+          "n_unique": 12,
+          "example_values": [
+            0.9659,
+            0.9693,
+            0.9716,
+            0.9743,
+            0.9771,
+            0.9788
+          ],
+          "example_cells": [
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              6,
+              4
+            ],
+            [
+              7,
+              4
+            ]
+          ],
+          "severity": "medium",
+          "rule": "12 cells share rounded value 1.0 but have 12 distinct precise values",
+          "evidence": {
+            "headers": [
+              "rel_expr",
+              "ct_value",
+              "efficiency",
+              "input_ng"
+            ],
+            "col_offset": 1,
+            "highlight_cols": [],
+            "highlight_rows": [
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "rel_expr",
+                  "ct_value",
+                  "efficiency",
+                  "input_ng"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  20,
+                  0.9812,
+                  10.2371
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  2.4519,
+                  22.5,
+                  0.9743,
+                  10.4188
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25,
+                  0.9881,
+                  9.8642
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  3.1142,
+                  27.5,
+                  0.9659,
+                  10.1095
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30,
+                  0.9927,
+                  9.9523
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  0.8734,
+                  32.5,
+                  0.9788,
+                  10.3367
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35,
+                  0.9834,
+                  10.0814
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  2.9913,
+                  20.5,
+                  0.9716,
+                  9.7459
+                ]
+              },
+              {
+                "row_idx": 10,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  25.5,
+                  0.9902,
+                  10.2956
+                ]
+              },
+              {
+                "row_idx": 11,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  30.5,
+                  0.9771,
+                  9.9138
+                ]
+              },
+              {
+                "row_idx": 12,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  35.5,
+                  0.9845,
+                  10.1772
+                ]
+              },
+              {
+                "row_idx": 13,
+                "is_context": false,
+                "values": [
+                  1.0837,
+                  22.5,
+                  0.9693,
+                  10.0285
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "file": "ED_Fig4_qPCR.xlsx",
+      "sheet": "donor_B",
+      "block": {
+        "rows": "2-13",
+        "cols": "2-5",
+        "header": [
+          "rel_expr",
+          "ct_value",
+          "efficiency",
+          "input_ng"
+        ]
+      },
+      "relations": [],
+      "progressions": [],
+      "equal_pairs": [],
+      "within_col": [],
+      "identical_after_rounding": [
+        {
+          "kind": "identical_after_rounding",
+          "rounded_to": 1.0,
+          "n_cells": 13,
+          "n_unique": 13,
+          "example_values": [
+            0.9659,
+            0.9693,
+            0.9716,
+            0.9743,
+            0.9771,
+            0.9788
+          ],
+          "example_cells": [
+            [
+              2,
+              4
+            ],
+            [
+              3,
+              4
+            ],
+            [
+              4,
+              4
+            ],
+            [
+              5,
+              4
+            ],
+            [
+              6,
+              4
+            ],
+            [
+              7,
+              2
+            ]
+          ],
+          "severity": "medium",
+          "rule": "13 cells share rounded value 1.0 but have 13 distinct precise values",
+          "evidence": {
+            "headers": [
+              "rel_expr",
+              "ct_value",
+              "efficiency",
+              "input_ng"
+            ],
+            "col_offset": 1,
+            "highlight_cols": [],
+            "highlight_rows": [
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "rows": [
+              {
+                "row_idx": 1,
+                "is_context": true,
+                "values": [
+                  "rel_expr",
+                  "ct_value",
+                  "efficiency",
+                  "input_ng"
+                ]
+              },
+              {
+                "row_idx": 2,
+                "is_context": false,
+                "values": [
+                  1.5523,
+                  23,
+                  0.9812,
+                  10.2371
+                ]
+              },
+              {
+                "row_idx": 3,
+                "is_context": false,
+                "values": [
+                  2.119,
+                  25.5,
+                  0.9743,
+                  10.4188
+                ]
+              },
+              {
+                "row_idx": 4,
+                "is_context": false,
+                "values": [
+                  1.7834,
+                  22.5,
+                  0.9881,
+                  9.8642
+                ]
+              },
+              {
+                "row_idx": 5,
+                "is_context": false,
+                "values": [
+                  2.6651,
+                  24,
+                  0.9659,
+                  10.1095
+                ]
+              },
+              {
+                "row_idx": 6,
+                "is_context": false,
+                "values": [
+                  1.4427,
+                  23.5,
+                  0.9934,
+                  9.9523
+                ]
+              },
+              {
+                "row_idx": 7,
+                "is_context": false,
+                "values": [
+                  0.9913,
+                  21.5,
+                  0.9788,
+                  10.3367
+                ]
+              },
+              {
+                "row_idx": 8,
+                "is_context": false,
+                "values": [
+                  2.0148,
+                  25,
+                  0.9834,
+                  10.0814
+                ]
+              },
+              {
+                "row_idx": 9,
+                "is_context": false,
+                "values": [
+                  1.8876,
+                  22,
+                  0.9716,
+                  9.7459
+                ]
+              },
+              {
+                "row_idx": 10,
+                "is_context": false,
+                "values": [
+                  1.6692,
+                  24.5,
+                  0.9902,
+                  10.2956
+                ]
+              },
+              {
+                "row_idx": 11,
+                "is_context": false,
+                "values": [
+                  2.3318,
+                  23,
+                  0.9771,
+                  9.9105
+                ]
+              },
+              {
+                "row_idx": 12,
+                "is_context": false,
+                "values": [
+                  1.9905,
+                  21,
+                  0.9845,
+                  10.1772
+                ]
+              },
+              {
+                "row_idx": 13,
+                "is_context": false,
+                "values": [
+                  1.7741,
+                  25.5,
+                  0.9693,
+                  10.0285
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "digit_distribution": [
+    {
+      "label": "ED_Fig2_tumor_volume.xlsx::growth_curve",
+      "n": 47,
+      "chi2": 4.127659574468084,
+      "p": 0.8454257080158954,
+      "counts": {
+        "0": 0,
+        "1": 6,
+        "2": 6,
+        "3": 6,
+        "4": 5,
+        "5": 1,
+        "6": 6,
+        "7": 5,
+        "8": 6,
+        "9": 6
+      },
+      "top": [
+        [
+          "6",
+          6
+        ],
+        [
+          "3",
+          6
+        ],
+        [
+          "9",
+          6
+        ]
+      ]
+    },
+    {
+      "label": "ED_Fig4_qPCR.xlsx::donor_A",
+      "n": 46,
+      "chi2": 22.47826086956522,
+      "p": 0.004102835221635459,
+      "counts": {
+        "0": 0,
+        "1": 3,
+        "2": 5,
+        "3": 4,
+        "4": 3,
+        "5": 13,
+        "6": 2,
+        "7": 10,
+        "8": 3,
+        "9": 3
+      },
+      "top": [
+        [
+          "5",
+          13
+        ],
+        [
+          "7",
+          10
+        ],
+        [
+          "2",
+          5
+        ]
+      ]
+    },
+    {
+      "label": "ED_Fig4_qPCR.xlsx::donor_B",
+      "n": 48,
+      "chi2": 13.5,
+      "p": 0.09576514648486567,
+      "counts": {
+        "0": 0,
+        "1": 6,
+        "2": 6,
+        "3": 7,
+        "4": 5,
+        "5": 12,
+        "6": 3,
+        "7": 2,
+        "8": 4,
+        "9": 3
+      },
+      "top": [
+        [
+          "5",
+          12
+        ],
+        [
+          "3",
+          7
+        ],
+        [
+          "2",
+          6
+        ]
+      ]
+    }
+  ],
+  "decimal_endings": [],
+  "cross_sheet_findings": [
+    {
+      "kind": "cross_sheet_position_identical",
+      "sheet_a": "donor_A",
+      "sheet_b": "donor_B",
+      "size_a": 36,
+      "size_b": 36,
+      "same_position_count": 22,
+      "fraction_of_smaller": 0.6111111111111112,
+      "examples": [
+        {
+          "row": 2,
+          "col": 4,
+          "value": 0.9812
+        },
+        {
+          "row": 2,
+          "col": 5,
+          "value": 10.2371
+        },
+        {
+          "row": 3,
+          "col": 4,
+          "value": 0.9743
+        },
+        {
+          "row": 3,
+          "col": 5,
+          "value": 10.4188
+        },
+        {
+          "row": 4,
+          "col": 4,
+          "value": 0.9881
+        }
+      ],
+      "severity": "high",
+      "rule": "donor_A and donor_B share 22/36 (61%) decimal values at SAME (row,col)",
+      "file": "ED_Fig4_qPCR.xlsx"
+    }
+  ]
+}
