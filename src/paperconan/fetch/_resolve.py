@@ -1,6 +1,7 @@
 """Resolve a paper DOI/title into a search query and score candidate matches."""
 from __future__ import annotations
 import re
+import urllib.parse
 
 from . import _http
 
@@ -18,7 +19,9 @@ def normalize_query(text):
 def enrich_via_crossref(doi):
     """Best-effort title/authors/year for a paper DOI. Returns None on any failure."""
     try:
-        m = _http.get_json(f"https://api.crossref.org/works/{doi}").get("message", {})
+        m = _http.get_json(
+            f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
+        ).get("message", {})
     except Exception:
         return None
     title = (m.get("title") or [None])[0]

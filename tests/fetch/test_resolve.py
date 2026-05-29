@@ -30,3 +30,9 @@ def test_match_signals_title_overlap():
     assert sig["doi_in_related"] is False
     assert sig["title_overlap"] > 0.3
     assert sig["author_overlap"] > 0.0
+
+
+def test_normalize_query_strips_doi_org_prefix():
+    q = _resolve.normalize_query("https://doi.org/10.1371/journal.pone.0173664")
+    assert q["is_doi"] is True
+    assert q["doi"] == "10.1371/journal.pone.0173664"

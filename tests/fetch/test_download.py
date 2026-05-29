@@ -50,3 +50,42 @@ def test_download_candidate_tabular_only(monkeypatch, tmp_path):
     summary = _download.download_candidate(cand, str(tmp_path))
     assert len(summary["downloaded"]) == 1
     assert summary["downloaded"][0].endswith("a.csv")
+
+
+def test_download_file_rejects_non_http_scheme(tmp_path):
+    res = _download.download_file("file:///etc/passwd", str(tmp_path / "x.csv"))
+    assert res["ok"] is False
+    assert "scheme" in res["skipped_reason"].lower()
+    assert not (tmp_path / "x.csv").exists()
+
+
+def test_download_file_rejects_oversize_via_content_length(monkeypatch, tmp_path):
+    def big(req, timeout=None):
+        r = _Resp(b"x", "text/csv")
+        r.headers["Content-Length"] = "999999999"
+        return r
+    monkeypatch.setattr(_download.urllib.request, "urlopen", big)
+    res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"), max_bytes=1000)
+    assert res["ok"] is False
+    assert "max_bytes" in res["skipped_reason"]
+    assert not (tmp_path / "t.csv").exists()
+
+
+def test_download_file_rejects_oversize_via_body(monkeypatch, tmp_path):
+    payload = b"a" * 50
+    monkeypatch.setattr(_download.urllib.request, "urlopen",
+                        lambda req, timeout=None: _Resp(payload, "text/csv"))
+    res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"), max_bytes=10)
+    assert res["ok"] is False
+    assert "max_bytes" in res["skipped_reason"]
+    assert not (tmp_path / "t.csv").exists()
+
+
+def test_download_file_403_message(monkeypatch, tmp_path):
+    import urllib.error
+    def boom(req, timeout=None):
+        raise urllib.error.HTTPError("https://x/t.csv", 403, "Forbidden", {}, None)
+    monkeypatch.setattr(_download.urllib.request, "urlopen", boom)
+    res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"))
+    assert res["ok"] is False
+    assert "auth" in res["skipped_reason"].lower()

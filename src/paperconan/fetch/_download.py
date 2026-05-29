@@ -10,6 +10,9 @@ _DEFAULT_MAX = 50 * 1024 * 1024  # 50 MB
 
 
 def download_file(url, dest_path, timeout=60, max_bytes=_DEFAULT_MAX):
+    if not url.lower().startswith(("https://", "http://")):
+        return {"ok": False, "path": dest_path,
+                "skipped_reason": f"unsupported URL scheme: {url!r}"}
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -17,6 +20,10 @@ def download_file(url, dest_path, timeout=60, max_bytes=_DEFAULT_MAX):
             if "text/html" in ctype:
                 return {"ok": False, "path": dest_path,
                         "skipped_reason": f"server returned HTML ({ctype}), not a data file"}
+            clen = resp.info().get("Content-Length")
+            if clen and clen.isdigit() and int(clen) > max_bytes:
+                return {"ok": False, "path": dest_path,
+                        "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
             data = resp.read(max_bytes + 1)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
