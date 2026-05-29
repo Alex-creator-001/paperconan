@@ -1,0 +1,6 @@
+{"title": "Sabertooth predatory behavior data",
+ "identifier": "doi:10.5061/dryad.7rh4625",
+ "authors": [{"firstName": "Sam", "lastName": "Jones"}],
+ "publicationDate": "2018-05-01",
+ "relatedWorks": [{"identifier": "10.1098/rspb.2018.0123", "relationship": "article"}],
+ "_links": {"stash:version": {"href": "/api/v2/versions/124910"}}}

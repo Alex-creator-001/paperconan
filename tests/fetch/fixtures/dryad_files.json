@@ -1,0 +1,4 @@
+{"_embedded": {"stash:files": [
+  {"path": "measurements.csv", "mimeType": "text/csv", "size": 8000, "_links": {"stash:download": {"href": "/api/v2/files/9/download"}}},
+  {"path": "model.inp", "mimeType": "application/octet-stream", "size": 4000, "_links": {"stash:download": {"href": "/api/v2/files/1/download"}}}
+]}}

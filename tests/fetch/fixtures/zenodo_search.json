@@ -1,0 +1,15 @@
+{"hits": {"total": 1, "hits": [{
+  "id": 10277693, "doi": "10.5281/zenodo.10277693",
+  "metadata": {
+    "title": "Platelets retrospective biomarker dataset",
+    "creators": [{"name": "Doe, Jane"}, {"name": "Roe, Richard"}],
+    "publication_date": "2023-12-07",
+    "related_identifiers": [
+      {"identifier": "10.15761/JTS.1000455", "relation": "isPartOf", "scheme": "doi"}
+    ]
+  },
+  "files": [
+    {"key": "BASE_INFO.xlsx", "size": 191562, "links": {"self": "https://zenodo.org/api/records/10277693/files/BASE_INFO.xlsx/content"}},
+    {"key": "notes.pdf", "size": 5000, "links": {"self": "https://zenodo.org/api/records/10277693/files/notes.pdf/content"}}
+  ]
+}]}}
