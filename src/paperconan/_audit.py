@@ -722,6 +722,9 @@ def write_markdown_report(out, path):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "fetch":
+        from .fetch._cli import fetch_main
+        sys.exit(fetch_main(sys.argv[2:]))
     ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for fabrication red flags")
     ap.add_argument("in_dir", help="Directory containing the paper's *.xlsx source data files")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")
