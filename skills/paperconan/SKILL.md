@@ -1,6 +1,6 @@
 ---
 name: paperconan
-description: Paper data sanity check — scan supplementary source data (xlsx files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary xlsx and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser.
+description: Paper data sanity check — scan supplementary source data (.xlsx / .csv / .tsv files in a directory) for numerical fabrication red flags. Use when user mentions 论文数据检查, 论文数据造假, 数据 sanity check, 学术不端检测, 数据取证, 检查论文数据, paper data audit, source data audit, PubPeer prep, suspicious paper data, fabrication check, research integrity, or hands you a directory of supplementary data tables and asks "does this look real?". Produces structured findings (scan.json) the agent reads, plus a self-contained HTML report (report.html) the user opens in a browser.
 ---
 
 # paperconan — paper data sanity check
@@ -11,7 +11,7 @@ Tool repository: https://github.com/zixixr/paperconan
 
 Use this skill when the user:
 
-- Hands over a directory of `.xlsx` supplementary source data and asks for a data integrity / sanity check
+- Hands over a directory of supplementary source data (`.xlsx` / `.csv` / `.tsv`) and asks for a data integrity / sanity check
 - Wants to prep a PubPeer post and asks you to surface suspicious numeric patterns first
 - Asks about a paper they suspect has fabricated data and wants statistical signal before deciding next step
 - Says things like "帮我看看这篇论文数据有没有问题", "扫一下这个 source data", "查查这些表格的可疑模式", "audit this paper's data"
@@ -19,7 +19,7 @@ Use this skill when the user:
 ## When NOT to use
 
 - The concern is image fraud (Western blot, microscopy, gel splicing) — paperconan only inspects numeric tables
-- The data is CSV / TSV / not in `.xlsx` format — current version only reads xlsx
+- The data is not tabular — paperconan reads `.xlsx` / `.csv` / `.tsv` only (not `.xls`, PDFs, or images)
 - The user wants statistical methodology review or peer-review-style scrutiny — paperconan is forensic, not statistical
 
 ## Prerequisites
@@ -33,12 +33,13 @@ pip install -e /path/to/paperconan
 Verify with `paperconan --help` (or `paperconan --version`).
 
 A complete worked example — synthetic data + the report it produces + a guided
-walkthrough of every finding — lives in [examples/](examples/README.md). Read it
-to see the output shape before running on real data.
+walkthrough of every finding — lives in the repo's
+[`examples/`](../../examples/README.md) directory. Read it to see the output
+shape before running on real data.
 
 ## How to invoke
 
-Single command, takes a directory of xlsx files:
+Single command, takes a directory of data tables (`.xlsx` / `.csv` / `.tsv`):
 
 ```bash
 paperconan <input-dir>
@@ -95,7 +96,7 @@ Three artifacts may exist in the output dir:
 
 ### Every finding has
 
-- `kind`: detector name (see [skill/references/detectors.md](skill/references/detectors.md))
+- `kind`: detector name (see [references/detectors.md](references/detectors.md))
 - `severity`: `"high"` | `"medium"` | `"low"`
 - `rule`: human-readable rule string e.g. `col[27] ≡ col[28] in 9/10 rows`
 - `n`: sample size for the rule
@@ -107,7 +108,7 @@ Three artifacts may exist in the output dir:
 2. **Group by file, then by severity.** Most users want "which figure should I look at first."
 3. **Always include severity badges in your summary.** Don't flatten `high` and `medium` together.
 4. **Point them to `report.html`.** That file has the actual table snippets with the suspicious cells highlighted — much easier for the user than re-reading xlsx.
-5. **Read [skill/references/interpretation.md](skill/references/interpretation.md)** for the response template and the red lines.
+5. **Read [references/interpretation.md](references/interpretation.md)** for the response template and the red lines.
 
 ## CRITICAL: signal, not verdict
 
@@ -124,4 +125,4 @@ Do:
 - ✅ Surface common false positives (shared controls, dose-axis duplication, count quantization)
 - ✅ Recommend the user verify against figure legend + Methods, then escalate via PubPeer / journal editor / research integrity office
 
-Full response template lives in [skill/references/interpretation.md](skill/references/interpretation.md).
+Full response template lives in [references/interpretation.md](references/interpretation.md).

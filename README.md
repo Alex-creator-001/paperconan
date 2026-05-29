@@ -16,7 +16,7 @@
 
 `paperconan` 是一个 **论文数据 sanity check** 小工具。
 
-喂一份 supplementary source data（一个目录，里面装着 `.xlsx`）进去，它会跑十几组数值取证检测器，输出 **scan.json**（结构化的全部命中）+ **report.html**（自包含的可交互法证报告，每条 finding 直接嵌可疑表格片段并高亮可疑列/行），告诉你哪些位置值得人工再看一眼。
+喂一份 supplementary source data（一个目录，里面装着 `.xlsx` / `.csv` / `.tsv`）进去，它会跑十几组数值取证检测器，输出 **scan.json**（结构化的全部命中）+ **report.html**（自包含的可交互法证报告，每条 finding 直接嵌可疑表格片段并高亮可疑列/行），告诉你哪些位置值得人工再看一眼。
 
 **适合谁**：
 
@@ -95,10 +95,12 @@ paperconan path/to/paper_dir/ --out /tmp/audit-of-this-paper
 
 ## 作为 skill 使用（被 Claude Code / Codex / 其他 agent 调用）
 
-仓库根目录的 [`SKILL.md`](SKILL.md) 是给 agent 看的入口，自带 YAML frontmatter（name + 触发关键词）和怎么解读 `scan.json` 的指引。`skill/references/` 下有：
+[`skills/paperconan/SKILL.md`](skills/paperconan/SKILL.md) 是给 agent 看的入口，自带 YAML frontmatter（name + 触发关键词）和怎么解读 `scan.json` 的指引。同目录 `references/` 下有：
 
-- [`detectors.md`](skill/references/detectors.md) — 每个检测器的原理 / 典型命中 / **常见误报**
-- [`interpretation.md`](skill/references/interpretation.md) — severity 语义 + "signal not verdict" 红线 + 推荐回复话术
+- [`detectors.md`](skills/paperconan/references/detectors.md) — 每个检测器的原理 / 典型命中 / **常见误报**
+- [`interpretation.md`](skills/paperconan/references/interpretation.md) — severity 语义 + "signal not verdict" 红线 + 推荐回复话术
+
+整个 skill 收在 `skills/paperconan/` 一个目录里，安装只需软链一次。
 
 ### 安装
 
@@ -106,13 +108,11 @@ paperconan path/to/paper_dir/ --out /tmp/audit-of-this-paper
 # 1. 装 CLI
 pip install -e /path/to/paperconan       # 本地开发；发到 PyPI 后改成 pip install paperconan
 
-# 2a. Claude Code: 软链 / 拷贝 SKILL.md 到 skills 目录
-mkdir -p ~/.claude/skills/paperconan
-ln -s /path/to/paperconan/SKILL.md   ~/.claude/skills/paperconan/SKILL.md
-ln -s /path/to/paperconan/skill      ~/.claude/skills/paperconan/skill
+# 2a. Claude Code: 软链整个 skill 目录（一次搞定）
+ln -s /path/to/paperconan/skills/paperconan ~/.claude/skills/paperconan
 
 # 2b. Codex / 其他 agent: 在 AGENTS.md / CLAUDE.md / GEMINI.md 里引用
-echo '@/path/to/paperconan/SKILL.md' >> AGENTS.md
+echo '@/path/to/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 ```
 
 之后在 agent 会话里说"我有一篇论文的 source data 在 /path/to/data，帮我做个 sanity check"，agent 会自动调用 paperconan 并按 SKILL.md 的解读规则向你汇报。
@@ -192,10 +192,10 @@ echo '@/path/to/paperconan/SKILL.md' >> AGENTS.md
 
 短期：
 
-- [ ] CSV / TSV 输入（目前只支持 xlsx）
+- [x] CSV / TSV 输入 — v0.3 已实现（含跨文件数据复用检测）
 - [x] HTML 报告（在 REPORT.md 之外）— v0.2 已实现，并取代 REPORT.md 成为默认人类可读输出
 - [x] 把每条 finding 嵌入对应的表格片段 — v0.2 实现为可交互 HTML 表格（不是截图）
-- [x] 作为 skill 给 agent 调用 — v0.2 已实现，见 SKILL.md
+- [x] 作为 skill 给 agent 调用 — v0.2 已实现，见 skills/paperconan/SKILL.md
 - [ ] PubPeer 风格的 "为什么这值得复核" 旁注（LLM 生成的可选）
 
 中长期：

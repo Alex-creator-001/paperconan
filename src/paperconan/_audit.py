@@ -21,6 +21,7 @@ Dependencies: openpyxl, numpy, scipy
 """
 from __future__ import annotations
 import argparse
+import csv as _csv
 import datetime
 import glob
 import json
@@ -95,6 +96,54 @@ def load_workbook_rows(path):
         out[s] = rows
     wb.close()
     return out
+
+
+def _coerce_cell(s):
+    """Parse a CSV string cell into int / float / text. Empty -> None.
+    Deliberately conservative: no thousands separators, no percent, no currency."""
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        return s
+
+
+def load_csv_rows(path, delimiter):
+    """Load a delimited text file as {sheet_name: rows}, mirroring load_workbook_rows.
+    A flat file has no sheets, so it becomes a single sheet named after the file stem."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    rows = []
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            with open(path, newline="", encoding=enc) as fh:
+                rows = [[_coerce_cell(c) for c in r]
+                        for r in _csv.reader(fh, delimiter=delimiter)]
+            break
+        except UnicodeDecodeError:
+            continue
+    maxc = max((len(r) for r in rows), default=0)
+    for r in rows:
+        if len(r) < maxc:
+            r.extend([None] * (maxc - len(r)))
+    return {stem: rows}
+
+
+def load_table(path):
+    """Dispatch by extension to a {sheet_name: rows} loader."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".tsv":
+        return load_csv_rows(path, delimiter="\t")
+    if ext == ".csv":
+        return load_csv_rows(path, delimiter=",")
+    return load_workbook_rows(path)
 
 
 def find_numeric_blocks(rows, min_rows=3, min_cols=1):
@@ -450,98 +499,103 @@ def detect_equal_pairs(rows, r0, r1, c0, c1, header):
 
 # ---------- driver ----------
 
-def detect_cross_sheet_collisions(xlsx_path, min_decimal_places=3):
-    """Find pairs of sheets in the same workbook with many bit-identical decimal values
-    at the SAME (row, col). Catches "copy a whole sheet, then tweak a few values" fraud.
+def _grid_from_rows(rows, min_decimal_places=3, max_rows=200):
+    """Build {(r, c): rounded_value} of decimal-bearing numeric cells from a rows matrix.
+    Only keeps non-integer values with >= min_decimal_places decimals in a sane range —
+    these are the values whose bit-identical reuse across tables is suspicious."""
+    grid = {}
+    for ri, r in enumerate(rows[:max_rows]):
+        for ci, v in enumerate(r):
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                fv = float(v)
+                if fv != int(fv) and 0.001 <= abs(fv) < 100000:
+                    s = repr(fv)
+                    if "." in s and "e" not in s.lower():
+                        frac = s.split(".", 1)[1]
+                        if len(frac) >= min_decimal_places:
+                            grid[(ri, ci)] = round(fv, 9)
+    return grid
 
-    Returns list of dicts, one per suspicious sheet pair.
+
+def detect_collisions(grids):
+    """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
+    values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
+    whether the copy lives in another sheet of the same workbook or in a separate file.
+
+    `grids` maps (file, sheet) -> grid (from _grid_from_rows). Returns one dict per
+    suspicious pair, with file_a/file_b set so same-file and cross-file pairs are
+    distinguishable.
     """
-    from collections import defaultdict
-    wb = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
-    sheet_grid = {}  # sheet_name -> {(r, c): value}
-    sheet_size = {}
-    for sn in wb.sheetnames:
-        ws = wb[sn]
-        grid = {}
-        for ri, r in enumerate(ws.iter_rows(values_only=True, max_row=200)):
-            for ci, v in enumerate(r):
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    fv = float(v)
-                    if fv != int(fv) and 0.001 <= abs(fv) < 100000:
-                        s = repr(fv)
-                        if "." in s and "e" not in s.lower():
-                            frac = s.split(".", 1)[1]
-                            if len(frac) >= min_decimal_places:
-                                grid[(ri, ci)] = round(fv, 9)
-        sheet_grid[sn] = grid
-        sheet_size[sn] = len(grid)
-    wb.close()
-
     findings = []
-    sheets = list(sheet_grid.keys())
-    for i in range(len(sheets)):
-        for j in range(i + 1, len(sheets)):
-            sa, sb = sheets[i], sheets[j]
-            ga, gb = sheet_grid[sa], sheet_grid[sb]
-            if min(sheet_size[sa], sheet_size[sb]) < 5:
+    keys = list(grids.keys())
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            (fa, sa), (fb, sb) = keys[i], keys[j]
+            ga, gb = grids[keys[i]], grids[keys[j]]
+            size_a, size_b = len(ga), len(gb)
+            smaller = min(size_a, size_b)
+            if smaller < 5:
                 continue
-            # Position-wise: same (r, c) AND same value
+            same_file = fa == fb
+            # label_a / label_b disambiguate sheets when the pair spans two files
+            la = sa if same_file else f"{fa}::{sa}"
+            lb = sb if same_file else f"{fb}::{sb}"
+            scope = "sheets" if same_file else "files"
+
             same_pos = sum(1 for k, v in ga.items() if k in gb and gb[k] == v)
-            # Value-wise: same value anywhere (looser)
-            vals_a = set(ga.values())
-            vals_b = set(gb.values())
+            vals_a, vals_b = set(ga.values()), set(gb.values())
             same_val = len(vals_a & vals_b)
-            smaller = min(sheet_size[sa], sheet_size[sb])
+
             if same_pos >= max(6, smaller * 0.15):
-                # 5 examples
                 examples = [(k, v) for k, v in ga.items() if k in gb and gb[k] == v][:5]
                 findings.append(dict(
                     kind="cross_sheet_position_identical",
-                    sheet_a=sa, sheet_b=sb,
-                    size_a=sheet_size[sa], size_b=sheet_size[sb],
+                    file=fa if same_file else f"{fa} + {fb}",
+                    file_a=fa, file_b=fb, same_file=same_file,
+                    sheet_a=la, sheet_b=lb,
+                    size_a=size_a, size_b=size_b,
                     same_position_count=same_pos,
                     fraction_of_smaller=same_pos / smaller,
-                    examples=[dict(row=k[0]+1, col=k[1]+1, value=v) for k, v in examples],
+                    examples=[dict(row=k[0] + 1, col=k[1] + 1, value=v) for k, v in examples],
                     severity="high",
-                    rule=f"{sa} and {sb} share {same_pos}/{smaller} ({same_pos/smaller*100:.0f}%) decimal values at SAME (row,col)"
+                    rule=f"{la} and {lb} share {same_pos}/{smaller} ({same_pos/smaller*100:.0f}%) decimal values at SAME (row,col) across 2 {scope}",
                 ))
             elif same_val >= max(8, smaller * 0.4):
                 examples = sorted(list(vals_a & vals_b))[:5]
                 findings.append(dict(
                     kind="cross_sheet_value_overlap",
-                    sheet_a=sa, sheet_b=sb,
-                    size_a=sheet_size[sa], size_b=sheet_size[sb],
+                    file=fa if same_file else f"{fa} + {fb}",
+                    file_a=fa, file_b=fb, same_file=same_file,
+                    sheet_a=la, sheet_b=lb,
+                    size_a=size_a, size_b=size_b,
                     shared_value_count=same_val,
                     fraction_of_smaller=same_val / smaller,
                     examples=examples,
                     severity="medium",
-                    rule=f"{sa} and {sb} share {same_val} bit-identical decimal values ({same_val/smaller*100:.0f}% of smaller sheet)"
+                    rule=f"{la} and {lb} share {same_val} bit-identical decimal values ({same_val/smaller*100:.0f}% of smaller) across 2 {scope}",
                 ))
     return findings
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
-    xlsx_files = sorted(glob.glob(os.path.join(in_dir, "*.xlsx")))
-    if not xlsx_files:
-        sys.exit(f"no .xlsx files in {in_dir}\n"
-                 f"(paperconan currently reads only .xlsx — CSV/TSV support is on the roadmap)")
+    files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv")
+                    for p in glob.glob(os.path.join(in_dir, pat))})
+    if not files:
+        sys.exit(f"no .xlsx / .csv / .tsv files in {in_dir}\n"
+                 f"(paperconan reads .xlsx, .csv and .tsv; .xls/.xlsm are not supported)")
 
     report_blocks = []
     per_sheet_numbers = {}
-    cross_sheet_findings = []
+    grids = {}  # (file, sheet) -> decimal grid, for the unified collision pass
 
-    for f in xlsx_files:
-        # NEW: cross-sheet pass before reading rows again
+    for f in files:
         try:
-            csf = detect_cross_sheet_collisions(f)
-            for cf in csf:
-                cf["file"] = os.path.basename(f)
-                cross_sheet_findings.append(cf)
+            sheets = load_table(f)
         except Exception as e:
-            print(f"  cross-sheet scan failed on {os.path.basename(f)}: {e}", file=sys.stderr)
-
-        sheets = load_workbook_rows(f)
+            print(f"  failed to read {os.path.basename(f)}: {e}", file=sys.stderr)
+            continue
         for sn, rows in sheets.items():
+            grids[(os.path.basename(f), sn)] = _grid_from_rows(rows)
             sheet_nums = [float(v) for r in rows for v in r if is_num(v)]
             per_sheet_numbers[(os.path.basename(f), sn)] = sheet_nums
             blocks = find_numeric_blocks(rows)
@@ -560,6 +614,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
                                               relations=rel, progressions=ap, equal_pairs=eq,
                                               within_col=wc, identical_after_rounding=iar))
 
+    # Unified collision pass: every (file, sheet) grid against every other —
+    # covers both intra-workbook sheet pairs and cross-file duplicates.
+    cross_sheet_findings = detect_collisions(grids)
+
     digit_reports, decimal_reports = [], []
     for key, nums in per_sheet_numbers.items():
         d = detect_last_digit(nums, label=f"{key[0]}::{key[1]}")
@@ -573,7 +631,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                input_dir=in_dir,
-               n_files=len(xlsx_files),
+               n_files=len(files),
                n_blocks_with_findings=len(report_blocks),
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,

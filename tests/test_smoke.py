@@ -110,6 +110,65 @@ def test_no_html_flag_skips_html(tiny_paper, tmp_path):
     assert not (out_dir / "report.html").exists()
 
 
+_CSV_ONE = (
+    "sample,height,weight,score\n"
+    "s1,1.2345,55.6789,9.1234\n"
+    "s2,1.8923,60.1234,8.7654\n"
+    "s3,2.5612,58.4321,9.3456\n"
+    "s4,3.1456,62.7890,8.9012\n"
+    "s5,3.8721,59.5678,9.5678\n"
+    "s6,4.2389,61.2345,8.4321\n"
+)
+# Same height/weight values at the same positions as _CSV_ONE -> cross-file collision.
+_CSV_TWO = (
+    "id,h,w,sc\n"
+    "a1,1.2345,55.6789,3.1111\n"
+    "a2,1.8923,60.1234,3.2222\n"
+    "a3,2.5612,58.4321,3.3333\n"
+    "a4,3.1456,62.7890,3.4444\n"
+    "a5,3.8721,59.5678,3.5555\n"
+    "a6,4.2389,61.2345,3.6666\n"
+)
+
+
+def test_csv_cross_file_collision(tmp_path):
+    data = tmp_path / "csv_data"
+    data.mkdir()
+    (data / "dataset_one.csv").write_text(_CSV_ONE, encoding="utf-8")
+    (data / "dataset_two.csv").write_text(_CSV_TWO, encoding="utf-8")
+
+    out_dir = tmp_path / "out"
+    res = scan_dir(str(data), str(out_dir))
+
+    assert res["n_files"] == 2
+    collisions = [cf for cf in res["cross_sheet_findings"]
+                  if cf["kind"] == "cross_sheet_position_identical"]
+    assert collisions, "expected a cross-file position-identical collision"
+    cf = collisions[0]
+    assert cf["same_file"] is False, "collision should be flagged as cross-file"
+    assert cf["file_a"] != cf["file_b"]
+
+
+def test_tsv_and_text_columns_are_handled(tmp_path):
+    data = tmp_path / "tsv_data"
+    data.mkdir()
+    # A TSV with a text column and a verbatim-duplicate numeric column.
+    rows = ["label\tmass\tmass_copy\tnote"]
+    for i in range(6):
+        v = round(1.1 + i * 0.7, 4)
+        rows.append(f"row{i}\t{v}\t{v}\tok")
+    (data / "table.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    out_dir = tmp_path / "out"
+    res = scan_dir(str(data), str(out_dir))
+    assert res["n_files"] == 1
+    kinds = set()
+    for blk in res["relations_blocks"]:
+        for f in blk.get("relations", []):
+            kinds.add(f["kind"])
+    assert "identical_column" in kinds, f"expected identical_column from TSV, got {kinds}"
+
+
 def test_write_html_report_handles_empty_scan(tmp_path):
     out_path = tmp_path / "empty.html"
     write_html_report({

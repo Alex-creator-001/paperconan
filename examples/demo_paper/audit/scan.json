@@ -1,7 +1,7 @@
 {
   "tool": "paperconan",
-  "tool_version": "0.2.0",
-  "scanned_at": "2026-05-29T02:14:05+00:00",
+  "tool_version": "0.3.0",
+  "scanned_at": "2026-05-29T02:33:25+00:00",
   "input_dir": "examples/demo_paper",
   "n_files": 2,
   "n_blocks_with_findings": 3,
@@ -1844,6 +1844,10 @@
   "cross_sheet_findings": [
     {
       "kind": "cross_sheet_position_identical",
+      "file": "ED_Fig4_qPCR.xlsx",
+      "file_a": "ED_Fig4_qPCR.xlsx",
+      "file_b": "ED_Fig4_qPCR.xlsx",
+      "same_file": true,
       "sheet_a": "donor_A",
       "sheet_b": "donor_B",
       "size_a": 36,
@@ -1878,8 +1882,7 @@
         }
       ],
       "severity": "high",
-      "rule": "donor_A and donor_B share 22/36 (61%) decimal values at SAME (row,col)",
-      "file": "ED_Fig4_qPCR.xlsx"
+      "rule": "donor_A and donor_B share 22/36 (61%) decimal values at SAME (row,col) across 2 sheets"
     }
   ]
 }

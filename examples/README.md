@@ -112,5 +112,5 @@ control) and a `medium` can be the real tell. You still have to read the paper.
 paperconan output is a **statistical signal, not a verdict**. The report footer says
 it, and so does this README: take findings to the original authors, PubPeer, the journal
 ethics inquiry channel, or a research integrity office — never to social media as an
-accusation. See [`../skill/references/interpretation.md`](../skill/references/interpretation.md)
+accusation. See [`../skills/paperconan/references/interpretation.md`](../skills/paperconan/references/interpretation.md)
 for the full guidance and response templates.
