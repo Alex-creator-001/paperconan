@@ -365,6 +365,41 @@ def detect_relations(rows, r0, r1, c0, c1, header):
     return findings
 
 
+# Above this many pairwise column relations in ONE block, the sheet is a dense /
+# correlated matrix (correlation tables, normalized replicate panels) where identical or
+# linear columns are expected by construction — not a duplication red flag. One real
+# proteomics sheet produced ~20,000 such 'high' relations, drowning the genuine signal.
+RELATION_FLOOD_CAP = 40
+
+
+def _demote_dense_relations(relations, cap=RELATION_FLOOD_CAP):
+    """Demote a flood of pairwise column relations to low severity (tagging them
+    ``dense_block``) so a dense matrix stops dominating high-severity output. Findings
+    are kept, not dropped — just down-weighted. Returns the same list."""
+    if len(relations) <= cap:
+        return relations
+    for r in relations:
+        r["severity"] = "low"
+        r["dense_block"] = True
+    return relations
+
+
+def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
+    """Apply the dense-flood demotion per (file, sheet), not per block: a dense matrix
+    is split into many numeric blocks, each holding only part of the column relations,
+    so the flood must be judged by the SHEET total. Mutates findings in place."""
+    by_sheet = {}
+    for b in report_blocks:
+        key = (b["file"], b["sheet"])
+        agg = by_sheet.setdefault(key, {"relations": [], "equal_pairs": []})
+        agg["relations"].extend(b.get("relations", []))
+        agg["equal_pairs"].extend(b.get("equal_pairs", []))
+    for agg in by_sheet.values():
+        _demote_dense_relations(agg["relations"], cap)   # same dict objects as in blocks
+        _demote_dense_relations(agg["equal_pairs"], cap)
+    return report_blocks
+
+
 def detect_arithmetic_progression(rows, r0, r1, c0, c1, header):
     findings = []
     for c in range(c0, c1):
@@ -764,6 +799,10 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
                                               relations=rel, progressions=ap, equal_pairs=eq,
                                               within_col=wc, identical_after_rounding=iar))
+
+    # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
+    # wide matrix's expected identical/linear columns don't flood high-severity output.
+    _demote_dense_sheets(report_blocks)
 
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.
