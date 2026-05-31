@@ -44,10 +44,16 @@
 | `identical_after_rounding` | 两列舍掉末位后完全相同 | 一列 = 另一列 × 小扰动 |
 | `many_equal_pairs` | 两个本该独立的列里有 ≥40% 行 byte-identical | 9/10 一致 + 1 格手改的指纹 |
 | `cross_sheet_position_identical` | 两张 sheet 在同行同列位置数值完全一样 | 同一份样本被分析了两次 |
-| `last_digit_chi_square` | 整 sheet 末位数字偏离 χ² 均匀分布 (p < 1e-6) | 真实测量末位应近似均匀 |
+| `last_digit_chi_square` | 整 sheet 末位数字偏离 χ² 均匀分布（BH-FDR 多重检验校正后 q ≤ 0.05） | 真实测量末位应近似均匀 |
 | `repeated_two_decimal_endings` | 末两位高度集中 | 编造数字常见模式 |
 
 每条命中都带 severity (`high` / `medium` / `low`) + 涉及的文件 / sheet / block 行范围 / 规则字符串，方便人工复核时直接定位。
+
+**跨 sheet 重复**还会额外给出上下文，降低误读：
+
+- **按图号分级**：解析 sheet 名里的图号（`Figure 5o` → `main:5`、`exFig.6i` → `ext:6`）。同一图号两个 panel 共享数据（合并曲线 vs 个体曲线的预期重画）自动**降级为 `low`**；只有跨图/跨文件的重复才保持 `high`/`medium`——让真正值得查的那条不被同图噪音淹没。
+- **`delta` 形态**：区分 `perfect_dup`（干净重画）/ `superset`（多一列重复样本，n=5 vs n=6）/ `value_tweaked`（就地改值，copy-then-tweak 指纹）/ `value_divergent`。
+- **`likely_benign`**：常见良性解释直接写进 finding（如"day/dose 轴""主图/扩展图共享 cohort，核对 legend"），报告里随卡片展示，避免把 signal 当 verdict。
 
 ---
 
@@ -85,22 +91,30 @@ paperconan path/to/paper_dir/ --out /tmp/audit-of-this-paper
 
 ### 自动抓取论文数据（v0.4）
 
-只有论文、没有本地数据时，可以让 paperconan 去开放数据仓库找：
+只有论文、没有本地数据时，可以让 paperconan 去开放数据源找：
 
 ```bash
-paperconan fetch "10.xxxx/your.doi"            # 列出 Zenodo/Figshare/Dryad 的候选数据集 + 匹配信号
+paperconan fetch "10.xxxx/your.doi"            # 列出 Zenodo/Figshare/Dryad/Europe PMC 候选 + 匹配信号
 paperconan fetch "10.xxxx/your.doi" --download zenodo:123456 --out data/
+paperconan fetch "10.xxxx/your.doi" --auto --out data/   # 直接下载排名最高的候选
 paperconan data/                                # 再照常分析
 ```
 
-只覆盖开放仓库、不绕付费墙。Zenodo / Figshare 可直接下载；Dryad 仅做检索（其下载接口需鉴权，命中后请到 Dryad 数据集页面手动下载）。很多论文没把数据存进可机读仓库，抓不到会如实告知。
+只覆盖开放数据源、**不绕付费墙、不抓取出版商页面**：
+
+- **Zenodo / Figshare**：keyless 直接下载。
+- **Europe PMC**：keyless。开放获取论文（很多 NIH/Wellcome 资助的 Nature 论文都在内）的补充材料以一个 zip 提供，`fetch` 会自动下载并解压出其中的 `.xlsx/.csv/.tsv`。
+- **Dryad**：仅做检索（下载接口需鉴权），命中后请到 Dryad 数据集页面手动下载。
+- **都没命中**：`fetch` 会按 DOI 输出一段期刊指引（出版商 + `doi.org` 文章链接 + 该刊 source data 的常见位置，如 Nature 的 `...MOESM<N>_ESM.xlsx`），而不是简单告诉你"没找到"——绝不暗示"查过=干净"。
+
+`fetch --download/--auto` 还会在下载目录写一个 `paperconan_source.json`（记录 DOI/标题/来源），随后 `paperconan <dir>` 会自动把它写进 scan.json 的 `paper` 字段做溯源；也可手动 `paperconan <dir> --doi <DOI> --title <T>` 标注。
 
 **report.html** 长这样（单文件、无外部依赖、可直接邮件/PubPeer 附件分享）：
 
 - 顶部摘要：n_files / n_sheets / high / medium / low 计数
 - 左侧边栏：按 severity / detector 类型 / 文件 勾选过滤 + 关键字搜索
-- 主区域：每条 finding 是一张可折叠卡片，里面直接渲染出**可疑表格片段**，高亮可疑列（黄底）和高亮行（红边）—— 用户不需要再打开 xlsx 翻位置
-- 末位数字 χ² 异常自带 0-9 inline 直方图
+- 主区域：每条 finding 是一张可折叠卡片，里面直接渲染出**可疑表格片段**，高亮可疑列（黄底）和高亮行（红边）—— 用户不需要再打开 xlsx 翻位置；有常见良性解释的，卡片里直接给出 `likely_benign` 旁注
+- 末位数字 χ² 异常（BH-FDR 校正后）自带 0-9 inline 直方图，并显示 q 值
 - 跨 sheet bit-identical collisions 单独成段，最高优先级展示
 
 ---
@@ -173,7 +187,7 @@ echo '@/path/to/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 - **量化产生的终位偏置**（细胞计数 / 4 视野平均 → 多 0.25 步长）会被标记为 "末位异常"
 - **共享的剂量轴 / 时间轴** 会被标记为 "跨列复制"
 
-报告里 high severity 的 anomaly **依然需要人工读 figure legend 和 Methods** 才能下判断。不要把 high = misconduct。
+不过这几类现在工具会主动帮你识别：同图重画的跨 sheet 复用会**自动降级**，剂量/时间轴、量化偏置等会附 `likely_benign` 旁注，末位 χ² 也做了多重检验校正（看 q 值而非裸 p）。即便如此，报告里 high severity 的 anomaly **依然需要人工读 figure legend 和 Methods** 才能下判断。不要把 high = misconduct。
 
 **Q: 我用它发现一篇看似有问题的论文，下一步该做什么？**
 
