@@ -23,6 +23,8 @@ def _print_table(cands):
             flags.append("DOI-match")
         if sig.get("title_overlap"):
             flags.append(f"title~{sig['title_overlap']}")
+        if not _resolve.is_confident_match(c):
+            flags.append("⚠ no DOI/title match")
         ntab = len(c.get("tabular_files", []))
         print(f"[{c['cand_id']}] {c['source']:8} tabular={ntab}/{c.get('all_files_count','?')} "
               f"{' '.join(flags):20} {c.get('title','')[:60]}")
@@ -39,6 +41,8 @@ def fetch_main(argv):
     mode.add_argument("--download", metavar="CAND_ID", help="download this candidate's files")
     mode.add_argument("--auto", action="store_true", help="download the top-ranked candidate")
     ap.add_argument("--out", default=None, help="output dir for downloads (--download/--auto only)")
+    ap.add_argument("--force", action="store_true",
+                    help="download even a candidate with no DOI/title match (--download)")
     ap.add_argument("--all", action="store_true", help="download non-tabular files too")
     ap.add_argument("--per-source", type=int, default=5, help="max results per repository (default: 5)")
     args = ap.parse_args(argv)
@@ -53,12 +57,28 @@ def fetch_main(argv):
                   f"(check the cand_id from a list run, or increase --per-source)",
                   file=sys.stderr)
             return 2
+        # Guard: a repo search can return unrelated deposits. Refuse to download a
+        # candidate that doesn't match the paper unless the user insists with --force.
+        if not _resolve.is_confident_match(target) and not args.force:
+            print(f"candidate {args.download!r} has no DOI/title match to this paper "
+                  f"(title: {target.get('title','')[:60]!r}); it is probably NOT this "
+                  f"paper's data. Re-run with --force if you are sure.", file=sys.stderr)
+            return 2
     elif args.auto:
         if not cands:
             print("--auto: no candidate datasets found; cannot select automatically",
                   file=sys.stderr)
             return 1
-        target = cands[0]
+        # Only auto-pick a candidate we are confident is the paper's own dataset;
+        # otherwise fall through to journal guidance rather than fetch a stranger's data.
+        if _resolve.is_confident_match(cands[0]):
+            target = cands[0]
+        else:
+            q = _resolve.normalize_query(args.query)
+            print("--auto: no candidate confidently matches this paper "
+                  "(no DOI match, weak title overlap), so nothing was downloaded.\n")
+            print(_resolve.journal_guidance({"doi": q.get("doi"), "title": q.get("title")}))
+            return 1
 
     if target is None:
         if args.json:

@@ -90,6 +90,21 @@ def journal_guidance(paper):
     return "\n".join(lines)
 
 
+def is_confident_match(cand, min_title=0.5):
+    """Is this candidate confidently the paper's own dataset?
+
+    Repository full-text search (especially figshare/zenodo) routinely returns
+    completely unrelated deposits. Only a DOI listed in the dataset's relations,
+    or a strong title overlap, should count as "this is the paper's data" — file
+    count and source are NOT evidence of a match. Used to stop ``fetch --auto`` /
+    ``--download`` from silently fetching a stranger's data.
+    """
+    sig = cand.get("match_signals") or {}
+    if sig.get("doi_in_related"):
+        return True
+    return (sig.get("title_overlap") or 0) >= min_title
+
+
 def _tokens(s):
     return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
 

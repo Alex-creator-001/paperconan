@@ -63,3 +63,15 @@ def test_journal_guidance_never_recommends_scraping():
     """Honesty rule: paperconan must not tell users (or imply) it scrapes publishers."""
     g = _resolve.journal_guidance({"doi": "10.1038/x"})
     assert "manual" in g.lower()
+
+
+def test_is_confident_match_requires_doi_or_strong_title():
+    """A repo full-text search can return totally unrelated deposits; only a DOI hit
+    or a strong title overlap should count as 'this is the paper's data'."""
+    assert _resolve.is_confident_match({"match_signals": {"doi_in_related": True}})
+    assert _resolve.is_confident_match({"match_signals": {"title_overlap": 0.8}})
+    # the failure mode we actually hit: many tabular files, but no real match
+    assert not _resolve.is_confident_match(
+        {"match_signals": {"doi_in_related": False, "title_overlap": 0.02}})
+    assert not _resolve.is_confident_match({"match_signals": None})
+    assert not _resolve.is_confident_match({})

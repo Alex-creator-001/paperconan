@@ -70,7 +70,11 @@ Workflow:
 1. Run `paperconan fetch "<DOI>"`. Each candidate has `match_signals`
    (`doi_in_related`, `title_overlap`, `author_overlap`).
 2. **You decide the match** — prefer `doi_in_related: true`; otherwise weigh title/author
-   overlap. If unsure, show the user the candidates and ask.
+   overlap. If unsure, show the user the candidates and ask. Repository full-text search
+   (especially figshare/zenodo) often returns **unrelated deposits**, so `fetch --auto`
+   refuses to download a candidate with no DOI match / weak title overlap (it falls back
+   to journal guidance), and `fetch --download <id>` of such a candidate requires `--force`.
+   A candidate flagged `⚠ no DOI/title match` in the listing is probably not this paper's data.
 3. Download the chosen candidate, then run `paperconan <dir>` on the output.
 
 ### Honesty rules (REQUIRED)
