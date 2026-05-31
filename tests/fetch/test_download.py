@@ -102,6 +102,53 @@ def test_download_candidate_extracts_tabular_from_supplementary_zip(monkeypatch,
     assert not (tmp_path / "PMC1_supplementary.zip").exists(), "zip should be cleaned up"
 
 
+def test_supplementary_archive_downloads_with_larger_cap_than_per_file(monkeypatch, tmp_path):
+    """A supplementary zip bundles ALL supplementary material (often 100MB+ of video),
+    yet we only extract its small tabular members. So the archive must download with a
+    much larger byte cap than an individual file, or big-but-tabular zips get truncated
+    and silently lost (the failure seen on Europe PMC archives)."""
+    import io, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("table.csv", b"a,b\n1,2\n")
+    zbytes = buf.getvalue()
+    calls = []
+    def fake_dl(url, dest, **kw):
+        calls.append({"url": url, "max_bytes": kw.get("max_bytes")})
+        open(dest, "wb").write(zbytes)
+        return {"ok": True, "path": dest}
+    monkeypatch.setattr(_download, "download_file", fake_dl)
+    cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
+            "supplementary_archive": {"url": "https://ebi/PMC1/supplementaryFiles",
+                                      "name": "PMC1.zip"}}
+    _download.download_candidate(cand, str(tmp_path))
+    arch_call = next(c for c in calls if c["url"].endswith("supplementaryFiles"))
+    assert arch_call["max_bytes"] == _download._ARCHIVE_MAX
+    assert _download._ARCHIVE_MAX > _download._DEFAULT_MAX
+
+
+def test_supplementary_archive_extraction_still_caps_each_table(monkeypatch, tmp_path):
+    """The larger archive cap must NOT relax the per-table cap: an individual table
+    bigger than the per-file limit is still skipped (one bloated sheet shouldn't slip in
+    just because it rode inside an archive)."""
+    import io, os, zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("small.csv", b"a,b\n1,2\n")        # ~8 bytes, kept
+        z.writestr("huge.csv", b"x" * 500)            # 500 bytes, over the per-table cap
+    zbytes = buf.getvalue()
+    monkeypatch.setattr(_download, "download_file",
+                        lambda url, dest, **kw: (open(dest, "wb").write(zbytes),
+                                                 {"ok": True, "path": dest})[1])
+    cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
+            "supplementary_archive": {"url": "https://ebi/PMC1/supplementaryFiles",
+                                      "name": "PMC1.zip"}}
+    summary = _download.download_candidate(cand, str(tmp_path), max_bytes=100)
+    names = sorted(os.path.basename(p) for p in summary["downloaded"])
+    assert names == ["small.csv"]
+    assert not (tmp_path / "huge.csv").exists()
+
+
 def test_download_file_rejects_non_http_scheme(tmp_path):
     res = _download.download_file("file:///etc/passwd", str(tmp_path / "x.csv"))
     assert res["ok"] is False

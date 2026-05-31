@@ -14,7 +14,11 @@ from ._files import is_tabular
 SOURCE_SIDECAR = "paperconan_source.json"
 
 _UA = "paperconan-fetch/0.4 (+https://github.com/zixixr/paperconan)"
-_DEFAULT_MAX = 50 * 1024 * 1024  # 50 MB
+_DEFAULT_MAX = 50 * 1024 * 1024     # 50 MB — per individual file / per extracted table
+# A supplementary archive bundles ALL supplementary material (often 100MB+ of video/
+# imaging) but we only keep its small tabular members, so it needs a much larger cap
+# than a single file — otherwise big-but-tabular Europe PMC zips truncate and are lost.
+_ARCHIVE_MAX = 250 * 1024 * 1024    # 250 MB — whole supplementary zip
 
 
 def download_file(url, dest_path, timeout=60, max_bytes=_DEFAULT_MAX):
@@ -70,10 +74,14 @@ def _extract_tabular_zip(zip_bytes, out_dir, max_member_bytes=_DEFAULT_MAX):
     return extracted
 
 
-def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes):
-    """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip."""
+def _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
+                                    archive_max=_ARCHIVE_MAX):
+    """Fetch a supplementary zip (Europe PMC), extract its tabular members, drop the zip.
+
+    The archive downloads with the larger ``archive_max`` cap; each extracted table is
+    still capped at the per-file ``max_bytes``."""
     tmp_zip = os.path.join(out_dir, arch.get("name") or "supplementary.zip")
-    res = download_file(arch["url"], tmp_zip, max_bytes=max_bytes)
+    res = download_file(arch["url"], tmp_zip, max_bytes=archive_max)
     if not res.get("ok"):
         skipped.append({"name": arch.get("name"), "reason": res.get("skipped_reason")})
         return
@@ -101,7 +109,8 @@ def _write_source_sidecar(cand, out_dir):
         pass  # provenance is best-effort; never fail a download over it
 
 
-def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX):
+def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX,
+                       archive_max=_ARCHIVE_MAX):
     if tabular_only:
         files = cand.get("tabular_files", [])
     else:
@@ -118,6 +127,7 @@ def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX)
             skipped.append({"name": f["name"], "reason": res.get("skipped_reason")})
     arch = cand.get("supplementary_archive")
     if arch and arch.get("url"):
-        _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes)
+        _download_supplementary_archive(arch, out_dir, downloaded, skipped, max_bytes,
+                                        archive_max=archive_max)
     return {"cand_id": cand.get("cand_id"), "out_dir": out_dir,
             "downloaded": downloaded, "skipped": skipped}
