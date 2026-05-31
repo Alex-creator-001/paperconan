@@ -1,9 +1,13 @@
 """Defensive file download: redirects (urllib default), timeout, size cap,
 content-type sniffing so an HTML error page is never saved as data."""
 from __future__ import annotations
+import json
 import os
 import urllib.error
 import urllib.request
+
+# Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
+SOURCE_SIDECAR = "paperconan_source.json"
 
 _UA = "paperconan-fetch/0.4 (+https://github.com/zixixr/paperconan)"
 _DEFAULT_MAX = 50 * 1024 * 1024  # 50 MB
@@ -43,12 +47,25 @@ def download_file(url, dest_path, timeout=60, max_bytes=_DEFAULT_MAX):
     return {"ok": True, "path": dest_path, "size": len(data)}
 
 
+def _write_source_sidecar(cand, out_dir):
+    """Record which paper/dataset these downloads came from, for scan.json provenance."""
+    prov = {"doi": cand.get("doi"), "title": cand.get("title"),
+            "source": cand.get("source"), "cand_id": cand.get("cand_id"),
+            "related_dois": cand.get("related_dois") or []}
+    try:
+        with open(os.path.join(out_dir, SOURCE_SIDECAR), "w", encoding="utf-8") as fh:
+            json.dump(prov, fh, indent=2, default=str)
+    except OSError:
+        pass  # provenance is best-effort; never fail a download over it
+
+
 def download_candidate(cand, out_dir, tabular_only=True, max_bytes=_DEFAULT_MAX):
     if tabular_only:
         files = cand.get("tabular_files", [])
     else:
         files = cand.get("all_files") or cand.get("tabular_files", [])
     os.makedirs(out_dir, exist_ok=True)
+    _write_source_sidecar(cand, out_dir)
     downloaded, skipped = [], []
     for f in files:
         dest = os.path.join(out_dir, os.path.basename(f["name"]))

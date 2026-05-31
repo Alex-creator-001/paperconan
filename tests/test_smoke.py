@@ -169,6 +169,37 @@ def test_tsv_and_text_columns_are_handled(tmp_path):
     assert "identical_column" in kinds, f"expected identical_column from TSV, got {kinds}"
 
 
+def test_scan_reads_provenance_sidecar(tmp_path):
+    """A paperconan_source.json left by `fetch` is read so scan.json records which
+    paper the data belongs to."""
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "t.csv").write_text("a,b\n1.234,5.678\n2.345,6.789\n3.456,7.890\n", encoding="utf-8")
+    (data / "paperconan_source.json").write_text(
+        '{"doi": "10.1038/s41590-026-02471-0", "title": "CLEC12B"}', encoding="utf-8")
+    res = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    assert res["paper"]["doi"] == "10.1038/s41590-026-02471-0"
+    assert res["paper"]["title"] == "CLEC12B"
+
+
+def test_scan_paper_arg_overrides_sidecar(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "t.csv").write_text("a,b\n1.234,5.678\n2.345,6.789\n3.456,7.890\n", encoding="utf-8")
+    (data / "paperconan_source.json").write_text('{"doi": "10.x/sidecar"}', encoding="utf-8")
+    res = scan_dir(str(data), str(tmp_path / "out"), write_html=False,
+                   paper={"doi": "10.x/override"})
+    assert res["paper"]["doi"] == "10.x/override"
+
+
+def test_scan_without_provenance_has_null_paper(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "t.csv").write_text("a,b\n1.234,5.678\n2.345,6.789\n3.456,7.890\n", encoding="utf-8")
+    res = scan_dir(str(data), str(tmp_path / "out"), write_html=False)
+    assert res["paper"] is None
+
+
 def test_write_html_report_handles_empty_scan(tmp_path):
     out_path = tmp_path / "empty.html"
     write_html_report({

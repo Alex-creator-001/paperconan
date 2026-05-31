@@ -76,8 +76,9 @@ Workflow:
 ### Honesty rules (REQUIRED)
 - Searched repositories are Zenodo / Figshare / Dryad only.
 - If a candidate has no `.xlsx/.csv/.tsv`, say so and name the other file types.
-- If nothing matches, tell the user the data may be in journal supplementary
-  (paywalled) or simply not deposited — never imply "checked = clean".
+- If nothing matches, `fetch` now prints a journal-guidance block derived from the
+  DOI (publisher + `doi.org` article link + where that publisher puts source data,
+  e.g. Nature's `...MOESM<N>_ESM.xlsx`). Relay it — never imply "checked = clean".
 - Do not bypass paywalls or scrape publisher sites.
 - Download works keyless for **Zenodo and Figshare**. **Dryad** is discovery/listing only —
   its download API needs authentication, so report Dryad hits to the user and point them to
@@ -98,9 +99,10 @@ Three artifacts may exist in the output dir:
 ```json
 {
   "tool": "paperconan",
-  "tool_version": "0.2.0",        // for provenance when the report is archived / shared
+  "tool_version": "0.4.0",        // for provenance when the report is archived / shared
   "scanned_at": "2026-05-29T02:08:53+00:00",
   "input_dir": "...",
+  "paper": {"doi": "10.1038/...", "title": "..."},  // provenance, or null (see below)
   "n_files": 3,
   "n_blocks_with_findings": 8,
   "relations_blocks": [
@@ -115,11 +117,20 @@ Three artifacts may exist in the output dir:
       "identical_after_rounding": [...] // cells matching after rounding
     }
   ],
-  "digit_distribution": [...],   // per-sheet last-digit χ² (flag p < 1e-6)
-  "decimal_endings": [...],      // per-sheet two-decimal ending over-representation
-  "cross_sheet_findings": [...]  // bit-identical / value-overlap across sheets in same file
+  // per-sheet last-digit χ². Each: {label, n, chi2, p, p_adj, fdr_significant, counts, top}
+  // Filter on fdr_significant (BH-FDR q ≤ 0.05), NOT raw p — dozens of sheets are tested.
+  "digit_distribution": [...],
+  // per-sheet two-decimal ending counts. Each: {label, n, n_unique, top}
+  "decimal_endings": [...],
+  // bit-identical / value-overlap across sheets (same file OR cross-file). See fields below.
+  "cross_sheet_findings": [...]
 }
 ```
+
+`paper` provenance is populated from a `paperconan_source.json` sidecar that
+`paperconan fetch --download/--auto` writes alongside the data, or from
+`paperconan <dir> --doi <DOI> --title <T>`. It is `null` when neither is present
+(a bare directory audit) — never read `null` as "no paper".
 
 ### Every finding has
 
@@ -128,6 +139,17 @@ Three artifacts may exist in the output dir:
 - `rule`: human-readable rule string e.g. `col[27] ≡ col[28] in 9/10 rows`
 - `n`: sample size for the rule
 - `evidence`: block snippet `{headers, rows, highlight_cols, ...}` — used by report.html, but you can also surface a few highlighted values if useful
+- `likely_benign` (optional): a common innocent explanation for this kind — surface it to the user alongside the finding so a signal is never reported as a verdict
+
+### cross_sheet_findings fields
+
+- `same_file`: whether the two sheets live in one workbook or span two files
+- `figure_a` / `figure_b` / `same_figure`: parsed figure identity (e.g. `main:5`, `ext:6`). When `same_figure` is true the overlap is a combined-vs-individual re-plot of one display item — it is **downgraded to `low`** and carries a `context` note. Cross-figure / cross-file overlaps keep `high`/`medium` and are the ones worth checking against the legend.
+- `delta`: how the two near-duplicate tables differ — `{pattern, modified_cells, shared_values, only_in_a, only_in_b}`. `pattern` is one of:
+  - `perfect_dup` — identical value multiset (clean re-plot)
+  - `superset` — one side strictly contains the other (e.g. an extra replicate column, n=5 vs n=6)
+  - `value_tweaked` — cells changed in place (copy-then-tweak fingerprint; most worth investigating)
+  - `value_divergent` — both sides hold values the other lacks
 
 ### What to surface to the user
 

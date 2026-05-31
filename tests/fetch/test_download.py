@@ -52,6 +52,26 @@ def test_download_candidate_tabular_only(monkeypatch, tmp_path):
     assert summary["downloaded"][0].endswith("a.csv")
 
 
+def test_download_candidate_writes_provenance_sidecar(monkeypatch, tmp_path):
+    """Downloading must record where the data came from, so the later audit can
+    stamp scan.json with the paper's DOI/title (provenance for archiving)."""
+    import json
+    monkeypatch.setattr(_download, "download_file",
+                        lambda url, dest, **kw: (open(dest, "wb").write(b"x"),
+                                                 {"ok": True, "path": dest})[1])
+    cand = {"cand_id": "zenodo:1", "source": "zenodo", "doi": "10.5281/zenodo.42",
+            "title": "My deposited data", "related_dois": ["10.1038/paper"],
+            "tabular_files": [{"name": "a.csv", "ext": "csv", "size": 1,
+                               "download_url": "https://x/a.csv"}]}
+    _download.download_candidate(cand, str(tmp_path))
+    sidecar = tmp_path / "paperconan_source.json"
+    assert sidecar.exists(), "expected a provenance sidecar next to the downloads"
+    p = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert p["doi"] == "10.5281/zenodo.42"
+    assert p["cand_id"] == "zenodo:1"
+    assert p["source"] == "zenodo"
+
+
 def test_download_file_rejects_non_http_scheme(tmp_path):
     res = _download.download_file("file:///etc/passwd", str(tmp_path / "x.csv"))
     assert res["ok"] is False

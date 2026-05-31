@@ -712,7 +712,22 @@ def detect_collisions(grids):
     return findings
 
 
-def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
+def _load_provenance(in_dir, paper):
+    """Resolve scan provenance: an explicit `paper` override wins; otherwise read a
+    paperconan_source.json sidecar left by `fetch`; otherwise None."""
+    if paper:
+        return paper
+    sidecar = os.path.join(in_dir, "paperconan_source.json")
+    if os.path.isfile(sidecar):
+        try:
+            with open(sidecar, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
     files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv")
                     for p in glob.glob(os.path.join(in_dir, pat))})
     if not files:
@@ -776,6 +791,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True):
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                input_dir=in_dir,
+               paper=_load_provenance(in_dir, paper),
                n_files=len(files),
                n_blocks_with_findings=len(report_blocks),
                relations_blocks=report_blocks,
@@ -881,11 +897,18 @@ def main():
                     help="Also write REPORT.md (default: only scan.json + report.html)")
     ap.add_argument("--no-html", action="store_true",
                     help="Skip the HTML report (only scan.json, plus REPORT.md if --md)")
+    ap.add_argument("--doi", default=None,
+                    help="Record this paper DOI as scan.json provenance "
+                         "(overrides any paperconan_source.json sidecar)")
+    ap.add_argument("--title", default=None, help="Record this paper title as provenance")
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
     out_dir = args.out or os.path.join(args.in_dir, "audit")
     write_html = not args.no_html
-    res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html)
+    paper = None
+    if args.doi or args.title:
+        paper = {"doi": args.doi, "title": args.title}
+    res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html, paper=paper)
     outputs = [f"{out_dir}/scan.json"]
     if write_html:
         outputs.append(f"{out_dir}/report.html")
