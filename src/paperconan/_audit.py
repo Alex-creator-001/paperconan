@@ -342,8 +342,11 @@ def detect_relations(rows, r0, r1, c0, c1, header):
                                          severity="high",
                                          rule=f"col[{ci}] + col[{cj}] = {K:.6g}"))
             # exact linear (non-identical)
-            if n >= 5 and np.std(x) > 0:
-                slope, intercept, r, _p, _se = stats.linregress(x, y)
+            if n >= 5 and np.ptp(x) > 1e-12:
+                try:
+                    slope, intercept, r, _p, _se = stats.linregress(x, y)
+                except ValueError:
+                    continue
                 resid = y - (slope * x + intercept)
                 if np.std(y) > 0 and np.std(resid) < 1e-9 and abs(r) > 0.99:
                     if not (abs(slope - 1) < 1e-9 and abs(intercept) < 1e-9):
