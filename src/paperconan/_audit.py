@@ -143,6 +143,12 @@ def load_table(path):
         return load_csv_rows(path, delimiter="\t")
     if ext == ".csv":
         return load_csv_rows(path, delimiter=",")
+    if ext == ".pdf":
+        from ._extract import load_pdf_tables
+        return load_pdf_tables(path)
+    if ext == ".docx":
+        from ._extract import load_docx_tables
+        return load_docx_tables(path)
     return load_workbook_rows(path)
 
 
@@ -766,11 +772,12 @@ def _load_provenance(in_dir, paper):
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None):
-    files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv")
+    files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv", "*.pdf", "*.docx")
                     for p in glob.glob(os.path.join(in_dir, pat))})
     if not files:
-        sys.exit(f"no .xlsx / .csv / .tsv files in {in_dir}\n"
-                 f"(paperconan reads .xlsx, .csv and .tsv; .xls/.xlsm are not supported)")
+        sys.exit(f"no .xlsx / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
+                 f"(paperconan reads .xlsx, .csv, .tsv, and tables inside .pdf / .docx; "
+                 f".xls/.xlsm are not supported)")
 
     report_blocks = []
     per_sheet_numbers = {}
@@ -932,8 +939,8 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "fetch":
         from .fetch._cli import fetch_main
         sys.exit(fetch_main(sys.argv[2:]))
-    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for fabrication red flags")
-    ap.add_argument("in_dir", help="Directory containing the paper's *.xlsx source data files")
+    ap = argparse.ArgumentParser(description="Scan a paper's source data (xlsx/csv/tsv, or tables inside pdf/docx) for fabrication red flags")
+    ap.add_argument("in_dir", help="Directory with the paper's source data (*.xlsx/*.csv/*.tsv, or *.pdf/*.docx supplements)")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")
     ap.add_argument("--md", action="store_true",
                     help="Also write REPORT.md (default: only scan.json + report.html)")

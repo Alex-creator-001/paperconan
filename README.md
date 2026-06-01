@@ -16,7 +16,7 @@
 
 `paperconan` 是一个 **论文数据 sanity check** 小工具。
 
-喂一份 supplementary source data（一个目录，里面装着 `.xlsx` / `.csv` / `.tsv`）进去，它会跑十几组数值取证检测器，输出 **scan.json**（结构化的全部命中）+ **report.html**（自包含的可交互法证报告，每条 finding 直接嵌可疑表格片段并高亮可疑列/行），告诉你哪些位置值得人工再看一眼。
+喂一份 supplementary source data（一个目录，里面装着 `.xlsx` / `.csv` / `.tsv`，**也可以是补充材料 `.pdf` / `.docx` 里的表格**）进去，它会跑十几组数值取证检测器，输出 **scan.json**（结构化的全部命中）+ **report.html**（自包含的可交互法证报告，每条 finding 直接嵌可疑表格片段并高亮可疑列/行），告诉你哪些位置值得人工再看一眼。
 
 **适合谁**：
 
@@ -75,6 +75,9 @@ git clone https://github.com/zixixr/paperconan.git
 cd paperconan
 pip install .
 
+# 想顺带审补充材料里 .pdf / .docx 的表格，装上对应可选依赖（纯 Python、无 Java/系统依赖）：
+pip install '.[all]'      # 或 .[pdf] / .[docx] 单装
+
 # 跑一篇论文（指向其 source data 目录）
 paperconan path/to/paper_dir/
 
@@ -111,6 +114,20 @@ paperconan data/                                # 再照常分析
 - **都没命中**：`fetch` 会按 DOI 输出一段期刊指引（出版商 + `doi.org` 文章链接 + 该刊 source data 的常见位置，如 Nature 的 `...MOESM<N>_ESM.xlsx`），而不是简单告诉你"没找到"——绝不暗示"查过=干净"。
 
 `fetch --download/--auto` 还会在下载目录写一个 `paperconan_source.json`（记录 DOI/标题/来源），随后 `paperconan <dir>` 会自动把它写进 scan.json 的 `paper` 字段做溯源；也可手动 `paperconan <dir> --doi <DOI> --title <T>` 标注。
+
+### 审补充材料 PDF / Word 里的表格（v0.5）
+
+很多数据造假根本不在可下载的 `.xlsx` source data 里，而是**就摆在论文/补充材料本身**——补充 PDF 的附表、Word 附录表。这类"不需要单独 source data、看论文就能查"的数值，paperconan 现在能直接吃进来：
+
+```bash
+pip install '.[pdf]'                 # 或 .[docx] / .[all]
+paperconan path/to/dir_with_si_pdf/  # 目录里有 .pdf / .docx 即可，和 xlsx 混放也行
+```
+
+- 从 PDF / Word 里抽出的**每一张表**变成一个 sheet，命名带溯源：PDF 是 `<文件名>!p<页>_t<第几张表>`、Word 是 `<文件名>!t<第几张表>`——报告里一眼看出"这条命中来自补充 PDF 第 3 页第 1 张表"。
+- 抽出来的表走的是**和 xlsx 完全相同的那套数值检测器**（等差数列、末位偏置、列复制、跨表重复……），不是新算法。
+- **只抽真正的结构化表格**：不从 bar chart / 曲线的像素里数字化数据点（数字化误差本身会触发等差/重复检测器造成假阳性），也不做扫描件 OCR。图表像素数字化 / 图像取证仍是未做项（见路线图）。
+- 可选依赖缺失时给出明确提示（`pip install 'paperconan[pdf]'`），绝不影响只跑 xlsx 的基础安装。
 
 **report.html** 长这样（单文件、无外部依赖、可直接邮件/PubPeer 附件分享）：
 
@@ -174,13 +191,16 @@ echo '@/path/to/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 
 **Q: 它会漏掉哪些造假？**
 
-会。`paperconan` 只看数值表格 source data。下面这些它一概查不到：
+会。`paperconan` 只看**数值表格**——无论它来自 `.xlsx/.csv/.tsv`，还是补充材料 `.pdf/.docx` 里的表格。下面这些它一概查不到：
 
-- 图像 PS / Western blot 拼接 / 显微镜照片重复使用
-- 临床数据造假但 source data 没公开
+- 图像 PS / Western blot 拼接 / 显微镜照片重复使用（图像取证是另一套，仍未做）
+- **图表（bar chart / 曲线）里的数据**——只要数字没以表格形式给出，就读不到（不做像素数字化，详见路线图）
+- 临床数据造假但 source data / 补充材料都没公开
 - 实验完全没做但写进文章的部分
 - 统计方法选择性使用 (p-hacking)
 - 引用造假 / 同行评议造假
+
+> 注：补充材料 PDF/Word 的**表格**现在能读了（v0.5，需 `pip install 'paperconan[all]'`）——这覆盖了"不需要单独 source data、数据就摆在论文里"的一大类。但"摆在图里"的数据（柱状图、折线图）和图像本身仍在覆盖之外。
 
 **Q: 它会误报吗？**
 
@@ -226,11 +246,13 @@ echo '@/path/to/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 - [x] HTML 报告（在 REPORT.md 之外）— v0.2 已实现，并取代 REPORT.md 成为默认人类可读输出
 - [x] 把每条 finding 嵌入对应的表格片段 — v0.2 实现为可交互 HTML 表格（不是截图）
 - [x] 作为 skill 给 agent 调用 — v0.2 已实现，见 skills/paperconan/SKILL.md
+- [x] 补充材料 PDF / Word 表格输入 — v0.5 已实现（`pip install 'paperconan[all]'`，复用全部数值检测器）
 - [ ] PubPeer 风格的 "为什么这值得复核" 旁注（LLM 生成的可选）
 
 中长期：
 
 - [ ] 跨论文扫描（一个 lab 的多篇论文一起跑，看跨论文数据复用）
+- [ ] 图表像素数字化（从 bar chart / 曲线里提取数据点）— 精度与假阳性风险高，需谨慎做
 - [ ] 图像取证检测（Western blot / 显微镜照片重复）— 这块需要专门做
 - [ ] 与 [PubPeer Public API](https://pubpeer.com/api) 联动
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paperconan"
-version = "0.4.0"
+version = "0.5.0"
 description = "Numeric forensics for paper supplementary source-data: surfaces fabrication-style patterns (signal, not verdict)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,13 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
 ]
+
+[project.optional-dependencies]
+# Extract tables out of supplementary PDF / Word files. Optional so the base
+# install (xlsx/csv/tsv) stays dependency-light; the parsers are imported lazily.
+pdf = ["pdfplumber>=0.11"]
+docx = ["python-docx>=1.1"]
+all = ["pdfplumber>=0.11", "python-docx>=1.1"]
 
 [project.urls]
 Homepage = "https://github.com/zixixr/paperconan"
