@@ -37,7 +37,7 @@ def _esc(s: Any) -> str:
 
 # ---------- finding extraction ----------
 
-_PER_BLOCK_GROUPS = ("relations", "progressions", "equal_pairs",
+_PER_BLOCK_GROUPS = ("relations", "progressions", "equal_pairs", "row_pairs",
                      "within_col", "identical_after_rounding", "grim")
 
 

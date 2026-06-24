@@ -29,6 +29,7 @@ essentials; this file is the complete reference (it travels in the skill bundle)
       "relations": [...],              // cross-column relations
       "progressions": [...],           // arithmetic progressions
       "equal_pairs": [...],            // pairs of columns with many equal rows
+      "row_pairs": [...],              // pairs of rows with suspicious low-digit coupling
       "within_col": [...],             // within-column anomalies
       "identical_after_rounding": [...], // cells matching after rounding
       "grim": [...]                    // GRIM/GRIMMER: reported mean/SD impossible for integer data
@@ -64,6 +65,18 @@ essentials; this file is the complete reference (it travels in the skill bundle)
 - `dense_block` (optional, column-relation / equal-pair findings): `true` means this finding comes from a sheet that floods with pairwise column relations (a dense / correlated matrix — correlation tables, normalized replicate panels). Such findings are auto-demoted to `low` severity because identical/linear columns there are expected by construction, not a duplication red flag — don't treat them as high-severity signal
 - `value_sample` (optional, within-column findings): small sample of distinct values from the column. Use it for repeated-value explanation, last-two-decimal checks, and fixed-denominator triage.
 - `col_a_sample` / `col_b_sample` (optional, pairwise relation findings): small value samples from the relevant column(s), used as an evidence peek when the full table is large. These samples help explain cross-column transforms and relation prefilters, but they do not replace opening the original table when making a serious claim.
+
+## row_pair_digit_coupling fields
+
+- `row_a` / `row_b`: row labels inferred from text cells immediately left of the numeric block, or fallback row numbers.
+- `row_a_idx` / `row_b_idx`: 0-based absolute row indices; evidence highlights these rows.
+- `same_decimal1`: count of aligned numeric cell pairs sharing the first digit after the decimal point.
+- `same_ones_decimal1`: count sharing both the ones digit and the first decimal digit.
+- `coarse_10_diff`: count of changed pairs where `row_b - row_a` is a nonzero multiple of 10.
+- `top_diffs`: most common paired differences, rounded for compact display.
+- `examples`: small list of aligned columns with `a`, `b`, and `diff` values.
+
+Treat this as a local row-pair anomaly. Confirm row independence and exclude formula-generated grids, low-cardinality scores, and legitimate transformations before escalating.
 
 ## cross_sheet_findings fields
 

@@ -571,10 +571,14 @@ def _attach_evidence(findings, sheet, r0, r1, c0, c1, header):
             if k in f and isinstance(f[k], int):
                 hi_cols.append(f[k])
         hi_rows = []
+        for k in ("row_a_idx", "row_b_idx", "row_idx"):
+            if k in f and isinstance(f[k], int):
+                hi_rows.append(f[k] + 1)
         # identical_after_rounding lists specific (row, col) example cells (1-based).
         for ex in f.get("example_cells", []) or []:
             try:
                 hi_rows.append(int(ex[0]))
+                hi_cols.append(int(ex[1]) - 1)
             except (TypeError, ValueError, IndexError):
                 pass
         f["evidence"] = _block_evidence(sheet, r0, r1, c0, c1, header,
@@ -709,6 +713,191 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                          col_a_sample=sa, col_b_sample=sb,
                                          rule=f"col[{cj}] - col[{ci}] only takes {len(uniq)} discrete values"))
     return findings
+
+
+_ROW_PAIR_MAX_ROWS = 80
+_ROW_PAIR_MAX_COLS = 200
+_ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
+
+
+def _row_label(sheet, r, c0):
+    labels = []
+    for c in range(max(0, c0 - 4), c0):
+        v = sheet.cell(r, c)
+        if v is not None and not is_num(v):
+            s = str(v).strip()
+            if s:
+                labels.append(s)
+    return " | ".join(labels) if labels else f"row {r + 1}"
+
+
+def _has_fractional_part(v):
+    fv = float(v)
+    return abs(fv - round(fv)) > 1e-9
+
+
+def _ones_digit(v):
+    return int(math.floor(abs(float(v)) + 1e-9)) % 10
+
+
+def _decimal_digit(v, place=1):
+    scale = 10 ** place
+    return int(math.floor(abs(float(v)) * scale + 1e-8)) % 10
+
+
+def _is_multiple_of_ten_diff(d):
+    if abs(d) < 10 - 1e-8:
+        return False
+    nearest = round(d / 10.0) * 10.0
+    return abs(d - nearest) <= 1e-7
+
+
+def _row_pair_low_cardinality_integer_like(x, y):
+    combined = np.concatenate([x, y])
+    finite = combined[np.isfinite(combined)]
+    if len(finite) == 0:
+        return True
+    near_integer = np.mean(np.abs(finite - np.round(finite)) < 1e-9)
+    distinct = len(set(np.round(finite, 4).tolist()))
+    max_abs = float(np.max(np.abs(finite)))
+    return bool(near_integer >= 0.9 and max_abs <= 20 and distinct <= max(5, len(finite) // 4))
+
+
+def detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header, min_n=10):
+    """Detect suspicious paired rows that preserve low-order digits across many cells.
+
+    This targets source-data layouts where replicate/condition rows are aligned by
+    measurement column. A concerning pattern is: row B differs from row A in value,
+    but the first decimal digit and often the ones digit are preserved across many
+    paired cells, with differences frequently landing on coarse multiples of 10.
+    """
+    findings = []
+    n_rows = r1 - r0
+    n_cols = c1 - c0
+    if n_rows < 2 or n_cols < min_n:
+        return findings
+    if n_rows > _ROW_PAIR_MAX_ROWS or n_cols > _ROW_PAIR_MAX_COLS:
+        return findings
+
+    labels = {r: _row_label(sheet, r, c0) for r in range(r0, r1)}
+    for i, ra in enumerate(range(r0, r1)):
+        label_a = labels[ra]
+        if _AXIS_CONTEXT_LABEL_RE.search(label_a):
+            continue
+        a = sheet.numeric[ra, c0:c1]
+        for rb in range(r0 + i + 1, r1):
+            label_b = labels[rb]
+            if _AXIS_CONTEXT_LABEL_RE.search(label_b):
+                continue
+            b = sheet.numeric[rb, c0:c1]
+            mask = ~np.isnan(a) & ~np.isnan(b)
+            n = int(mask.sum())
+            if n < min_n:
+                continue
+            x = a[mask].astype(float)
+            y = b[mask].astype(float)
+            cols = [c for c, keep in zip(range(c0, c1), mask.tolist()) if keep]
+
+            if _row_pair_low_cardinality_integer_like(x, y):
+                continue
+
+            non_integer_pairs = sum(
+                1 for xv, yv in zip(x, y)
+                if _has_fractional_part(xv) or _has_fractional_part(yv)
+            )
+            if non_integer_pairs < max(4, math.ceil(0.25 * n)):
+                continue
+
+            changed_mask = ~_isclose_rowwise(x, y, rtol=1e-9)
+            changed = int(changed_mask.sum())
+            if changed / n < 0.5:
+                continue
+
+            same_decimal1 = 0
+            same_ones = 0
+            same_ones_decimal1 = 0
+            coarse_10_diff = 0
+            examples = []
+            diffs = []
+            for col, xv, yv, is_changed in zip(cols, x, y, changed_mask.tolist()):
+                dec_same = _decimal_digit(xv, 1) == _decimal_digit(yv, 1)
+                ones_same = _ones_digit(xv) == _ones_digit(yv)
+                if dec_same:
+                    same_decimal1 += 1
+                if ones_same:
+                    same_ones += 1
+                if dec_same and ones_same:
+                    same_ones_decimal1 += 1
+                diff = float(yv - xv)
+                diffs.append(round(diff, 6))
+                if is_changed and _is_multiple_of_ten_diff(diff):
+                    coarse_10_diff += 1
+                if len(examples) < 8 and dec_same and is_changed:
+                    examples.append({
+                        "col": col + 1,
+                        "header": header[col - c0] if 0 <= col - c0 < len(header) else "",
+                        "a": float(xv),
+                        "b": float(yv),
+                        "diff": diff,
+                    })
+
+            frac_decimal1 = same_decimal1 / n
+            frac_ones_decimal1 = same_ones_decimal1 / n
+            frac_coarse_10 = coarse_10_diff / n
+            severity = None
+            if (
+                n >= 12
+                and frac_decimal1 >= 0.90
+                and frac_ones_decimal1 >= 0.50
+                and changed / n >= 0.50
+                and frac_coarse_10 >= 0.50
+            ):
+                severity = "high"
+            elif (
+                n >= 12
+                and frac_decimal1 >= 0.85
+                and changed / n >= 0.50
+                and (frac_ones_decimal1 >= 0.45 or frac_coarse_10 >= 0.45)
+            ):
+                severity = "medium"
+            if not severity:
+                continue
+
+            top_diffs = Counter(diffs).most_common(6)
+            findings.append(dict(
+                kind="row_pair_digit_coupling",
+                row_a=label_a,
+                row_b=label_b,
+                row_a_idx=ra,
+                row_b_idx=rb,
+                n=n,
+                changed=changed,
+                same_decimal1=same_decimal1,
+                same_decimal1_frac=frac_decimal1,
+                same_ones=same_ones,
+                same_ones_decimal1=same_ones_decimal1,
+                same_ones_decimal1_frac=frac_ones_decimal1,
+                coarse_10_diff=coarse_10_diff,
+                coarse_10_diff_frac=frac_coarse_10,
+                top_diffs=[{"diff": float(d), "count": int(c)} for d, c in top_diffs],
+                examples=examples,
+                example_cells=[(ra + 1, ex["col"]) for ex in examples[:4]]
+                              + [(rb + 1, ex["col"]) for ex in examples[:4]],
+                severity=severity,
+                rule=(f"rows {ra + 1} and {rb + 1}: first decimal digit matches "
+                      f"{same_decimal1}/{n}; ones+decimal matches "
+                      f"{same_ones_decimal1}/{n}; coarse 10-step differences "
+                      f"{coarse_10_diff}/{n}"),
+            ))
+
+    findings.sort(key=lambda f: (
+        0 if f["severity"] == "high" else 1,
+        -f["same_decimal1_frac"],
+        -f["same_ones_decimal1_frac"],
+        -f["coarse_10_diff_frac"],
+        -f["n"],
+    ))
+    return findings[:_ROW_PAIR_MAX_FINDINGS_PER_BLOCK]
 
 
 # Above this many pairwise column relations in ONE block, the sheet is a dense /
@@ -1161,6 +1350,28 @@ def _value_delta(ga, gb):
                 shared_values=shared, only_in_a=only_a, only_in_b=only_b)
 
 
+def value_tweak_subtype(delta: dict | None) -> str | None:
+    """Sub-classify a ``value_tweaked`` cross-sheet overlap from an existing ``_value_delta``
+    result, without changing detector output (reads fields only).
+
+    - ``copy_then_edit``: a near-perfect copy with only a handful of cells retyped — the
+      strongest manual-edit fingerprint (the page #8 pattern). Worth surfacing to judges.
+    - ``block_edit``: a heavier rewrite of a shared block.
+    - ``None``: not a ``value_tweaked`` pattern.
+
+    Descriptive only — KEEP/DROP is unchanged; ``perfect_dup`` / ``mass`` / high-fraction
+    overlaps stay KEEP-protected exactly as before.
+    """
+    if not delta or delta.get("pattern") != "value_tweaked":
+        return None
+    modified = delta.get("modified_cells") or 0
+    shared = delta.get("shared_values") or 0
+    denom = shared + modified
+    if modified <= 3 or (denom and modified / denom <= 0.02):
+        return "copy_then_edit"
+    return "block_edit"
+
+
 def _column_cells(grid, c):
     """Row-ordered [(row, value)] for column ``c`` of a decimal grid."""
     return sorted(((r, v) for (r, cc), v in grid.items() if cc == c), key=lambda t: t[0])
@@ -1567,12 +1778,13 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 rel = [] if wide else detect_relations(sheet, r0, r1, c0, c1, header)
                 ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)
                 eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
+                rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header)
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(sheet, r0, r1, c0, c1, header)
                 gg = detect_grim_grimmer(sheet, r0, r1, c0, c1, header)
-                if rel or ap or eq or wc or iar or gg:
+                if rel or ap or eq or rp or wc or iar or gg:
                     sheet_context = " ".join([os.path.basename(f), sn, *[str(h) for h in header]])
-                    for group in (rel, ap, eq, wc, iar, gg):
+                    for group in (rel, ap, eq, rp, wc, iar, gg):
                         if evidence:
                             _attach_evidence(group, sheet, r0, r1, c0, c1, header)
                         _attach_benign(group)
@@ -1581,6 +1793,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                     report_blocks.append(dict(file=os.path.basename(f), sheet=sn,
                                               block=dict(rows=f"{r0+1}-{r1}", cols=f"{c0+1}-{c1}", header=header),
                                               relations=rel, progressions=ap, equal_pairs=eq,
+                                              row_pairs=rp,
                                               within_col=wc, identical_after_rounding=iar,
                                               grim=gg))
 
@@ -1655,6 +1868,8 @@ def write_markdown_report(out, path):
         for r in b["relations"]:
             push(b, r)
         for r in b["equal_pairs"]:
+            push(b, r)
+        for r in b.get("row_pairs", []):
             push(b, r)
         for r in b["progressions"]:
             push(b, r)

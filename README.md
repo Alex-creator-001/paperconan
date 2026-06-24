@@ -99,6 +99,7 @@ paperconan --version
 | `rounded_to_half_or_int` | 整列被舍入到固定刻度 | 全部落在整数、0.5 或 0.25 网格 |
 | `identical_after_rounding` | 两列舍掉末位后完全相同 | 一列像另一列乘小扰动后重排 |
 | `many_equal_pairs` | 两个本该独立的列里大量 byte-identical | 9/10 一致，只手改一格 |
+| `row_pair_digit_coupling` | 两行之间高位改变但小数/个位异常保留 | `197.2 → 167.2`、`165.5 → 155.5` 成串出现 |
 | `cross_sheet_position_identical` | 两张 sheet 同行同列位置数值完全一样 | 同一份样本被复制到另一张表 |
 | `grim_inconsistent` / `grimmer_inconsistent` | 报告的均值 / SD 对整数数据不可能 | 计数均值或 SD 与 n 不自洽 |
 | `last_digit_chi_square` | 末位数字偏离均匀分布，且 BH-FDR q <= 0.05 | 整张 sheet 的末位数字集中 |
