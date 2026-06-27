@@ -1459,6 +1459,25 @@ def _detect_decimal_tail_reuse_for_pair(
     }
 
 
+def _decimal_tail_constant_transform(pairs):
+    """True if the matched value pairs share a constant additive offset (vb = va + k) or a constant
+    ratio (vb = va * r). That is a benign linear/derived relationship between the two sheets (a shift,
+    rescale, or baseline correction that incidentally preserves the fractional tail), NOT the
+    leading-digit fabrication the detector targets (which produces *irregular* per-pair differences)."""
+    vp = [(va, vb) for _ka, _kb, va, vb, _sig in pairs if va is not None and vb is not None]
+    if len(vp) < 3:
+        return False
+
+    def _constant(vals):
+        lo, hi = min(vals), max(vals)
+        return (hi - lo) <= 1e-4 * max(abs(lo), abs(hi), 1e-9)
+
+    if _constant([vb - va for va, vb in vp]):
+        return True
+    ratios = [vb / va for va, vb in vp if va not in (None, 0)]
+    return len(ratios) >= 3 and _constant(ratios)
+
+
 def _column_cells(grid, c):
     """Row-ordered [(row, value)] for column ``c`` of a decimal grid."""
     return sorted(((r, v) for (r, cc), v in grid.items() if cc == c), key=lambda t: t[0])
@@ -1745,6 +1764,8 @@ def detect_collisions(grids, profile="review", sheets=None):
                 off_r, off_c = tail_reuse["offset"]
                 if same_figure:
                     sev = "low"
+                elif _decimal_tail_constant_transform(tail_reuse["pairs"]):
+                    sev = "low"   # constant offset/ratio = benign linear relationship, not fabrication
                 elif tail_reuse["tail_match_count"] >= 12 or fraction_of_smaller >= 0.10:
                     sev = "high"
                 else:
