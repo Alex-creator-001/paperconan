@@ -5,8 +5,10 @@ Use this reference when deciding how strongly to surface a paperconan finding or
 - `reportable concern`: a concrete anomaly that remains hard to explain after checking table context and common benign mechanisms.
 - `likely benign`: the pattern is explained by table structure, formulas, shared data, rounding, bounded values, or another ordinary workflow.
 - `needs human context`: the finding could matter, but the agent cannot confirm a key premise from the available data.
+- `Tier 1/2/3`: optional batch/formal-review labels for follow-up priority and difficulty of innocent explanation; see [adjudication-tiers.md](adjudication-tiers.md).
 
-Do not use non-public review labels in user-facing output.
+Do not present any label as author intent, misconduct probability, or proof of
+fabrication.
 
 ## First-Pass Ordering
 
@@ -114,7 +116,10 @@ Before reporting them as strong:
 
 ## PubPeer-Ready Chinese Template
 
-Use this 8-section template only when the user explicitly asks for a PubPeer draft or formal research-integrity note. Normal scan summaries should be shorter.
+Use the full eight-section template in [report-templates.md](report-templates.md)
+only when the user explicitly asks for a PubPeer draft, formal
+research-integrity note, or Tier 1/Tier 2 KEEP report. Normal scan summaries
+should be shorter.
 
 ### 1. 论文主结论
 
