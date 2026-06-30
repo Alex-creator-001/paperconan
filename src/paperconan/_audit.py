@@ -2278,6 +2278,25 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "fetch":
         from .fetch._cli import fetch_main
         sys.exit(fetch_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "report":
+        import json
+        from ._adjudicated_html import write_adjudicated_report
+
+        rp = argparse.ArgumentParser(
+            prog="paperconan report",
+            description="Render an adjudicated HTML report from scan.json and verdict.json",
+        )
+        rp.add_argument("scan_json", help="Path to paperconan scan.json")
+        rp.add_argument("--verdict", required=True, help="Path to verdict JSON")
+        rp.add_argument("--out", required=True, help="Output HTML path")
+        rargs = rp.parse_args(sys.argv[2:])
+        with open(rargs.scan_json, encoding="utf-8") as fh:
+            scan = json.load(fh)
+        with open(rargs.verdict, encoding="utf-8") as fh:
+            verdict = json.load(fh)
+        write_adjudicated_report(scan, verdict, rargs.out)
+        print(f"wrote {rargs.out}")
+        return
     ap = argparse.ArgumentParser(description="Scan a paper's source data (xlsx/csv/tsv, or tables inside pdf/docx) for fabrication red flags")
     ap.add_argument("in_dir", help="Directory with the paper's source data (*.xlsx/*.csv/*.tsv, or *.pdf/*.docx supplements)")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")

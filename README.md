@@ -222,6 +222,23 @@ paperconan fetch "<DOI>" --auto --out runs/<paper-id>/data/
 
 `scan.json` 完整结构见 [`output-schema.md`](skills/paperconan/references/output-schema.md)。
 
+## 判定后 HTML 报告
+
+默认的 `audit/report.html` 只展示确定性检测器输出；它不会替你判断论文。若你已经按 skill 的
+[`adjudication-tiers.md`](skills/paperconan/references/adjudication-tiers.md) 和
+[`report-templates.md`](skills/paperconan/references/report-templates.md) 写好了 `verdict.json`，可以再生成一份**判定后报告**：
+
+```bash
+paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
+```
+
+`verdict.json` 使用公开 schema：`verdict`、`suspicion_tier`、`impact_scope`、`tier_why`、`drop_reason`、
+`innocent_explanation`、`needs_author_data`、`report_md`、`review_status`。这份 HTML 会把 8 段式
+`report_md`、Tier/impact/review 状态和 `scan.json` 的关键 evidence 放在一起，适合单篇论文复核或批量审计后的归档。
+
+注意：`paperconan report` 是本地、公开、无私有依赖的渲染器；不读取 Postgres、Blob、云端队列或任何
+`recheck/` 私有缓存。真实论文 PDF、截图、主图等材料若要展示，应由使用者在自己的审计目录中合法保存并另行归档。
+
 ---
 
 ## ⚠️ 重要声明

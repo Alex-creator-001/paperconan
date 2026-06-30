@@ -70,6 +70,7 @@ paperconan <input-dir> --out /tmp/audit-X
 paperconan <input-dir> --md
 paperconan <input-dir> --no-html
 paperconan <input-dir> --profile forensic
+paperconan report /tmp/audit-X/scan.json --verdict verdict.json --out adjudication.html
 ```
 
 If Python or package access is unavailable, tell the user to run the command locally. A manual review may be offered only as a non-authoritative hint and must not be presented as paperconan output.
@@ -139,5 +140,11 @@ For batch or agent-to-agent workflows, an optional verdict JSON may use:
 `innocent_explanation`, `needs_author_data`, `report_md`, and `review_status`.
 See [references/adjudication-tiers.md](references/adjudication-tiers.md) and
 [references/report-templates.md](references/report-templates.md).
+
+When a verdict JSON already exists, `paperconan report <scan.json> --verdict
+<verdict.json> --out <html>` renders a separate adjudicated report. Do not
+confuse this with the default deterministic `audit/report.html`; the
+adjudicated report is only as reliable as the human/AI verdict and source
+context behind it.
 
 If the user asks "is this fraud?", answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.
