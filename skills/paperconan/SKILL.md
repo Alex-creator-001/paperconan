@@ -12,6 +12,7 @@ Tool repository: https://github.com/zixixr/paperconan
 
 ## Core Workflow
 
+0. Ensure the CLI is available before scanning: run `paperconan --version`. If it is missing and pip works, install once with `pip install "paperconan[all]"` (ask first if a virtualenv or non-global install is preferred). If Python/pip is unavailable, ask the user to install and run locally — never fabricate output.
 1. Confirm what the user supplied:
    - Local source-data directory: run `paperconan <input-dir>`.
    - DOI or title: run `paperconan fetch "<DOI or title>"`, choose a matched tabular dataset, download it, then scan the downloaded directory.

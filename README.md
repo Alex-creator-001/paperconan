@@ -48,6 +48,8 @@ paperconan --version            # 确认可用
 ```
 
 > 只装基础版、加 `[fast]` 更快读 xlsx、本地开发等其它安装变体，见文末[命令行参考 › 安装](#安装)。
+>
+> 有 shell + Python 环境的 agent（如本地 Claude Code / Codex），装好 skill 后会在首次扫描前自动检测并 `pip install` 这个 CLI，你也可以跳过这一步直接进入第 2 步。
 
 ### 2. 把 skill 接到你的 agent 上
 
