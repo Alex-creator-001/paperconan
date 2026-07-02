@@ -110,3 +110,23 @@ def test_decimal_tail_reuse_keeps_identity_and_is_protected():
     assert f["kind"] == "cross_sheet:decimal_tail_reuse"   # identity preserved
     assert f["prefilter"] == "keep"                        # protected, not downweighted
     assert f["tail_benign_reason"] == "log_or_dilution_integer_shift_candidate"
+
+
+def test_grim_high_finding_distills_with_mean_col_identifier():
+    # regression: grim/grimmer findings use mean_col/n_col/sd_col (not col/col_a), so the
+    # generic block distiller produced col_a=None. It must carry the mean_col identifier.
+    from paperconan.packet import distill_findings_for_review
+    scan = {
+        "relations_blocks": [{
+            "file": "f.xlsx", "sheet": "Fig 3",
+            "relations": [], "equal_pairs": [], "progressions": [], "row_pairs": [],
+            "within_col": [], "identical_after_rounding": [],
+            "grim": [{"kind": "grim_inconsistent", "severity": "high", "n": 10,
+                      "mean_col": "cell count mean", "n_col": "n", "sd_col": "sd",
+                      "rule": "reported mean 3.45 impossible for integer counts at n=10"}],
+        }],
+        "cross_sheet_findings": [],
+    }
+    out = distill_findings_for_review(scan)
+    grim = [f for f in out if f["kind"] == "grim_inconsistent"]
+    assert grim and grim[0]["col_a"] == "cell count mean", grim

@@ -1,0 +1,145 @@
+"""B2: detect_recurring_row_vectors — a fixed, high-information numeric tuple recurring as a
+contiguous row-slice across >=3 places spanning >=2 figure namespaces. Includes a brute-force
+oracle and the FP guards (patterned/ladder tuples, single-figure recurrence, too few occurrences)."""
+from __future__ import annotations
+
+from paperconan._audit import Sheet, detect_recurring_row_vectors, figure_key
+
+_W = 9   # uniform row width so a numeric block covers the full vector
+
+
+def _sheet(rows):
+    return Sheet.from_rows([[f"c{j}" for j in range(_W)]] + [list(r) for r in rows])
+
+
+def _pad(seed, k):
+    """k filler values unique to a sheet (seed), so padding never recurs across sheets."""
+    return [round(seed * 1.7 + 0.31 * j + 0.07, 4) for j in range(k)]
+
+
+def _row(vec, seed):
+    return list(vec) + _pad(seed, _W - len(vec))
+
+
+def _fill(seed):
+    """Three DISTINCT full-width filler rows unique to a sheet."""
+    return [[round(seed + 0.13 * i + 0.7 * j, 4) for j in range(_W)] for i in range(1, 4)]
+
+
+def _panel(vec, seed):
+    return [_row(vec, seed)] + _fill(seed)
+
+
+def _b2_oracle(panels, vec, min_occ=3, min_ns=2):
+    """Independent ground truth: distinct (sheet,row) sites where `vec` appears as a contiguous
+    row-slice, and the figure namespaces they span."""
+    sites, ns = set(), set()
+    for (f, s), rows in panels.items():
+        for ri, row in enumerate(rows):
+            nums = [float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) else None for x in row]
+            for start in range(len(nums) - len(vec) + 1):
+                win = nums[start:start + len(vec)]
+                if all(w is not None for w in win) and [round(w, 6) for w in win] == [round(v, 6) for v in vec]:
+                    sites.add((f, s, ri))
+                    if figure_key(s):
+                        ns.add(figure_key(s))
+    return len(sites) >= min_occ and len(ns) >= min_ns
+
+
+VEC = [220.0, 188.0, 122.0, 166.0, 128.0, 166.0]     # high-information, not a ladder
+
+
+def test_b2_flags_recurring_vector_across_figures_and_matches_oracle():
+    panels = {
+        ("M1.xls", "Figure 1e"): _panel(VEC, 10),
+        ("M2.xls", "Figure 4b"): _panel(VEC, 40),
+        ("M3.xls", "Extended Data Fig. 2a"): _panel(VEC, 70),
+    }
+    f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
+    hi = [x for x in f if x["kind"] == "recurring_row_vector" and x["severity"] == "high"]
+    assert len(hi) == 1, [x["vector"] for x in hi]
+    assert hi[0]["vector"] == VEC
+    assert hi[0]["n_occurrences"] == 3 and hi[0]["n_figures"] >= 2
+    assert _b2_oracle(panels, VEC) is True
+
+
+def test_b2_no_flag_on_arithmetic_ladder():
+    ladder = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+    panels = {
+        ("M1.xls", "Figure 1e"): _panel(ladder, 10),
+        ("M2.xls", "Figure 4b"): _panel(ladder, 40),
+        ("M3.xls", "Extended Data Fig. 2a"): _panel(ladder, 70),
+    }
+    f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
+    assert not [x for x in f if x["severity"] == "high"]
+
+
+def test_b2_no_flag_when_single_figure_namespace():
+    # recurrence confined to one figure (main:4, panels 4b/4c/4d) is expected replicate structure
+    panels = {
+        ("M.xls", "Figure 4b"): _panel(VEC, 10),
+        ("M.xls", "Figure 4c"): _panel(VEC, 40),
+        ("M.xls", "Figure 4d"): _panel(VEC, 70),
+    }
+    f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
+    assert not [x for x in f if x["severity"] == "high"]
+    assert _b2_oracle(panels, VEC) is False
+
+
+def test_b2_no_flag_on_two_occurrences_only():
+    panels = {
+        ("M1.xls", "Figure 1e"): _panel(VEC, 10),
+        ("M2.xls", "Figure 4b"): _panel(VEC, 40),
+    }
+    f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
+    assert not [x for x in f if x["severity"] == "high"]
+    assert _b2_oracle(panels, VEC) is False
+
+
+def test_b2_no_flag_on_near_constant_vector():
+    const = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0]
+    panels = {
+        ("M1.xls", "Figure 1e"): _panel(const, 10),
+        ("M2.xls", "Figure 4b"): _panel(const, 40),
+        ("M3.xls", "Extended Data Fig. 2a"): _panel(const, 70),
+    }
+    f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
+    assert not [x for x in f if x["severity"] == "high"]
+
+
+def test_b2_dedups_overlapping_windows_to_one_finding():
+    # a long recurring row-run yields many overlapping k=4..8 windows → must report once
+    run = [220.0, 188.0, 122.0, 166.0, 128.0, 166.0, 199.0, 254.0]
+    panels = {
+        ("M1.xls", "Figure 1e"): _panel(run, 10),
+        ("M2.xls", "Figure 4b"): _panel(run, 40),
+        ("M3.xls", "Extended Data Fig. 2a"): _panel(run, 70),
+    }
+    f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
+    hi = [x for x in f if x["severity"] == "high"]
+    assert len(hi) == 1, [x["vector"] for x in hi]
+
+
+def test_b2_single_namespace_early_exit():
+    # a corpus that can never reach >=2 figure namespaces must skip the whole expensive pass
+    panels = {("M.xls", "Sheet1"): _panel(VEC, 10), ("M.xls", "Data"): _panel(VEC, 40)}
+    assert detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()}) == []
+
+
+def test_b2_same_sheet_name_across_files_not_conflated():
+    # regression: the dedup 'cells' key omitted the file, so two files sharing a sheet name
+    # ('Sheet1') with vectors at overlapping positions could be merged. Two DISTINCT vectors
+    # each recurring across >=2 real figures must both survive.
+    v1 = [220.0, 188.0, 122.0, 166.0, 128.0, 166.0]
+    v2 = [311.0, 277.0, 203.0, 255.0, 199.0, 241.0]
+    panels = {
+        ("A.xls", "Sheet1"): _panel(v1, 10),                 # figure_key None
+        ("A.xls", "Figure 4b"): _panel(v1, 40),              # main:4
+        ("A.xls", "Extended Data Fig. 2a"): _panel(v1, 70),  # ext:2
+        ("B.xls", "Sheet1"): _panel(v2, 11),                 # same sheet name, different file/vector
+        ("B.xls", "Figure 5b"): _panel(v2, 41),              # main:5
+        ("B.xls", "Extended Data Fig. 3a"): _panel(v2, 71),  # ext:3
+    }
+    f = detect_recurring_row_vectors({k: _sheet(v) for k, v in panels.items()})
+    vecs = {tuple(x["vector"]) for x in f if x["severity"] == "high"}
+    assert tuple(v1) in vecs and tuple(v2) in vecs, f"both distinct vectors must survive: {vecs}"

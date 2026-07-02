@@ -41,6 +41,16 @@ from ._profiles import apply_profile_to_findings, normalize_profile
 from ._sheet import Sheet
 from .schema import PaperconanInputError
 
+# Canonical list of the per-block finding-group keys emitted into every
+# `relations_blocks[]` entry (see scan_dir's report_blocks.append). This is the
+# SINGLE SOURCE OF TRUTH: the markdown report, the packet distiller, and the
+# paperconan-watch severity counters / triage gate all iterate this set, so a
+# HIGH finding in ANY group (notably row_pairs) is counted and can reach review.
+BLOCK_FINDING_GROUPS = (
+    "relations", "equal_pairs", "progressions", "row_pairs",
+    "within_col", "identical_after_rounding", "grim",
+)
+
 
 def _version():
     """paperconan version, resolved lazily to avoid an import cycle with __init__."""
@@ -701,6 +711,72 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                              severity="high",
                                              col_a_sample=sa, col_b_sample=sb,
                                              rule=f"col[{cj}] = {slope:.4g} * col[{ci}] + {intercept:.4g}"))
+            # B4: partial constant offset — a long CONSECUTIVE run where y = x + k for a fixed
+            # non-zero k, while the rest of the column diverges (the whole-column case is
+            # constant_offset above). A contiguous block shifted by a fixed amount is a
+            # copy-then-shift fingerprint; two independent columns do not hold a fixed offset
+            # over a long contiguous run. Guarded to non-trivial offsets and long runs only.
+            if n >= 24:
+                # Scale-relative run detection on the raw diff (a fixed decimal round would be
+                # inert on small-magnitude data — the exact regime `tol` above was written for).
+                best_len = cur_len = 1
+                best_val = float(diff[0])
+                for t in range(1, len(diff)):
+                    if abs(diff[t] - diff[t - 1]) < tol:
+                        cur_len += 1
+                    else:
+                        if cur_len > best_len:
+                            best_len, best_val = cur_len, float(diff[t - 1])
+                        cur_len = 1
+                if cur_len > best_len:
+                    best_len, best_val = cur_len, float(diff[-1])
+                run_floor = max(20, int(round(0.5 * n)))
+                col_hp = sum(1 for v in x if _sig_frac_digits(v) >= 2) >= 0.6 * len(x)
+                # The benign case to exclude is a run shifted by a small WHOLE number on
+                # low-precision data (e.g. B = A + 5). Test that scale-relatively (tol), so a
+                # genuine small-magnitude offset like 3e-14 is not mistaken for "integer 0".
+                off_is_small_integer = abs(best_val - round(best_val)) < tol and abs(round(best_val)) >= 1
+                non_trivial_offset = (not off_is_small_integer) or col_hp
+                if (best_len >= run_floor and best_len < n
+                        and abs(best_val) > tol and non_trivial_offset):
+                    findings.append(dict(kind="partial_constant_offset",
+                                         col_a=header[ci - c0], col_b=header[cj - c0],
+                                         col_a_idx=ci, col_b_idx=cj, n=n,
+                                         run_length=int(best_len), offset=float(best_val),
+                                         severity="high",
+                                         col_a_sample=sa, col_b_sample=sb,
+                                         rule=(f"col[{cj}] = col[{ci}] + {best_val:.6g} over a run of "
+                                               f"{int(best_len)}/{n} consecutive rows")))
+                    continue
+            # integer difference with shared decimal fractions (B5), else small discrete diff set
+            # B5: y and x reproduce each other's HIGH-PRECISION decimal fractions row-wise while
+            # differing only by whole numbers that VARY across rows (a constant integer offset is
+            # already caught above as constant_offset). Independent measurements do not reproduce
+            # another column's 4+-decimal fractions on several rows — a copy-then-shift fingerprint
+            # (e.g. 178.7615 vs 112.7615, 169.8687 vs 115.8687). The precision requirement lets this
+            # fire from n>=5 without the false positives a bare small-diff-set floor would admit.
+            if n >= 5:
+                diff_is_int = np.abs(diff - np.round(diff)) < tol
+                frac_x = x - np.round(x)                       # signed distance to nearest integer
+                hp_rows = diff_is_int & (np.abs(frac_x) > 1e-6)
+                hp_fracs = [float(v) for v in frac_x[hp_rows] if _sig_frac_digits(v) >= 4]
+                distinct_hp = len({round(v, 6) for v in hp_fracs})
+                int_diffs = np.unique(np.round(diff[diff_is_int]))
+                n_real_frac = int(hp_rows.sum())        # rows sharing a genuine (non-.0) fraction
+                if (int(diff_is_int.sum()) >= max(5, int(round(0.8 * n)))
+                        and distinct_hp >= 3
+                        and len(int_diffs) >= 2):
+                    findings.append(dict(kind="integer_diff_shared_fraction",
+                                         col_a=header[ci - c0], col_b=header[cj - c0],
+                                         col_a_idx=ci, col_b_idx=cj, n=n,
+                                         n_shared_fraction=n_real_frac,
+                                         n_high_precision=distinct_hp,
+                                         severity="high",
+                                         col_a_sample=sa, col_b_sample=sb,
+                                         rule=(f"col[{cj}] and col[{ci}] share the same decimal fraction on "
+                                               f"{n_real_frac}/{n} rows ({distinct_hp} distinct high-precision "
+                                               f"fractions) but differ by whole numbers")))
+                    continue
             # small discrete diff set
             if n >= 8:
                 diff_rounded = np.round(diff, 4)
@@ -743,6 +819,15 @@ def _ones_digit(v):
 def _decimal_digit(v, place=1):
     scale = 10 ** place
     return int(math.floor(abs(float(v)) * scale + 1e-8)) % 10
+
+
+def _sig_frac_digits(v):
+    """Count significant fractional decimal digits of v's distance to the nearest integer.
+    167.93 -> 2 (.07), 178.7615 -> 4 (.2385), 100.5 -> 1, an integer -> 0."""
+    fv = abs(float(v) - round(float(v)))
+    if fv < 1e-9:
+        return 0
+    return len(f"{fv:.9f}".split(".")[1].rstrip("0"))
 
 
 def _is_multiple_of_ten_diff(d):
@@ -970,6 +1055,7 @@ def detect_arithmetic_progression(sheet, r0, r1, c0, c1, header):
         if np.allclose(diffs, diffs[0], atol=tol, rtol=1e-9) and abs(diffs[0]) > tol:
             sev = "medium" if abs(diffs[0] - round(diffs[0])) < 1e-9 else "high"
             findings.append(dict(kind="arithmetic_progression", col=header[c - c0], col_idx=c,
+                                 block_c0=c0,
                                  n=int(len(a)), step=float(diffs[0]), first=float(a[0]),
                                  severity=sev,
                                  rule=f"col[{c}] = arithmetic progression, step={diffs[0]:.6g}"))
@@ -1988,6 +2074,293 @@ def detect_collisions(grids, profile="review", sheets=None):
     return findings
 
 
+def _column_axis_like(a):
+    """True if a numeric column is an axis/index whose recurrence across panels is mundane: a
+    (near-)constant column, a perfect ARITHMETIC progression (time/dose grid), or a perfect
+    GEOMETRIC progression (serial-dilution axis) — the latter is legitimately shared across
+    dose-response panels and must not read as a cross-experiment duplication."""
+    if len(a) < 2:
+        return True
+    if len({round(float(v), 9) for v in a}) <= 1:
+        return True                                   # constant
+    scale = max(float(np.max(np.abs(a))), 1e-300)
+    diffs = np.diff(a)
+    if np.allclose(diffs, diffs[0], atol=1e-9 * scale, rtol=1e-9) and abs(diffs[0]) > 1e-9 * scale:
+        return True                                   # arithmetic ladder
+    if np.all(np.abs(a) > 1e-12):                     # geometric ladder (serial dilution)
+        ratios = a[1:] / a[:-1]
+        if np.allclose(ratios, ratios[0], atol=1e-9, rtol=1e-9) and abs(ratios[0] - 1) > 1e-9:
+            return True
+    return False
+
+
+def detect_cross_sheet_column_duplicates(grid_sheets, profile="review", min_len=12):
+    """B1 — full-column duplication ACROSS different (file, sheet) panels, including the
+    integer / 1-decimal columns that `detect_collisions` misses (it grids only >=3-decimal
+    values). Two panels that should be independent measurements carrying a byte-identical
+    ordered column is a cross-experiment reuse fingerprint (e.g. a comet-assay 'No IR' column
+    reproduced across two different figures). Same-figure panels are downgraded to low
+    (a combined plot and its per-replicate breakdown legitimately share a column)."""
+    if len(grid_sheets) < 2:
+        return []                                     # a cross-panel duplicate needs >=2 panels
+    # 1) collect candidate columns, deduped to the longest per (file, sheet, col_idx)
+    best = {}
+    for (fname, sname), sheet in grid_sheets.items():
+        for (r0, r1, c0, c1) in find_numeric_blocks(sheet):
+            header = header_for(sheet, r0, c0, c1)
+            for c in range(c0, c1):
+                a = col_array(sheet, r0, r1, c)
+                a = a[~np.isnan(a)]
+                if len(a) < min_len or _column_axis_like(a):
+                    continue
+                if len({round(float(v), 9) for v in a}) < max(6, len(a) // 2):
+                    continue                          # low-cardinality column recurs benignly
+                key = (fname, sname, c)
+                if key not in best or len(a) > len(best[key][3]):
+                    best[key] = (fname, sname, header[c - c0], a)
+
+    # 2) bucket by exact rounded value-sequence; a bucket with >=2 distinct panels is a dup
+    buckets = {}
+    for (fname, sname, c), (_f, _s, label, a) in best.items():
+        sig = tuple(round(float(v), 6) for v in a)
+        buckets.setdefault(sig, []).append((fname, sname, c, label, a))
+
+    findings = []
+    for sig, group in buckets.items():
+        panels = {(g[0], g[1]) for g in group}
+        if len(panels) < 2:
+            continue                                  # same-panel identical cols are identical_column's job
+        a = group[0][4]
+        n = len(a)
+        all_int = all(abs(float(v) - round(float(v))) < 1e-9 for v in a)
+        # all-integer sequences recur far more benignly (counts, indices) → require length + variety
+        if all_int and (n < 25 or len({round(float(v), 9) for v in a}) < max(12, int(0.7 * n))):
+            continue
+        emitted = 0
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                fa, sa_name, _ca, la, _a = group[i]
+                fb, sb_name, _cb, lb, _b = group[j]
+                if (fa, sa_name) == (fb, sb_name):
+                    continue                          # different columns, same sheet → identical_column
+                fig_a, fig_b = figure_key(sa_name), figure_key(sb_name)
+                same_figure = fig_a is not None and fig_a == fig_b
+                same_file = fa == fb
+                scope = "sheets" if same_file else "files"
+                sev = "low" if (same_figure or all_int) else "high"
+                findings.append(dict(
+                    kind="cross_sheet_column_duplicate",
+                    file=fa if same_file else f"{fa} + {fb}",
+                    file_a=fa, file_b=fb, same_file=same_file,
+                    sheet_a=sa_name, sheet_b=sb_name,
+                    col_a=la, col_b=lb,
+                    size_a=n, size_b=n,
+                    same_position_count=n,
+                    fraction_of_smaller=1.0,
+                    figure_a=fig_a, figure_b=fig_b, same_figure=same_figure,
+                    delta={"pattern": "column_duplicate"},
+                    examples=[{"value": float(v)} for v in a[:5]],
+                    severity=sev,
+                    rule=(f"column '{la}' ({sa_name}) and column '{lb}' ({sb_name}) match to 6 decimal "
+                          f"places over all {n} values across 2 {scope}"),
+                ))
+                emitted += 1
+                if emitted >= 10:                     # cap per bucket
+                    break
+            if emitted >= 10:
+                break
+    apply_profile_to_findings(findings, profile)
+    return findings
+
+
+def _vector_is_patterned(vec):
+    """Reject low-information tuples whose recurrence is mundane: near-constant, arithmetic or
+    geometric ladders, and all-round-number (multiples of 10 / boundary) tuples."""
+    if len({round(v, 6) for v in vec}) < 3:
+        return True                                   # near-constant / too few distinct
+    d = [vec[i + 1] - vec[i] for i in range(len(vec) - 1)]
+    if all(abs(x - d[0]) < 1e-9 for x in d):
+        return True                                   # arithmetic ladder
+    nz = [v for v in vec if abs(v) > 1e-12]
+    if len(nz) == len(vec):
+        rat = [vec[i + 1] / vec[i] for i in range(len(vec) - 1)]
+        if all(abs(r - rat[0]) < 1e-9 for r in rat):
+            return True                               # geometric ladder
+    if all(abs(v - round(v / 10.0) * 10.0) < 1e-9 for v in vec):
+        return True                                   # all multiples of 10
+    return False
+
+
+def detect_recurring_row_vectors(grid_sheets, profile="review",
+                                 min_k=4, max_k=8, max_rows=300, max_findings=20):
+    """B2 — a fixed ordered numeric tuple recurring as a contiguous row-slice across >=3 places
+    spanning >=2 figure namespaces. Six independent mice cannot yield the identical six-value
+    vector in several arms; a specific high-information tuple reappearing across unrelated figures
+    is a copy fingerprint. Guarded hard (this is the most FP-prone pass): >=3 distinct values, no
+    arithmetic/geometric/round-number ladders, >=3 occurrences in >=2 figure namespaces, and
+    all-integer tuples need k>=5 with >=4 distinct values."""
+    # A finding needs >=2 distinct figure namespaces; skip the (expensive, FP-prone) window
+    # build entirely when the corpus can never satisfy that (single sheet, or plainly-named
+    # sheets whose figure_key is None).
+    if len({figure_key(s) for (_f, s) in grid_sheets if figure_key(s) is not None}) < 2:
+        return []
+    occ = {}   # rounded tuple -> list of (file, sheet, figure_key, row, start_col)
+    budget = 3_000_000   # bound worst-case work on genome-scale papers (linear, but many blocks)
+    for (fname, sname), sheet in grid_sheets.items():
+        fk = figure_key(sname)
+        for (r0, r1, c0, c1) in find_numeric_blocks(sheet):
+            for r in range(r0, min(r1, r0 + max_rows)):
+                row = []
+                for c in range(c0, c1):
+                    v = sheet.cell(r, c)
+                    row.append(float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+                for start in range(len(row)):
+                    for k in range(min_k, max_k + 1):
+                        window = row[start:start + k]
+                        if len(window) < k or any(w is None for w in window):
+                            continue
+                        key = tuple(round(w, 6) for w in window)
+                        occ.setdefault(key, []).append((fname, sname, fk, r, c0 + start))
+                        budget -= 1
+                if budget <= 0:
+                    break
+            if budget <= 0:
+                break
+        if budget <= 0:
+            break
+
+    cands = []
+    for vec, places in occ.items():
+        if len(places) < 3 or _vector_is_patterned(list(vec)):
+            continue
+        namespaces = {p[2] for p in places if p[2] is not None}
+        if len(namespaces) < 2:
+            continue                                  # recurrence within one figure is expected
+        all_int = all(abs(v - round(v)) < 1e-9 for v in vec)
+        if all_int and (len(vec) < 5 or len({round(v, 6) for v in vec}) < 4):
+            continue
+        # distinct (sheet,row) occurrences so the same cells aren't counted twice
+        sites = {(p[0], p[1], p[3]) for p in places}
+        if len(sites) < 3:
+            continue
+        # cells physically covered by all occurrences (file, sheet, row, col) — used to merge the
+        # many overlapping windows that a single long recurring row-run produces. The file is part
+        # of the key so two files that share a sheet name ('Sheet1') are not conflated.
+        cells = {(p[0], p[1], p[3], p[4] + off) for p in places for off in range(len(vec))}
+        cands.append((vec, places, namespaces, sites, cells))
+
+    # Dedup by occurrence-cell overlap: a long recurring row-segment yields many overlapping
+    # windows (k=4..8, shifted) at the SAME cells. Keep the strongest (most occurrences, then
+    # longest) and drop any candidate whose covered cells overlap >=50% with a kept one, so one
+    # physical recurring run reports as one finding.
+    cands.sort(key=lambda x: (-len(x[3]), -len(x[0])))
+    kept = []
+    for c in cands:
+        cells = c[4]
+        if any(len(cells & k[4]) >= 0.5 * min(len(cells), len(k[4])) for k in kept):
+            continue
+        kept.append(c)
+
+    findings = []
+    for vec, places, namespaces, sites, _cells in kept:
+        sheets_hit = sorted({p[1] for p in places})
+        loc = "; ".join(sheets_hit[:6])
+        files_hit = sorted({p[0] for p in places})
+        findings.append(dict(
+            kind="recurring_row_vector",
+            file="; ".join(files_hit)[:120],
+            file_a=files_hit[0], file_b=files_hit[-1], same_file=len(files_hit) == 1,
+            sheet="; ".join(sheets_hit)[:120],
+            sheet_a=sheets_hit[0], sheet_b=sheets_hit[-1],
+            vector=[float(v) for v in vec],
+            size_a=len(sites), size_b=len(sites),
+            same_position_count=len(sites),
+            fraction_of_smaller=1.0,
+            n_occurrences=len(sites),
+            n_figures=len(namespaces),
+            same_figure=False,
+            delta={"pattern": "recurring_row_vector"},
+            pattern="recurring_row_vector",
+            examples=[{"value": float(v)} for v in vec],
+            severity="high" if (len(vec) >= 5 and len(sites) >= 3) else "medium",
+            rule=(f"the {len(vec)}-value vector {list(vec)} recurs at {len(sites)} places across "
+                  f"{len(namespaces)} figures ({loc})")))
+        if len(findings) >= max_findings:
+            break
+    apply_profile_to_findings(findings, profile)
+    return findings
+
+
+def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=10):
+    """B3 — two numeric blocks in the SAME sheet whose positionally-corresponding cells reproduce
+    each other's HIGH-PRECISION decimal fractions while their integer parts differ by whole numbers
+    (e.g. two dose-response matrices where every cell shares the 5-decimal fraction but the value
+    was shifted by an integer). detect_relations only compares columns within one block and
+    detect_collisions only compares distinct sheets, so this matrix-to-matrix within-sheet reuse
+    has no other detector. The precision + integer-shift + coverage requirements make chance
+    coincidence negligible."""
+    findings = []
+    for (fname, sname), sheet in grid_sheets.items():
+        grids = []
+        for (r0, r1, c0, c1) in find_numeric_blocks(sheet):
+            cells = {}
+            for r in range(r0, r1):
+                for c in range(c0, c1):
+                    v = sheet.cell(r, c)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        cells[(r - r0, c - c0)] = float(v)
+            if len(cells) >= min_cells:
+                grids.append(((r0, r1, c0, c1), cells))
+        best = None                                            # keep only the strongest pair per sheet
+        for i in range(len(grids)):
+            for j in range(i + 1, len(grids)):
+                (ba, ca), (bb, cb) = grids[i], grids[j]
+                common = [k for k in ca if k in cb]
+                if len(common) < min_cells:
+                    continue
+                scale = max(max(abs(ca[k]) for k in common), max(abs(cb[k]) for k in common), 1.0)
+                tol = 1e-6 * scale
+                shared = int_diffs = hp = 0
+                fracs, diffset = set(), set()
+                for k in common:
+                    x, y = ca[k], cb[k]
+                    d = y - x
+                    if abs(d - round(d)) < tol:                 # integer difference => same fraction
+                        shared += 1
+                        if abs(round(d)) >= 1:
+                            int_diffs += 1
+                            diffset.add(round(d))
+                        if _sig_frac_digits(x) >= 3:
+                            hp += 1
+                            fracs.add(round(x - round(x), 6))
+                if (shared >= max(min_cells, int(round(0.8 * len(common))))
+                        and hp >= max(6, int(round(0.5 * len(common))))
+                        and int_diffs >= 3 and len(diffset) >= 2 and len(fracs) >= 5
+                        and (best is None or shared > best[0])):
+                    best = (shared, ba, bb, len(common))
+        if best is not None:
+            shared, ba, bb, ncommon = best
+            findings.append(dict(
+                kind="within_table_fraction_reuse",
+                file=fname, file_a=fname, file_b=fname, same_file=True,
+                sheet_a=sname, sheet_b=sname,
+                size_a=ncommon, size_b=ncommon,
+                same_position_count=shared,
+                fraction_of_smaller=shared / ncommon,
+                # both blocks live in ONE sheet, so there is no "two figures" to compare — leave
+                # figure_a/b unset (None) rather than equal-but-not-same_figure (contradictory).
+                figure_a=None, figure_b=None, same_figure=False,
+                delta={"pattern": "fraction_reuse"},
+                block_a=f"rows {ba[0]+1}-{ba[1]}, cols {ba[2]+1}-{ba[3]}",
+                block_b=f"rows {bb[0]+1}-{bb[1]}, cols {bb[2]+1}-{bb[3]}",
+                severity="high",
+                rule=(f"two blocks in '{sname}' share identical decimal fractions on "
+                      f"{shared}/{ncommon} positionally-corresponding cells but differ "
+                      f"by whole numbers")))
+    apply_profile_to_findings(findings, profile)
+    return findings
+
+
 def _load_provenance(in_dir, paper):
     """Resolve scan provenance: an explicit `paper` override wins; otherwise read a
     paperconan_source.json sidecar left by `fetch`; otherwise None."""
@@ -2035,13 +2408,14 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # The HTML report renders the evidence snippets, so it requires them.
     if write_html:
         evidence = True
-    files = sorted({p for pat in ("*.xlsx", "*.csv", "*.tsv", "*.pdf", "*.docx")
+    files = sorted({p for pat in ("*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
+                                  "*.csv", "*.tsv", "*.pdf", "*.docx")
                     for p in glob.glob(os.path.join(in_dir, pat))})
     if not files:
         raise PaperconanInputError(
-            f"no .xlsx / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
-            f"(paperconan reads .xlsx, .csv, .tsv, and tables inside .pdf / .docx; "
-            f".xls/.xlsm are not supported)"
+            f"no .xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
+            f"(paperconan reads .xlsx via openpyxl, legacy .xls / .xlsm / .xlsb via calamine, "
+            f".csv / .tsv, and tables inside .pdf / .docx)"
         )
 
     report_blocks = []
@@ -2147,6 +2521,13 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.
     cross_sheet_findings = detect_collisions(grids, profile=profile, sheets=grid_sheets)
+    # B1: full-column duplication across panels, incl. the integer / 1-decimal columns the
+    # >=3-decimal collision grids miss.
+    cross_sheet_findings += detect_cross_sheet_column_duplicates(grid_sheets, profile=profile)
+    # B3: matrix-to-matrix decimal-fraction reuse between two blocks of the same sheet.
+    cross_sheet_findings += detect_within_sheet_fraction_reuse(grid_sheets, profile=profile)
+    # B2: a fixed high-information row-vector recurring across >=2 figures.
+    cross_sheet_findings += detect_recurring_row_vectors(grid_sheets, profile=profile)
     _attach_benign(cross_sheet_findings)
 
     digit_reports, decimal_reports = [], []

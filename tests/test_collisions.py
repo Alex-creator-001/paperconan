@@ -339,3 +339,140 @@ def test_copied_measurement_column_keeps_severity():
     assert cf["same_figure"] is False
     assert cf.get("axis_overlap") is not True, "a copied measurement column must not be treated as axis"
     assert cf["severity"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# B1: cross_sheet_column_duplicate — full-column duplication across panels,
+# including the integer / 1-decimal columns detect_collisions' >=3dp grids miss.
+# ---------------------------------------------------------------------------
+from paperconan._audit import detect_cross_sheet_column_duplicates, figure_key  # noqa: E402
+
+
+def _sheet_from_cols(labels, cols):
+    rows = [list(labels)]
+    for r in range(len(cols[0])):
+        rows.append([cols[j][r] for j in range(len(cols))])
+    return Sheet.from_rows(rows)
+
+
+def _b1_oracle(panels):
+    """Independent ground truth. panels: {(file,sheet): {label: values}}. Returns the set of
+    frozenset({(file,sheet), (file,sheet)}) pairs that SHOULD be a HIGH duplicate: byte-identical
+    high-cardinality non-axis column of len>=12, different figure namespaces, and not the
+    all-integer-short case."""
+    import numpy as np
+    cols = []
+    for (f, s), colmap in panels.items():
+        for label, vals in colmap.items():
+            cols.append((f, s, label, [float(v) for v in vals]))
+    def axis_like(a):
+        if len(set(round(v, 9) for v in a)) <= 1:
+            return True
+        d = np.diff(a)
+        return bool(np.allclose(d, d[0], atol=1e-9 * max(max(abs(x) for x in a), 1e-300), rtol=1e-9) and abs(d[0]) > 0)
+    high = set()
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            fa, sa, _la, a = cols[i]
+            fb, sb, _lb, b = cols[j]
+            if (fa, sa) == (fb, sb) or len(a) != len(b):
+                continue
+            if [round(x, 6) for x in a] != [round(x, 6) for x in b]:
+                continue
+            n = len(a)
+            if n < 12 or axis_like(a) or len(set(round(v, 9) for v in a)) < max(6, n // 2):
+                continue
+            all_int = all(abs(v - round(v)) < 1e-9 for v in a)
+            if all_int and (n < 25 or len(set(round(v, 9) for v in a)) < max(12, int(0.7 * n))):
+                continue
+            fka, fkb = figure_key(sa), figure_key(sb)
+            if fka is not None and fka == fkb:
+                continue  # same figure -> low, not high
+            high.add(frozenset({(fa, sa), (fb, sb)}))
+    return high
+
+
+def _run_b1(panels):
+    gs = {k: _sheet_from_cols(list(v.keys()), list(v.values())) for k, v in panels.items()}
+    return detect_cross_sheet_column_duplicates(gs)
+
+
+def test_b1_flags_cross_figure_column_duplicate_and_matches_oracle():
+    dup = [3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2, 4.5, 4.8, 4.9, 4.2, 6.1, 6.3, 5.7]  # 15, 1-dp
+    other = [1.1, 2.4, 3.9, 0.7, 5.5, 4.2, 6.8, 2.1, 3.3, 7.4, 1.9, 8.2, 0.5, 4.7, 6.0]
+    panels = {
+        ("F3.xls", "Figure 3b"): {"NBS1-K388R": dup, "ctrl": other},
+        ("F9.xls", "Extended Data Fig. 9d"): {"Si-LDHA": list(dup), "misc": list(reversed(other))},
+    }
+    f = _run_b1(panels)
+    hi = [x for x in f if x["severity"] == "high"]
+    assert len(hi) == 1, f
+    assert hi[0]["size_a"] == 15 and hi[0]["same_figure"] is False
+    got = {frozenset({(x["file_a"], x["sheet_a"]), (x["file_b"], x["sheet_b"])}) for x in hi}
+    assert got == _b1_oracle(panels)
+
+
+def test_b1_no_flag_on_shared_axis_column():
+    axis = [0.5 * (i + 1) for i in range(15)]        # perfect progression → axis
+    panels = {
+        ("A.xls", "Figure 1a"): {"week": list(axis), "m": [1.1 * i + 0.3 for i in range(15)]},
+        ("B.xls", "Figure 2a"): {"week": list(axis), "m": [9.0 - 0.2 * i for i in range(15)]},
+    }
+    f = _run_b1(panels)
+    assert not [x for x in f if x["severity"] == "high"]
+    assert _b1_oracle(panels) == set()
+
+
+def test_b1_same_figure_is_low_not_high():
+    dup = [3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2, 4.5, 4.8, 4.9, 4.2, 6.1]
+    panels = {
+        ("M.xls", "Figure 4b"): {"control": list(dup)},
+        ("M.xls", "Figure 4c"): {"control": list(dup)},
+    }
+    f = _run_b1(panels)
+    assert not [x for x in f if x["severity"] == "high"]
+    assert all(x["severity"] == "low" for x in f)
+
+
+def test_b1_no_flag_short_or_all_integer_column():
+    short = [3.0, 3.2, 2.5, 2.8, 2.9, 2.2]           # < 12
+    ints = [int(v) for v in range(100, 118)]          # all-integer, n=18 < 25
+    panels = {
+        ("A.xls", "Figure 1a"): {"s": short, "i": list(ints)},
+        ("B.xls", "Figure 2a"): {"s": list(short), "i": list(ints)},
+    }
+    f = _run_b1(panels)
+    assert not f
+    assert _b1_oracle(panels) == set()
+
+
+def test_b1_serial_dilution_axis_not_flagged():
+    # regression: _column_axis_like rejected only arithmetic ladders, so a geometric
+    # serial-dilution axis shared across two dose-response panels was flagged HIGH (FP).
+    serial = [100.0 / (2 ** i) for i in range(14)]
+    other_a = [1.1 * i + 0.3 for i in range(14)]
+    other_b = [9.0 - 0.2 * i for i in range(14)]
+    panels = {
+        ("A.xls", "Figure 1a"): {"dose": list(serial), "m": other_a},
+        ("B.xls", "Figure 2a"): {"dose": list(serial), "m": other_b},
+    }
+    f = _run_b1(panels)
+    assert not [x for x in f if x["severity"] == "high"], "a shared serial-dilution axis is benign"
+
+
+def test_b1_rule_wording_is_honest_about_precision():
+    dup = [3.0, 3.2, 2.5, 2.8, 2.9, 2.2, 5.0, 5.2, 4.5, 4.8, 4.9, 4.2, 6.1, 6.3, 5.7]
+    panels = {
+        ("F3.xls", "Figure 3b"): {"x": dup},
+        ("F9.xls", "Extended Data Fig. 9d"): {"y": list(dup)},
+    }
+    hi = [x for x in _run_b1(panels) if x["severity"] == "high"]
+    assert hi and "byte-identical" not in hi[0]["rule"]
+    assert "6 decimal places" in hi[0]["rule"]
+
+
+def test_b1_single_sheet_early_exit():
+    from paperconan._audit import detect_cross_sheet_column_duplicates
+    one = {("A.xls", "Figure 1a"): _sheet_from_cols(["a", "b"], [[1.1 * i + 0.3 for i in range(14)],
+                                                                 [9.0 - 0.2 * i for i in range(14)]])}
+    assert detect_cross_sheet_column_duplicates(one) == []
