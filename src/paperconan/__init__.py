@@ -9,6 +9,7 @@ journal editors and the original authors. See README for full usage.
 """
 from ._audit import scan_dir, main  # noqa: F401
 from ._audit import scan_dir as audit_dir  # noqa: F401  public library entry point
+from ._adjudicated_html import write_adjudicated_report  # noqa: F401
 from ._html import write_html_report  # noqa: F401
 from .packet import distill_findings_for_review  # noqa: F401
 from .schema import PaperconanInputError  # noqa: F401
