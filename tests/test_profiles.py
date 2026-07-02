@@ -241,3 +241,20 @@ def test_cli_accepts_profile_flag(tmp_path):
     assert res.returncode == 0, res.stderr
     scan = json.loads((tmp_path / "out" / "scan.json").read_text())
     assert scan["profile"] == "triage"
+
+
+def test_axis_regex_excludes_collision_prone_measurement_headers():
+    # regression: _AXIS_RE was broadened with min/point/year/month/minute, which match real
+    # measurement/summary headers ('Min' statistic, 'melting point', date columns). Those must
+    # NOT be treated as axes, or a real column that is a perfect progression gets demoted.
+    from paperconan._profiles import _AXIS_RE, _is_axis_finding
+    for h in ("Min", "melting point", "set point", "Year", "minute", "month"):
+        assert not _AXIS_RE.search(h), f"{h!r} must not read as an axis"
+    for h in ("week 3", "day", "time (h)", "dose", "passage"):
+        assert _AXIS_RE.search(h), f"{h!r} is a genuine axis word"
+    # a 'Min' column that is a perfect non-integer progression (off-leftmost) stays HIGH
+    assert _is_axis_finding({"kind": "arithmetic_progression", "col": "Min",
+                             "step": 2.5, "col_idx": 3, "block_c0": 0}) is False
+    # a genuine 'week' axis is still demoted regardless of position
+    assert _is_axis_finding({"kind": "arithmetic_progression", "col": "week after treatment",
+                             "step": 2.5, "col_idx": 3, "block_c0": 0}) is True

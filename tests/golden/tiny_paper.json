@@ -5,31 +5,7 @@
       "block_rows": "2-11",
       "file": "ED_Fig1.xlsx",
       "finding": {
-        "col": "ap_col",
-        "col_idx": 3,
-        "count_05": 10,
-        "false_positive_context": [],
-        "kind": "rounded_to_half_or_int",
-        "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
-        "n": 10,
-        "profile_action": "kept",
-        "rule": "col[3]: 10/10 values end in 0 or 5",
-        "severity": "medium"
-      },
-      "group": "within_col",
-      "header": [
-        "mass(kg)",
-        "vol(mL)",
-        "copy_of_mass",
-        "ap_col"
-      ],
-      "sheet": "Sheet1"
-    },
-    {
-      "block_cols": "1-4",
-      "block_rows": "2-11",
-      "file": "ED_Fig1.xlsx",
-      "finding": {
+        "block_c0": 0,
         "col": "ap_col",
         "col_idx": 3,
         "false_positive_context": [],
@@ -55,6 +31,7 @@
       "block_rows": "2-11",
       "file": "ED_Fig1.xlsx",
       "finding": {
+        "block_c0": 0,
         "col": "ap_col",
         "col_idx": 3,
         "false_positive_context": [],
@@ -67,6 +44,31 @@
         "step": 2.5
       },
       "group": "progressions",
+      "header": [
+        "mass(kg)",
+        "vol(mL)",
+        "copy_of_mass",
+        "ap_col"
+      ],
+      "sheet": "Sheet1"
+    },
+    {
+      "block_cols": "1-4",
+      "block_rows": "2-11",
+      "file": "ED_Fig1.xlsx",
+      "finding": {
+        "col": "ap_col",
+        "col_idx": 3,
+        "count_05": 10,
+        "false_positive_context": [],
+        "kind": "rounded_to_half_or_int",
+        "likely_benign": "values ending in .0/.5 are common for derived or instrument-rounded quantities (cell counts, scores, calibrated readouts)",
+        "n": 10,
+        "profile_action": "kept",
+        "rule": "col[3]: 10/10 values end in 0 or 5",
+        "severity": "medium"
+      },
+      "group": "within_col",
       "header": [
         "mass(kg)",
         "vol(mL)",

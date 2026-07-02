@@ -26,9 +26,14 @@ NOISY_CONTEXTS = {
 }
 
 _AXIS_RE = re.compile(
-    r"\b(day|days|time|dose|concentration|conc|dilution|frequency|freq|"
-    r"voltage|field|index|rank|position|ppm|theta|2theta|2θ|x)\b"
-    r"|时间|剂量|浓度|频率|电压|场强|索引|坐标",
+    # Only unambiguous axis / independent-variable words. Deliberately NOT: min, month, year,
+    # minute, point — those collide with real measurement/summary headers (a "Min" statistic,
+    # "melting point", date columns) that could themselves be arithmetic progressions.
+    r"\b(day|days|week|weeks|wk|hour|hours|hr|hrs|"
+    r"time|timepoint|passage|cycle|cycles|dose|concentration|conc|"
+    r"dilution|frequency|freq|voltage|field|index|rank|position|ppm|theta|"
+    r"2theta|2θ|x)\b"
+    r"|时间|剂量|浓度|频率|电压|场强|索引|坐标|周|天|小时|传代|周期",
     re.I,
 )
 _DERIVED_RE = re.compile(
@@ -108,6 +113,13 @@ def _is_axis_finding(f: dict) -> bool:
     except (TypeError, ValueError):
         step = None
     if step is not None and abs(step - round(step)) < 1e-9:
+        return True
+    # Leftmost column of its block is the canonical x-axis / index position; a perfect
+    # progression there is the independent variable (time/dose grid), benign by construction
+    # — this catches unlabeled or oddly-named axes (e.g. "week after treatment", step 0.5)
+    # that the name regex misses.
+    col_idx, block_c0 = f.get("col_idx"), f.get("block_c0")
+    if col_idx is not None and block_c0 is not None and col_idx == block_c0:
         return True
     return bool(_AXIS_RE.search(_names_for(f)))
 

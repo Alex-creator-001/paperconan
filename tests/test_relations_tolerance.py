@@ -102,6 +102,171 @@ def test_metadata_coordinate_row_does_not_loosen_many_equal_pair_tolerance():
 
     assert not findings, f"one large Pos.start row must not make beta values look equal: {findings}"
 
+
+# ---------------------------------------------------------------------------
+# B5: integer_diff_shared_fraction — two columns reproduce each other's
+# high-precision decimal fractions but differ by whole numbers that vary per row.
+# ---------------------------------------------------------------------------
+
+def _b5_oracle(a, b):
+    """Independent ground truth: >=max(5,0.8n) rows differ by a (near-)integer, >=3 distinct
+    high-precision (>=4 sig frac digit) shared fractions, and >=2 distinct integer offsets."""
+    n = len(a)
+    scale = max(max(abs(v) for v in a), max(abs(v) for v in b), 1.0)
+    tol = 1e-9 * scale
+    diffs = [bb - aa for aa, bb in zip(a, b)]
+    int_diffs = [d for d in diffs if abs(d - round(d)) < tol]
+    def sig(v):
+        fv = abs(v - round(v))
+        return 0 if fv < 1e-9 else len(f"{fv:.9f}".split(".")[1].rstrip("0"))
+    hp = {round(aa - round(aa), 6) for aa, d in zip(a, diffs)
+          if abs(d - round(d)) < tol and sig(aa) >= 4}
+    return (len(int_diffs) >= max(5, round(0.8 * n))
+            and len(hp) >= 3
+            and len({round(d) for d in int_diffs}) >= 2)
+
+
+def _kinds(a, b, labels=("c0", "c1")):
+    s = _sheet([a, b])
+    return detect_relations(s, 1, len(a) + 1, 0, 2, list(labels))
+
+
+def test_b5_flags_shared_fraction_integer_diff_and_matches_oracle():
+    a = [12.3456, 45.6789, 7.1234, 88.9012, 33.4455, 61.2367, 19.8801, 50.5051]
+    shift = [3, -5, 10, 2, -7, 4, 11, -3]           # varying whole numbers
+    b = [aa + s for aa, s in zip(a, shift)]         # b reproduces a's fractions exactly
+    f = _kinds(a, b)
+    assert any(x["kind"] == "integer_diff_shared_fraction" and x["severity"] == "high" for x in f), f
+    assert _b5_oracle(a, b) is True
+    # not double-reported as small_diff_set
+    assert not any(x["kind"] == "small_diff_set" for x in f)
+
+
+def test_b5_no_fp_on_constant_integer_offset():
+    # a CONSTANT integer offset is a benign constant_offset, not the varying-shift fingerprint
+    a = [12.3456, 45.6789, 7.1234, 88.9012, 33.4455, 61.2367, 19.8801, 50.5051]
+    b = [aa + 5 for aa in a]
+    f = _kinds(a, b)
+    assert not any(x["kind"] == "integer_diff_shared_fraction" for x in f)
+    assert any(x["kind"] == "constant_offset" for x in f)
+    assert _b5_oracle(a, b) is False
+
+
+def test_b5_no_fp_on_low_precision_half_grid():
+    # shared .0/.5 fractions are low-precision (dose/score grids) — must NOT trigger B5
+    a = [2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0]
+    b = [aa + s for aa, s in zip(a, [3, -5, 10, 2, -7, 4, 11, -3])]
+    f = _kinds(a, b)
+    assert not any(x["kind"] == "integer_diff_shared_fraction" for x in f)
+    assert _b5_oracle(a, b) is False
+
+
+def test_b5_no_fp_on_independent_measurements():
+    a = [12.3456, 45.6789, 7.1234, 88.9012, 33.4455, 61.2367, 19.8801, 50.5051]
+    b = [9.8765, 41.2093, 3.5561, 82.7788, 30.1199, 58.4471, 15.2230, 47.9987]
+    f = _kinds(a, b)
+    assert not any(x["kind"] == "integer_diff_shared_fraction" for x in f)
+    assert _b5_oracle(a, b) is False
+
+
+# ---------------------------------------------------------------------------
+# B4: partial_constant_offset — a long CONSECUTIVE run where B = A + k (k const,
+# non-zero) while the rest of the column diverges.
+# ---------------------------------------------------------------------------
+
+def _b4_longest_run(a, b):
+    diffs = [round(bb - aa, 6) for aa, bb in zip(a, b)]
+    best = cur = 1
+    bestval = diffs[0]
+    for t in range(1, len(diffs)):
+        if abs(diffs[t] - diffs[t - 1]) < 1e-9:
+            cur += 1
+        else:
+            if cur > best:
+                best, bestval = cur, diffs[t - 1]
+            cur = 1
+    if cur > best:
+        best, bestval = cur, diffs[-1]
+    return best, bestval
+
+
+def _b4_oracle(a, b):
+    n = len(a)
+    run, val = _b4_longest_run(a, b)
+    non_trivial = abs(val - round(val)) > 1e-9
+    return run >= max(20, round(0.5 * n)) and run < n and abs(val) > 1e-9 and non_trivial
+
+
+def test_b4_flags_partial_offset_run_and_matches_oracle():
+    base = [round(0.13 * i + (i * i % 7) * 0.31, 4) for i in range(40)]
+    b = list(base)
+    for i in range(25):                     # first 25 rows shifted by a fixed -0.3
+        b[i] = round(base[i] - 0.3, 4)
+    for i in range(25, 40):                 # remaining rows diverge independently
+        b[i] = round(base[i] + 0.4 + 0.05 * i, 4)
+    f = _kinds(base, b)
+    pc = [x for x in f if x["kind"] == "partial_constant_offset"]
+    assert pc and pc[0]["severity"] == "high", f
+    assert pc[0]["run_length"] >= 20
+    assert _b4_oracle(base, b) is True
+    # whole-column offset is constant_offset, not partial
+    assert not any(x["kind"] == "constant_offset" for x in f)
+
+
+def test_b4_whole_column_offset_is_constant_not_partial():
+    base = [round(0.13 * i + 1.0, 4) for i in range(40)]
+    b = [round(v - 0.3, 4) for v in base]
+    f = _kinds(base, b)
+    assert any(x["kind"] == "constant_offset" for x in f)
+    assert not any(x["kind"] == "partial_constant_offset" for x in f)
+    assert _b4_oracle(base, b) is False        # run == n excluded
+
+
+def test_b4_short_run_not_flagged():
+    base = [round(0.13 * i + (i * i % 5) * 0.27, 4) for i in range(40)]
+    b = list(base)
+    for i in range(12):                        # only 12 consecutive (< 20 floor)
+        b[i] = round(base[i] - 0.3, 4)
+    for i in range(12, 40):
+        b[i] = round(base[i] + 0.5 + 0.03 * i, 4)
+    f = _kinds(base, b)
+    assert not any(x["kind"] == "partial_constant_offset" for x in f)
+    assert _b4_oracle(base, b) is False
+
+
+def test_b4_fires_at_small_magnitude_scale_relative():
+    # regression: B4 used a scale-ABSOLUTE round(diff,6)/1e-9 offset test, so a genuine
+    # copy-then-shift at MEG scale (~1e-14) was silently inert. It must fire scale-relatively.
+    base = [round((0.13 * i + (i * i % 7) * 0.31) * 1e-14, 20) for i in range(30)]
+    b = list(base)
+    for i in range(22):
+        b[i] = base[i] - 3e-14
+    for i in range(22, 30):
+        b[i] = base[i] + (0.4 + 0.05 * i) * 1e-14
+    f = _kinds(base, b)
+    assert any(x["kind"] == "partial_constant_offset" for x in f), "B4 must fire at ~1e-14 scale"
+
+
+def test_b4_benign_integer_shift_low_precision_not_flagged():
+    # a run shifted by a whole number on low-precision data (B = A + 5) is the benign case
+    a = [float(10 + i) for i in range(30)]
+    b = [a[i] + 5 for i in range(22)] + [a[i] + 9 + i for i in range(22, 30)]
+    f = _kinds(a, b)
+    assert not any(x["kind"] == "partial_constant_offset" for x in f)
+
+
+def test_b5_reports_real_shared_fraction_count_not_integer_rows():
+    # regression: n_shared_fraction / rule counted ALL integer-diff rows, including
+    # integer-on-integer rows with no fraction. It must report only genuine shared-fraction rows.
+    a = [12.3456, 45.6789, 7.1234, 88.9012, 33.4455, 61.2367, 19.8801, 50.5051,
+         5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0]   # 8 fractional + 10 integer rows
+    shift = [3, -5, 10, 2, -7, 4, 11, -3, 1, -2, 3, -1, 2, -3, 4, -1, 2, -3]
+    b = [a[i] + shift[i] for i in range(len(a))]
+    f = [x for x in _kinds(a, b) if x["kind"] == "integer_diff_shared_fraction"]
+    assert f, "B5 should still fire"
+    assert f[0]["n_shared_fraction"] == 8, f[0]           # not 18
+    assert "8/18" in f[0]["rule"] and "high-precision" in f[0]["rule"]
+
 def test_metadata_coordinate_row_does_not_loosen_identical_column_tolerance():
     left = [
         3_000_000_000.0, 0.10, 0.25, 0.44, 0.72, 0.91,

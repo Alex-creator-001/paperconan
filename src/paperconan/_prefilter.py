@@ -704,7 +704,8 @@ def prefilter(kind: str | None, a: str | None, b: str | None,
     if flags.get("common_unit_scale"):
         return "drop", "unit_conversion_or_normalization"
     if flags["derived_label"]:
-        if kind in {"constant_ratio", "constant_offset", "exact_linear", "sum_constant"}:
+        if kind in {"constant_ratio", "constant_offset", "exact_linear", "sum_constant",
+                    "integer_diff_shared_fraction", "partial_constant_offset"}:
             return "downweight", "derived_normalized"
         return "drop", "derived_normalized"
     if flags.get("low_information_sparse"):

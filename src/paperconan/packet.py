@@ -8,8 +8,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._audit import BLOCK_FINDING_GROUPS
 from ._prefilter import evidence_confidence
+from ._profiles import _is_axis_finding
 from .detectors import prefilter_relation_finding
+
+# Groups distilled generically here (severity-only) = the canonical per-block groups MINUS the
+# ones with dedicated distillers (relations/equal_pairs via _distill_relations, within_col via
+# _distill_within_col). Derived from BLOCK_FINDING_GROUPS so a newly-added group flows in here
+# automatically (the whole point of the single-source-of-truth constant).
+_SPECIALIZED_GROUPS = {"relations", "equal_pairs", "within_col"}
+_SIMPLE_BLOCK_GROUPS = tuple(g for g in BLOCK_FINDING_GROUPS if g not in _SPECIALIZED_GROUPS)
 
 
 def _relation_finding(kind: str | None, a: str | None, b: str | None, n: int,
@@ -130,9 +139,56 @@ def _distill_within_col(scan: dict[str, Any], drop_budget: int) -> list[dict[str
     return findings
 
 
+def _distill_block_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Distill the single-column statistical HIGH findings the specialized distillers
+    skip (arithmetic_progression, row_pair_digit_coupling, identical_after_rounding, grim).
+
+    Without this, a paper whose only HIGH signal lives in these groups distilled to an
+    EMPTY packet and was gated out of deep review as `no_surviving_high`. Only HIGH
+    (post-profile-demotion) findings are kept; axis progressions are additionally skipped
+    via `_is_axis_finding` as a belt-and-suspenders (they are already demoted to low in the
+    `review`/`triage` profiles, but `forensic` skips demotion).
+    """
+    findings = []
+    for block in scan.get("relations_blocks", []) or []:
+        for group in _SIMPLE_BLOCK_GROUPS:
+            for r in block.get(group, []) or []:
+                if str(r.get("severity")).lower() != "high":
+                    continue
+                if _is_axis_finding(r):
+                    continue
+                n = int(r.get("n") or 0)
+                sample = r.get("col_a_sample") or r.get("value_sample") or []
+                # grim/grimmer findings identify their column as mean_col (with n_col/sd_col),
+                # not col/col_a — carry it so the distilled entry has a usable location.
+                col_a = r.get("col") or r.get("col_a") or r.get("mean_col")
+                findings.append({
+                    "kind": r.get("kind"),
+                    "col_a": col_a,
+                    "col_b": r.get("col_b") or r.get("sd_col"),
+                    "n": n,
+                    "rule": r.get("rule"),
+                    "top5_a": list(sample)[:5],
+                    "top5_b": [],
+                    "high_precision": True,
+                    "mass": bool(n >= 200),
+                    "evidence_confidence": evidence_confidence(n, 1.0, True),
+                    "prefilter": "keep",
+                    "prefilter_reason": None,
+                    "sheet": block.get("sheet"),
+                    "file": block.get("file"),
+                    "figure_label": block.get("figure_label"),
+                })
+    return findings
+
+
 def distill_findings_for_review(scan: dict[str, Any], *,
                                 within_col_drop_budget: int = 100) -> list[dict[str, Any]]:
     """Return compact, prefiltered review findings from a full PaperConan scan.
+
+    Iterates every per-block finding group (see `paperconan.BLOCK_FINDING_GROUPS`):
+    relations/equal_pairs and within_col via their specialized distillers, the remaining
+    single-column statistical groups via `_distill_block_findings`, plus cross-sheet.
 
     Findings with `prefilter == "drop"` are retained in the returned list so
     callers can compute auto-drop/no-finding states and audit why a candidate
@@ -142,6 +198,7 @@ def distill_findings_for_review(scan: dict[str, Any], *,
     findings.extend(_distill_cross_sheet(scan))
     findings.extend(_distill_relations(scan))
     findings.extend(_distill_within_col(scan, within_col_drop_budget))
+    findings.extend(_distill_block_findings(scan))
     return findings
 
 
