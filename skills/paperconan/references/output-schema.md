@@ -87,3 +87,6 @@ Treat this as a local row-pair anomaly. Confirm row independence and exclude for
   - `superset` — one side strictly contains the other (e.g. an extra replicate column, n=5 vs n=6)
   - `value_tweaked` — cells changed in place (copy-then-tweak fingerprint; most worth investigating)
   - `value_divergent` — both sides hold values the other lacks
+  - `column_duplicate` — a full column repeats value-for-value across two panels (`cross_sheet_column_duplicate`; carries `col_a`/`col_b`)
+  - `fraction_reuse` — two matrix blocks in ONE sheet share decimal fractions while integer parts differ (`within_table_fraction_reuse`; `same_file=true`, `figure_a/b=null`)
+  - `recurring_row_vector` — a fixed row tuple recurs across ≥2 figures (`recurring_row_vector`; carries `vector`, `n_occurrences`, `n_figures`)
