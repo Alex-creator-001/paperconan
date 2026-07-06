@@ -538,6 +538,10 @@ def benign_reason(f):
     """
     kind = f.get("kind")
     if kind == "arithmetic_progression":
+        if f.get("reused_progression"):
+            return ("this exact progression is re-plotted across >=2 panels — an "
+                    "independent-variable axis (field / angle / time / dose / wavelength "
+                    "sweep), not measured data")
         step = f.get("step")
         if step is not None and abs(step - round(step)) < 1e-9:
             return ("an integer-step progression is usually an axis (day / dose / "
@@ -1046,6 +1050,37 @@ def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
         _demote_dense_relations(agg["relations"], cap)   # same dict objects as in blocks
         _demote_dense_relations(agg["equal_pairs"], cap)
         _demote_within_col_flood(agg["within_col"])      # per-sheet within-col flood gate
+    return report_blocks
+
+
+def _demote_reused_progressions(report_blocks):
+    """A perfect arithmetic progression that is REUSED — the identical (step, n, first)
+    appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plotted across
+    panels (magnetic-field / 2-theta / time / dose / wavelength sweep), not fabricated data.
+    Real measured data is never a perfect progression; a reused perfect progression is an axis.
+    Demote these out of the high/medium review priority (kept in scan.json, reversible via
+    forensic). A ONE-OFF perfect progression keeps its severity — that is the genuinely
+    suspicious linear-fill case (and matches the golden fixture's single ap_col). Mutates in
+    place and returns report_blocks."""
+    sig_count = {}
+    progs = []
+    for b in report_blocks:
+        for f in b.get("progressions", []):
+            if f.get("kind") != "arithmetic_progression":
+                continue
+            sig = (round(float(f.get("step", 0.0)), 9), f.get("n"),
+                   round(float(f.get("first", 0.0)), 9))
+            sig_count[sig] = sig_count.get(sig, 0) + 1
+            progs.append((sig, f))
+    for sig, f in progs:
+        if sig_count.get(sig, 0) >= 2:
+            f["severity"] = "low"
+            f["reused_progression"] = True
+            f["prefilter"] = "drop"
+            f["prefilter_reason"] = "reused_progression_axis"
+            note = benign_reason(f)               # runs AFTER _attach_benign, so set it here
+            if note:
+                f["likely_benign"] = note
     return report_blocks
 
 
@@ -2526,6 +2561,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     # Down-weight dense/correlated sheets: judged by per-sheet relation totals, so a
     # wide matrix's expected identical/linear columns don't flood high-severity output.
     _demote_dense_sheets(report_blocks)
+    _demote_reused_progressions(report_blocks)   # reused perfect progression = re-plotted axis
 
     # Unified collision pass: every (file, sheet) grid against every other —
     # covers both intra-workbook sheet pairs and cross-file duplicates.
