@@ -675,6 +675,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                      rule=f"col[{cj}] = col[{ci}] + {mean_diff:.6g}"))
                 continue
             # constant ratio
+            ratio_emitted = False
             if np.all(np.abs(x) > 1e-12):
                 ratio = y / x
                 mean_ratio = float(np.mean(ratio))
@@ -690,6 +691,7 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                          severity="high",
                                          col_a_sample=sa, col_b_sample=sb,
                                          rule=f"col[{cj}] = col[{ci}] * {mean_ratio:.6g}"))
+                    ratio_emitted = True
             # mirror: x + y == constant
             csum = x + y
             if n >= 5 and np.std(csum) < tol:
@@ -708,7 +710,17 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                     continue
                 fitted = slope * x + intercept
                 if np.std(y) > 0 and _allclose_rowwise(y, fitted, rtol=1e-7) and abs(r) > 0.99:
-                    if not (abs(slope - 1) < 1e-9 and abs(intercept) < tol):
+                    # A scale-relatively zero intercept means the fit is y = slope*x: the
+                    # identity (slope~=1, caught by identical_column) or a pure scaling. When a
+                    # constant_ratio already captured that scaling, a second exact_linear finding
+                    # is redundant (same relationship, b==0 to round-off) and only inflates the
+                    # count — suppress it. exact_linear is reserved for a genuine non-zero
+                    # intercept (an affine offset constant_ratio cannot express), and still fires
+                    # when no constant_ratio covered the pair (e.g. a zero in x skips its guard).
+                    intercept_is_zero = abs(intercept) < tol
+                    is_identity = abs(slope - 1) < 1e-9 and intercept_is_zero
+                    redundant_scaling = intercept_is_zero and ratio_emitted
+                    if not (is_identity or redundant_scaling):
                         findings.append(dict(kind="exact_linear", col_a=header[ci - c0], col_b=header[cj - c0],
                                              col_a_idx=ci, col_b_idx=cj, n=n,
                                              slope=float(slope), intercept=float(intercept),
