@@ -317,3 +317,65 @@ def test_mixed_scale_true_exact_linear_still_flags():
     findings = detect_relations(s, 1, len(x) + 1, 0, 2, ["x", "y"])
 
     assert any(f["kind"] == "exact_linear" for f in findings), findings
+
+
+# ---------------------------------------------------------------------------
+# Dedupe: a pure proportional relationship (y = k*x, k != 1) is a constant_ratio.
+# The linear fit of the same columns yields the same slope with a zero intercept
+# (down to floating-point round-off ~ eps*scale) — an exact_linear finding that
+# carries no information beyond the constant_ratio and only inflates the count.
+# exact_linear must be reserved for a GENUINE (scale-significant) non-zero intercept.
+# ---------------------------------------------------------------------------
+
+def test_pure_scaling_not_double_reported_as_exact_linear():
+    # mirrors the paper's Fig4g columns: y = 2.39 * x row-wise, no near-zero x.
+    x = [467.61905, 453.14286, 404.38095, 364.0, 598.66667, 538.47619,
+         532.38095, 510.28571, 544.57143, 375.42857, 619.2381, 715.2381]
+    y = [2.39 * v for v in x]
+    f = _kinds(x, y)
+    assert any(k["kind"] == "constant_ratio" for k in f), f
+    assert not any(k["kind"] == "exact_linear" for k in f), \
+        f"pure scaling must not also be reported as exact_linear (redundant, b~=0): {f}"
+
+
+def test_genuine_nonzero_intercept_still_flags_exact_linear_at_normal_scale():
+    # a real affine offset (y = 3x + 7) is a DISTINCT signal constant_ratio cannot express.
+    x = [12.0, 45.0, 7.0, 88.0, 33.0, 61.0, 19.0, 50.0, 27.0, 6.0]
+    y = [3 * v + 7 for v in x]
+    f = _kinds(x, y)
+    assert any(k["kind"] == "exact_linear" for k in f), f
+    assert not any(k["kind"] == "constant_ratio" for k in f), \
+        f"an affine offset is not a pure ratio: {f}"
+
+
+def test_pure_scaling_with_zero_in_x_still_detected():
+    # edge case: constant_ratio's divide guard (all |x| > 1e-12) skips columns containing 0,
+    # so the b~=0 exact_linear is the SOLE witness of the proportional relationship — the
+    # dedupe must NOT drop it here (that would be a false negative).
+    x = [0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.5, 12.0, 13.5]
+    y = [2.5 * v for v in x]
+    f = _kinds(x, y)
+    assert not any(k["kind"] == "constant_ratio" for k in f), \
+        "constant_ratio's zero-guard should skip this column"
+    assert any(k["kind"] == "exact_linear" for k in f), \
+        f"proportional relationship with a zero in x must still be caught: {f}"
+
+
+def test_ratio_emitted_flag_does_not_leak_across_column_pairs():
+    # Guard: the per-pair `ratio_emitted` flag must be re-initialized for every column
+    # pair. If it were hoisted outside the pair loop, a constant_ratio on an EARLIER pair
+    # (c0,c1) would leave the flag True and wrongly suppress the b~=0 exact_linear on a
+    # LATER pair (c2,c3) whose constant_ratio was skipped by the divide-by-zero guard —
+    # a cross-pair false negative. c2 contains a 0; c2/c3 are independent of c0/c1.
+    c0 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    c1 = [2.0 * v for v in c0]                      # pair (c0,c1): pure scaling -> constant_ratio
+    c2 = [0.0, 3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0]   # has a 0; irregular
+    c3 = [2.5 * v for v in c2]                      # pair (c2,c3): pure scaling with a 0 in x
+    s = _sheet([c0, c1, c2, c3])
+    f = detect_relations(s, 1, len(c0) + 1, 0, 4, ["c0", "c1", "c2", "c3"])
+    cr = {(x["col_a"], x["col_b"]) for x in f if x["kind"] == "constant_ratio"}
+    el = {(x["col_a"], x["col_b"]) for x in f if x["kind"] == "exact_linear"}
+    assert ("c0", "c1") in cr, f"pure scaling of the first pair should be a constant_ratio: {f}"
+    assert ("c0", "c1") not in el, f"first pair's redundant exact_linear must be deduped: {f}"
+    assert ("c2", "c3") in el, \
+        f"later zero-in-x pair's exact_linear must NOT be suppressed by an earlier pair's flag: {f}"
