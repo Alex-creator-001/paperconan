@@ -586,6 +586,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "openpyxl" },
+    { name = "python-calamine" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
@@ -600,6 +601,7 @@ dev = [
     { name = "pytest" },
     { name = "python-docx" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
+    { name = "xlwt" },
 ]
 docx = [
     { name = "python-docx" },
@@ -615,6 +617,7 @@ test = [
     { name = "pytest" },
     { name = "python-docx" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
+    { name = "xlwt" },
 ]
 
 [package.metadata]
@@ -627,6 +630,7 @@ requires-dist = [
     { name = "pdfplumber", marker = "extra == 'test'", specifier = ">=0.11" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8" },
+    { name = "python-calamine", specifier = ">=0.2" },
     { name = "python-calamine", marker = "extra == 'fast'", specifier = ">=0.2" },
     { name = "python-docx", marker = "extra == 'all'", specifier = ">=1.1" },
     { name = "python-docx", marker = "extra == 'dev'", specifier = ">=1.1" },
@@ -635,6 +639,8 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.10" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'dev'", specifier = ">=2" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'test'", specifier = ">=2" },
+    { name = "xlwt", marker = "extra == 'dev'", specifier = ">=1.3" },
+    { name = "xlwt", marker = "extra == 'test'", specifier = ">=1.3" },
 ]
 provides-extras = ["pdf", "docx", "fast", "all", "test", "dev"]
 
@@ -1142,4 +1148,13 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
+]
+
+[[package]]
+name = "xlwt"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/97/56a6f56ce44578a69343449aa5a0d98eefe04085d69da539f3034e2cd5c1/xlwt-1.3.0.tar.gz", hash = "sha256:c59912717a9b28f1a3c2a98fd60741014b06b043936dcecbc113eaaada156c88", size = 153929, upload-time = "2017-08-22T06:47:16.498Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/44/48/def306413b25c3d01753603b1a222a011b8621aed27cd7f89cbc27e6b0f4/xlwt-1.3.0-py2.py3-none-any.whl", hash = "sha256:a082260524678ba48a297d922cc385f58278b8aa68741596a87de01a9c628b2e", size = 99981, upload-time = "2017-08-22T06:47:15.281Z" },
 ]
