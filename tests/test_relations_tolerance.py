@@ -110,17 +110,20 @@ def test_metadata_coordinate_row_does_not_loosen_many_equal_pair_tolerance():
 
 def _b5_oracle(a, b):
     """Independent ground truth: >=max(5,0.8n) rows differ by a (near-)integer, >=3 distinct
-    high-precision (>=4 sig frac digit) shared fractions, and >=2 distinct integer offsets."""
+    high-precision (>=4 sig frac digit) shared fractions, and >=2 distinct integer offsets.
+    Tolerance is per-row (at each row's own magnitude), so one extreme value can't inflate it."""
     n = len(a)
-    scale = max(max(abs(v) for v in a), max(abs(v) for v in b), 1.0)
-    tol = 1e-9 * scale
+    def _is_int_diff(aa, bb):
+        tol = 1e-9 * max(abs(aa), abs(bb), 1e-300)
+        d = bb - aa
+        return abs(d - round(d)) < tol
     diffs = [bb - aa for aa, bb in zip(a, b)]
-    int_diffs = [d for d in diffs if abs(d - round(d)) < tol]
+    int_diffs = [bb - aa for aa, bb in zip(a, b) if _is_int_diff(aa, bb)]
     def sig(v):
         fv = abs(v - round(v))
         return 0 if fv < 1e-9 else len(f"{fv:.9f}".split(".")[1].rstrip("0"))
-    hp = {round(aa - round(aa), 6) for aa, d in zip(a, diffs)
-          if abs(d - round(d)) < tol and sig(aa) >= 4}
+    hp = {round(aa - round(aa), 6) for aa, bb in zip(a, b)
+          if _is_int_diff(aa, bb) and sig(aa) >= 4}
     return (len(int_diffs) >= max(5, round(0.8 * n))
             and len(hp) >= 3
             and len({round(d) for d in int_diffs}) >= 2)
@@ -167,6 +170,31 @@ def test_b5_no_fp_on_independent_measurements():
     f = _kinds(a, b)
     assert not any(x["kind"] == "integer_diff_shared_fraction" for x in f)
     assert _b5_oracle(a, b) is False
+
+
+def test_b5_no_fp_when_one_extreme_value_inflates_tolerance():
+    # regression (M2-1): a single extreme value (an inf/placeholder like a 1e99 fold-change)
+    # must NOT inflate the column-wide tolerance so that every row's diff reads as a whole
+    # number. x and y are independent measurements whose diffs are genuinely non-integer, plus
+    # one 1e99 placeholder row. With a column-wide tol = 1e-9 * max|value| ~ 1e90 every row
+    # passed vacuously and the detector emitted a spurious whole-sheet integer_diff_shared_fraction;
+    # a per-row tolerance rejects the normal rows.
+    x = [2.3456, -1.7890, 3.0112, 0.5561, -2.8834, 1.2207, 4.9019, 1e99]
+    y = [100.0, 50.0, 3000.0, 7.0, 12.0, 900.0, 45.0, 0.0]
+    f = _kinds(x, y)
+    assert not any(k["kind"] == "integer_diff_shared_fraction" for k in f), f
+    assert _b5_oracle(x, y) is False
+
+
+def test_b5_no_fp_on_large_integer_coordinate_column():
+    # regression (M2-1): a big integer column (e.g. distanceToTSS up to ~3.6e6) paired with a
+    # small fractional score column must not read as shared-fraction integer-diff on every row.
+    frac_score = [0.31, 0.47, 0.12, 0.58, 0.09, 0.66, 0.23, 0.41, 0.77, 0.05]
+    dist_to_tss = [5000.0, 128000.0, 3600000.0, 42.0, 990000.0, 17.0, 250000.0,
+                   8100.0, 33.0, 1400000.0]
+    f = _kinds(frac_score, dist_to_tss)
+    assert not any(k["kind"] == "integer_diff_shared_fraction" for k in f), f
+    assert _b5_oracle(frac_score, dist_to_tss) is False
 
 
 # ---------------------------------------------------------------------------

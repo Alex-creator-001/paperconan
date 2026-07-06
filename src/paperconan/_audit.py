@@ -756,7 +756,13 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
             # (e.g. 178.7615 vs 112.7615, 169.8687 vs 115.8687). The precision requirement lets this
             # fire from n>=5 without the false positives a bare small-diff-set floor would admit.
             if n >= 5:
-                diff_is_int = np.abs(diff - np.round(diff)) < tol
+                # Per-row tolerance for the integer-difference test: representation noise at each
+                # row's OWN magnitude, not the column-wide max. A single extreme value (an inf /
+                # placeholder like a 1e99 fold-change for a zero-denominator row) must not inflate
+                # the tolerance so that every row's diff reads as a whole number — that produced
+                # spurious whole-sheet integer_diff_shared_fraction findings (M2-1).
+                diff_tol = 1e-9 * np.maximum(np.maximum(np.abs(x), np.abs(y)), 1e-300)
+                diff_is_int = np.abs(diff - np.round(diff)) < diff_tol
                 frac_x = x - np.round(x)                       # signed distance to nearest integer
                 hp_rows = diff_is_int & (np.abs(frac_x) > 1e-6)
                 hp_fracs = [float(v) for v in frac_x[hp_rows] if _sig_frac_digits(v) >= 4]
@@ -2318,13 +2324,16 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
                 common = [k for k in ca if k in cb]
                 if len(common) < min_cells:
                     continue
-                scale = max(max(abs(ca[k]) for k in common), max(abs(cb[k]) for k in common), 1.0)
-                tol = 1e-6 * scale
                 shared = int_diffs = hp = 0
                 fracs, diffset = set(), set()
                 for k in common:
                     x, y = ca[k], cb[k]
                     d = y - x
+                    # Per-cell tolerance at THIS cell's magnitude, not the block-wide max. A single
+                    # extreme value (a huge integer coordinate like distanceToTSS ~3.6e6, or a
+                    # placeholder) must not inflate the tolerance so that every cell reads as an
+                    # integer difference — that produced spurious whole-block fraction_reuse (M2-1).
+                    tol = 1e-6 * max(abs(x), abs(y), 1.0)
                     if abs(d - round(d)) < tol:                 # integer difference => same fraction
                         shared += 1
                         if abs(round(d)) >= 1:

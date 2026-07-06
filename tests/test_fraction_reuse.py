@@ -92,6 +92,24 @@ def test_b3_no_flag_when_blocks_are_independent():
     assert _b3_oracle(a_rows, b_rows) is False
 
 
+def test_b3_no_flag_when_one_large_integer_column_inflates_block_scale():
+    # regression (M2-1): a large-integer column (e.g. distanceToTSS up to ~3.6e6) must not
+    # inflate the block-wide tolerance (1e-6 * block_max ~= 3.6) so that every independent
+    # fractional cell reads as an integer-difference shared fraction. Two GENUINELY INDEPENDENT
+    # fractional matrices that merely happen to include a big-integer coordinate column must NOT
+    # flag; a per-cell tolerance keeps the fractional cells honest.
+    a_rows, _ = _matrix_block(_BASE, _SHIFTS)
+    b_rows = [[round(v * 0.837 + 1.1119, 5) for v in row] for row in a_rows]   # independent
+    dist_a = [37.0, 128000.0, 3600000.0, 4200.0, 990000.0, 17.0, 250000.0]
+    dist_b = [512.0, 44000.0, 1800000.0, 63.0, 770000.0, 209.0, 130000.0]
+    a_rows = [list(r) + [dist_a[i]] for i, r in enumerate(a_rows)]
+    b_rows = [list(r) + [dist_b[i]] for i, r in enumerate(b_rows)]
+    gs = _grid_sheets_two_blocks(a_rows, b_rows)
+    f = detect_within_sheet_fraction_reuse(gs)
+    assert not [x for x in f if x["severity"] == "high"], f
+    assert _b3_oracle(a_rows, b_rows) is False
+
+
 def test_b3_no_flag_on_low_precision_half_grid():
     base = [[round((r * 7 + c) * 0.5, 1) for c in range(7)] for r in range(7)]   # .0/.5 only
     shifts = [[(r + c) % 5 for c in range(7)] for r in range(7)]
