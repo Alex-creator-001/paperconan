@@ -11,6 +11,11 @@ FIXTURE_HTML = '''
 </body></html>
 '''
 
+FIGURE_HTML = '''
+<a href="/articles/s41467-022-28338-0/figures/1">Fig. 1</a>
+<img src="https://media.springernature.com/full/springer-static/image/art%3A10.1038%2Fs41467-022-28338-0/MediaObjects/41467_2022_28338_Fig1_HTML.png">
+'''
+
 
 def test_parse_nature_esm_links_extracts_and_classifies():
     refs = nat.parse_nature_esm_links(FIXTURE_HTML)
@@ -33,3 +38,25 @@ def test_search_nature_esm_builds_confident_candidate(monkeypatch):
 
 def test_search_nature_esm_non_doi_returns_empty():
     assert nat.search_nature_esm("some free text query") == []
+
+
+def test_parse_nature_public_figure_links():
+    refs = nat.parse_nature_figure_links(
+        FIXTURE_HTML,
+        "https://www.nature.com/articles/s41467-022-28338-0",
+    )
+    assert refs == [
+        "https://www.nature.com/articles/s41467-022-28338-0/figures/1"
+    ]
+
+
+def test_search_nature_esm_adds_public_full_figure(monkeypatch):
+    def fake_get_text(url, **kwargs):
+        return FIGURE_HTML if url.endswith("/figures/1") else FIXTURE_HTML
+
+    monkeypatch.setattr(nat._http, "get_text", fake_get_text)
+    candidate = nat.search_nature_esm("10.1038/s41467-022-28338-0")[0]
+    assert [f["ext"] for f in candidate["image_files"]] == ["png"]
+    assert candidate["image_files"][0]["download_url"].startswith(
+        "https://media.springernature.com/full/"
+    )

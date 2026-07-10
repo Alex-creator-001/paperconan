@@ -12,6 +12,11 @@ from ._sources import _candidate
 
 _ESM_HREF = re.compile(
     r'href="(https://static-content\.springer\.com/esm/[^"]+)"', re.I)
+_FIGURE_HREF = re.compile(r'href="([^"]+/figures/\d+)"', re.I)
+_FULL_IMAGE_SRC = re.compile(
+    r'(https://media\.springernature\.com/full/[^"\']+\.(?:png|jpe?g|tiff?))',
+    re.I,
+)
 
 
 def parse_nature_esm_links(html: str) -> list[dict]:
@@ -28,6 +33,22 @@ def parse_nature_esm_links(html: str) -> list[dict]:
     return refs
 
 
+def parse_nature_figure_links(html: str, article_url: str) -> list[str]:
+    return sorted({
+        urllib.parse.urljoin(article_url, href.replace("&amp;", "&"))
+        for href in _FIGURE_HREF.findall(html or "")
+    })
+
+
+def parse_nature_full_image(html: str) -> dict | None:
+    match = _FULL_IMAGE_SRC.search(html or "")
+    if not match:
+        return None
+    url = match.group(1).replace("&amp;", "&")
+    name = urllib.parse.unquote(url.rsplit("/", 1)[-1])
+    return make_fileref(name, None, url)
+
+
 def search_nature_esm(query, size=5):
     """If `query` is a DOI, fetch its nature.com page and return one candidate
     carrying its ESM files. Non-DOI queries return [] (this source is DOI-keyed)."""
@@ -41,6 +62,13 @@ def search_nature_esm(query, size=5):
     except Exception:
         return []
     all_files = parse_nature_esm_links(html)
+    for figure_url in parse_nature_figure_links(html, url):
+        try:
+            ref = parse_nature_full_image(_http.get_text(figure_url, timeout=60))
+        except Exception:
+            ref = None
+        if ref is not None:
+            all_files.append(ref)
     if not all_files:
         return []
     c = _candidate("nature_esm", suffix, doi, None, [], None, all_files, [doi])

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 
 TABULAR_EXTS = {"xlsx", "csv", "tsv"}
+IMAGE_EXTS = {"png", "jpg", "jpeg", "tif", "tiff", "webp"}
+DOCUMENT_EXTS = {"pdf"}
 
 
 def ext_of(name: str) -> str:
@@ -11,6 +13,21 @@ def ext_of(name: str) -> str:
 
 def is_tabular(name: str) -> bool:
     return ext_of(name) in TABULAR_EXTS
+
+
+def is_image(name: str) -> bool:
+    return ext_of(name) in IMAGE_EXTS
+
+
+def asset_type(name: str) -> str:
+    ext = ext_of(name)
+    if ext in TABULAR_EXTS:
+        return "tabular"
+    if ext in IMAGE_EXTS:
+        return "image"
+    if ext in DOCUMENT_EXTS:
+        return "document"
+    return "other"
 
 
 def make_fileref(name: str, size, download_url: str) -> dict:

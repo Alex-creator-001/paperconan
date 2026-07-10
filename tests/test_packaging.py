@@ -33,3 +33,16 @@ def test_pyproject_version_matches_package():
         pyproject = tomllib.load(fh)
 
     assert pyproject["project"]["version"] == __version__
+
+
+def test_image_extra_is_optional_but_included_in_all_and_test():
+    with open("pyproject.toml", "rb") as fh:
+        extras = tomllib.load(fh)["project"]["optional-dependencies"]
+    assert {"pillow>=12", "pypdfium2>=5", "opencv-python-headless>=4.10"} <= set(
+        extras["image"]
+    )
+    for name in ("all", "test", "dev"):
+        joined = " ".join(extras[name])
+        assert "pillow" in joined
+        assert "pypdfium2" in joined
+        assert "opencv-python-headless" in joined

@@ -1,4 +1,6 @@
 import io
+from pathlib import Path
+
 from paperconan.fetch import _download
 
 
@@ -186,3 +188,205 @@ def test_download_file_403_message(monkeypatch, tmp_path):
     res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"))
     assert res["ok"] is False
     assert "auth" in res["skipped_reason"].lower()
+
+
+def test_download_candidate_images_are_additive_and_default_stays_tabular(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        open(dest, "wb").write(b"x")
+        calls.append(dest)
+        return {
+            "ok": True,
+            "path": dest,
+            "size": 1,
+            "content_type": "application/octet-stream",
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    cand = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{"name": "data.csv", "download_url": "https://x/data.csv"}],
+        "image_files": [{"name": "Fig1.png", "download_url": "https://x/Fig1.png"}],
+        "all_files": [
+            {"name": "data.csv", "download_url": "https://x/data.csv"},
+            {"name": "Fig1.png", "download_url": "https://x/Fig1.png"},
+        ],
+    }
+
+    default_dir = tmp_path / "default"
+    default = _download.download_candidate(cand, str(default_dir))
+    assert [Path(p).name for p in default["downloaded"]] == ["data.csv"]
+
+    image_dir = tmp_path / "images"
+    image = _download.download_candidate(cand, str(image_dir), include_images=True)
+    assert sorted(Path(p).name for p in image["downloaded"]) == ["Fig1.png", "data.csv"]
+
+
+def test_image_archive_same_basenames_do_not_overwrite(monkeypatch, tmp_path):
+    import io
+    import zipfile
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("figures/Fig1.png", b"first-image")
+        archive.writestr("supplement/Fig1.png", b"second-image")
+
+    def fake_download(url, dest, **kwargs):
+        Path(dest).write_bytes(payload.getvalue())
+        return {"ok": True, "path": dest, "size": len(payload.getvalue())}
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "tabular_files": [],
+        "image_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles",
+            "name": "supplementary.zip",
+        },
+    }
+    summary = _download.download_candidate(
+        candidate,
+        str(tmp_path),
+        include_images=True,
+    )
+    names = sorted(Path(path).name for path in summary["downloaded"])
+    assert len(names) == 2
+    assert "Fig1.png" in names
+    assert any(name.startswith("Fig1-") for name in names)
+
+
+def test_default_direct_table_download_does_not_also_fetch_archive(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_download(url, dest, **kwargs):
+        calls.append(url)
+        Path(dest).write_bytes(b"table")
+        return {"ok": True, "path": dest, "size": 5}
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [
+            {"name": "data.csv", "download_url": "https://example.test/data.csv"},
+        ],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert calls == ["https://example.test/data.csv"]
+
+
+def test_image_archive_runs_when_direct_table_download_succeeds(monkeypatch, tmp_path):
+    import io
+    import zipfile
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("figures/Fig1.png", b"image")
+
+    def fake_download(url, dest, **kwargs):
+        if url.endswith("data.csv"):
+            Path(dest).write_bytes(b"table")
+            return {"ok": True, "path": dest, "size": 5}
+        Path(dest).write_bytes(payload.getvalue())
+        return {"ok": True, "path": dest, "size": len(payload.getvalue())}
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [
+            {"name": "data.csv", "download_url": "https://example.test/data.csv"},
+        ],
+        "image_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(tmp_path),
+        include_images=True,
+    )
+
+    assert sorted(Path(path).name for path in summary["downloaded"]) == [
+        "Fig1.png",
+        "data.csv",
+    ]
+
+
+def test_identical_archive_file_preserves_direct_download_and_provenance(
+    monkeypatch,
+    tmp_path,
+):
+    import json
+    import zipfile
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("figures/Fig1.png", b"image")
+
+    direct_url = "https://example.test/Fig1.png?signature=secret#fragment"
+
+    def fake_download(url, dest, **kwargs):
+        if url == direct_url:
+            Path(dest).write_bytes(b"image")
+            return {
+                "ok": True,
+                "path": dest,
+                "size": 5,
+                "content_type": "image/png",
+                "source_url": url,
+            }
+        Path(dest).write_bytes(payload.getvalue())
+        return {
+            "ok": True,
+            "path": dest,
+            "size": len(payload.getvalue()),
+            "content_type": "application/zip",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "image_files": [
+            {"name": "Fig1.png", "download_url": direct_url},
+        ],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles?token=archive",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(tmp_path),
+        include_images=True,
+    )
+    sidecar = json.loads(
+        (tmp_path / "paperconan_source.json").read_text(encoding="utf-8")
+    )
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["Fig1.png"]
+    assert sidecar["downloads"] == [{
+        "file": "Fig1.png",
+        "source_url": "https://example.test/Fig1.png",
+        "content_type": "image/png",
+        "asset_type": "image",
+        "size": 5,
+    }]

@@ -2604,19 +2604,33 @@ def _cap_block_findings(groups, cap):
 
 
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
-             profile="review", write_json=True, evidence=True):
+             profile="review", write_json=True, evidence=True, images=False,
+             image_diagnostics=False):
     profile = normalize_profile(profile)
     # The HTML report renders the evidence snippets, so it requires them.
     if write_html:
         evidence = True
-    files = sorted({p for pat in ("*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
-                                  "*.csv", "*.tsv", "*.pdf", "*.docx")
-                    for p in glob.glob(os.path.join(in_dir, pat))})
-    if not files:
+    table_files = sorted({
+        p for pattern in (
+            "*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
+            "*.csv", "*.tsv", "*.pdf", "*.docx",
+        )
+        for p in glob.glob(os.path.join(in_dir, pattern))
+    })
+    from .fetch._files import is_image
+    local_images = sorted(
+        (
+            path for path in glob.glob(os.path.join(in_dir, "*"))
+            if os.path.isfile(path) and is_image(os.path.basename(path))
+        ),
+        key=lambda path: (os.path.basename(path).casefold(), os.path.basename(path)),
+    )
+    if not table_files and not (images and local_images):
+        supported = ".xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx"
+        if images:
+            supported += " / .png / .jpg / .jpeg / .tif / .tiff / .webp"
         raise PaperconanInputError(
-            f"no .xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
-            f"(paperconan reads .xlsx via openpyxl, legacy .xls / .xlsm / .xlsb via calamine, "
-            f".csv / .tsv, and tables inside .pdf / .docx)"
+            f"no {supported} files in {in_dir}"
         )
 
     report_blocks = []
@@ -2629,7 +2643,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     scan_stats = {"files": [], "sheets": []}
     scan_start = time.perf_counter()
 
-    for f in files:
+    for f in table_files:
         file_start = time.perf_counter()
         file_stat = {"file": os.path.basename(f), "path": f}
         # Memory guard: a large workbook expands to many GB of Python objects when fully
@@ -2782,13 +2796,22 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             d["p_adj"] = a
             d["fdr_significant"] = bool(s)
 
+    image_assets = []
+    image_findings = []
+    if images:
+        from .image._assets import prepare_image_assets
+        image_assets, image_errors = prepare_image_assets(in_dir, out_dir)
+        scan_errors.extend(image_errors)
+
     out = dict(tool="paperconan",
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                profile=profile,
                input_dir=in_dir,
                paper=_load_provenance(in_dir, paper),
-               n_files=len(files),
+               n_files=len(table_files),
+               n_image_source_files=len(local_images),
+               n_image_assets=len(image_assets),
                n_blocks_with_findings=len(report_blocks),
                findings_omitted=findings_omitted_total,
                scan_errors=scan_errors,
@@ -2797,7 +2820,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
-               cross_sheet_findings=cross_sheet_findings)
+               cross_sheet_findings=cross_sheet_findings,
+               image_assets=image_assets,
+               image_findings=image_findings)
     os.makedirs(out_dir, exist_ok=True)
     if write_json:
         with open(os.path.join(out_dir, "scan.json"), "w") as fh:
@@ -2938,8 +2963,20 @@ def main():
     ap.add_argument("--profile", choices=("review", "forensic", "triage"),
                     default="review",
                     help="False-positive handling profile: review (default), forensic, or triage")
+    ap.add_argument(
+        "--images",
+        action="store_true",
+        help="inventory local/fetched images and render PDF pages into scan.json image_assets",
+    )
+    ap.add_argument(
+        "--image-diagnostics",
+        action="store_true",
+        help="also run optional non-gating deterministic image similarity helpers",
+    )
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
+    if args.image_diagnostics and not args.images:
+        ap.error("--image-diagnostics requires --images")
     out_dir = args.out or os.path.join(args.in_dir, "audit")
     write_html = not args.no_html
     paper = None
@@ -2947,7 +2984,8 @@ def main():
         paper = {"doi": args.doi, "title": args.title}
     try:
         res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
-                       paper=paper, profile=args.profile)
+                       paper=paper, profile=args.profile, images=args.images,
+                       image_diagnostics=args.image_diagnostics)
     except PaperconanInputError as e:
         sys.exit(str(e))
     outputs = [f"{out_dir}/scan.json"]

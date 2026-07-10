@@ -7,14 +7,16 @@ import re
 import urllib.parse as _urlparse
 
 from . import _http
-from ._files import TABULAR_EXTS, make_fileref
+from ._files import TABULAR_EXTS, is_image, make_fileref
 
 
 def _candidate(source, cid, doi, title, authors, published, all_files, related):
     tabular = [f for f in all_files if f["ext"] in TABULAR_EXTS]
+    images = [f for f in all_files if is_image(f.get("name") or "")]
     return {"cand_id": f"{source}:{cid}", "source": source, "id": str(cid),
             "doi": doi, "title": title or "", "authors": authors or [],
             "published": published, "tabular_files": tabular,
+            "image_files": images,
             "all_files": all_files, "all_files_count": len(all_files),
             "related_dois": related or [], "match_signals": None}
 
