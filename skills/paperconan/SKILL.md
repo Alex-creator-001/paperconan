@@ -1,12 +1,16 @@
 ---
 name: paperconan
 version: 0.8.2
-description: Use when auditing paper source-data tables for numerical integrity signals, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, fabrication red flags, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv and tables in .pdf/.docx; not image forensics or chart digitization.
+description: Use when auditing paper source-data tables and registered image assets for statistical signals or data inconsistencies, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, figure review, multimodal image review, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv, tables in .pdf/.docx, and adaptive image review by an external multimodal Agent; not chart digitization or autonomous semantic judgment.
 ---
 
 # paperconan
 
-paperconan scans paper source-data tables for numerical anomaly signals. Treat every hit as **signal, not verdict**: report locations and patterns, never intent or misconduct.
+paperconan scans paper source-data tables and can register local image assets
+for external Agent review. Treat every hit as **signal, not verdict**: report
+locations and patterns, never intent or personal accusation. PaperConan does
+not manage model keys or provider SDKs and does not perform autonomous semantic
+judgment.
 
 Tool repository: https://github.com/zixixr/paperconan
 
@@ -21,6 +25,40 @@ Tool repository: https://github.com/zixixr/paperconan
 3. Parse `scan.json`, then load the reference file needed for the task.
 4. Open the original table when describing a serious finding as worth follow-up. If the original data is unavailable, say the finding is unverified.
 5. Answer cautiously: explain the anomaly, plausible benign explanations, and what human context is needed.
+
+## Adaptive Image Review
+
+Use this workflow when the user requests image review or the source directory
+contains figures that should be reviewed with the numeric material:
+
+1. Run `paperconan <input-dir> --images`; add `--image-diagnostics` only when
+   deterministic hints are useful.
+2. Read every entry in `image_assets`; deterministic `image_findings` are hints
+   and never the complete review set. An empty `image_findings` list does not
+   mean that every image question was resolved.
+3. Confirm the current Agent can open local images.
+   - If yes, inspect the whole image first, then use a native-pixel crop for
+     small panels or unresolved detail.
+   - If no, set `image_review.status` to
+     `unavailable_no_multimodal`, continue numeric review, and state that image
+     semantic review was not completed.
+4. For every asset, record exactly one coverage outcome in
+   `reviewed_asset_ids`, `unresolved_asset_ids`, `unreadable_asset_ids`, or
+   `deferred_asset_ids`. `image_review.status: "completed"` means coverage
+   accounting is complete; it does not mean every image question was explained.
+5. Check figure labels, channels, processing steps, shared controls, insets,
+   before/after layouts, figure legends, and Methods before escalating an image
+   similarity signal.
+6. The Agent may create an image finding using `image_refs` even when
+   `image_findings` is empty. Such Agent-only image findings belong in the
+   verdict, not in deterministic `scan.json`.
+7. Put numeric and image findings in the same `verdict.json findings[]`, then
+   generate a single unified report with `paperconan report`.
+
+PaperConan supplies registered local assets, bounded report previews, and
+optional deterministic hints. The external multimodal Agent is responsible for
+capability detection, semantic review, coverage accounting, and cautious
+contextual interpretation.
 
 ## Review Modes
 
@@ -71,6 +109,7 @@ tell them the findings still need human/agent triage before they mean anything.
 
 ```bash
 pip install paperconan
+pip install "paperconan[image]" # image assets, PDF page rendering, optional hints
 pip install "paperconan[all]"   # includes PDF / Word table extraction
 paperconan --version
 paperconan <input-dir>
@@ -90,6 +129,8 @@ paperconan <input-dir> --out /tmp/audit-X
 paperconan <input-dir> --md
 paperconan <input-dir> --no-html
 paperconan <input-dir> --profile forensic
+paperconan <input-dir> --images
+paperconan <input-dir> --images --image-diagnostics
 paperconan report /tmp/audit-X/scan.json --verdict verdict.json --out adjudication.html
 ```
 
@@ -103,7 +144,9 @@ Use fetch only when the user gives a DOI/title instead of local files:
 paperconan fetch "<DOI or title>"
 paperconan fetch "<DOI or title>" --json
 paperconan fetch "<DOI>" --download <id> --out data/
+paperconan fetch "<DOI or title>" --auto --images --out data/
 paperconan data/
+paperconan data/ --images
 ```
 
 Prefer candidates with `doi_in_related: true`. Repository search can return unrelated deposits, so report weak matches honestly and do not imply "no data found" means "paper is clean". Do not bypass paywalls or scrape publisher sites.
@@ -165,6 +208,13 @@ array (each entry adjudicated on its own tier/status with its own
 `finding_ref`); the report then renders one self-contained block per finding.
 See [references/adjudication-tiers.md](references/adjudication-tiers.md) and
 [references/report-templates.md](references/report-templates.md).
+
+For adaptive image review, `scan.json image_assets[]` is the complete registered
+asset inventory while `image_findings[]` contains only optional deterministic
+hints. Add Agent conclusions as `finding_type: "image"` entries with
+`image_refs`, and add top-level `image_review` coverage. Numeric and image
+entries stay in the same `findings[]`; do not create a separate image verdict
+or a second user-facing report.
 
 When a verdict JSON already exists, `paperconan report <scan.json> --verdict
 <verdict.json> --out <html>` renders a separate adjudicated report. Do not
