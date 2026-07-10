@@ -2802,6 +2802,17 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         from .image._assets import prepare_image_assets
         image_assets, image_errors = prepare_image_assets(in_dir, out_dir)
         scan_errors.extend(image_errors)
+        if image_diagnostics:
+            try:
+                from .image._diagnostics import diagnose_image_assets
+                image_findings, diagnostic_errors = diagnose_image_assets(
+                    image_assets, out_dir
+                )
+                scan_errors.extend(diagnostic_errors)
+            except Exception as exc:
+                scan_errors.append({
+                    "error": f"optional image diagnostics unavailable: {exc}",
+                })
 
     out = dict(tool="paperconan",
                tool_version=_version(),
