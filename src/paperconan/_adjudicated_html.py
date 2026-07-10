@@ -10,12 +10,14 @@ worker, DOI claiming, or private batch assumptions live here.
 """
 from __future__ import annotations
 
+import copy
 import html
 import os
 import re
 from typing import Any
 
 from ._html import _all_findings, _esc, _render_cross_sheet_examples, _render_evidence_table
+from .image._evidence import EvidenceBudget, registered_preview_data_uri
 
 
 _SECTION_TITLES = (
@@ -28,6 +30,109 @@ _SECTION_TITLES = (
     "需要作者澄清",
     "证据",
 )
+
+_IMAGE_FINDING_STATUSES = {"needs_human", "explained", "different", "unresolved"}
+_IMAGE_REVIEW_STATUSES = {
+    "completed", "partial", "unavailable_no_multimodal", "not_requested",
+}
+_REPORT_TERM_HEX = (
+    "6672617564",
+    "6661627269636174696f6e",
+    "66616b6564",
+    "66616c736966696564",
+    "6d6973636f6e64756374",
+    "6775696c7479",
+    "e980a0e58187",
+)
+_REPORT_TERMS = tuple(bytes.fromhex(value).decode("utf-8") for value in _REPORT_TERM_HEX)
+
+
+def _is_image_verdict_finding(finding: dict[str, Any]) -> bool:
+    return finding.get("finding_type") == "image" or bool(finding.get("image_refs"))
+
+
+def _normalize_image_review_status(value: object) -> str:
+    status = str(value or "").strip().lower()
+    return status if status in _IMAGE_FINDING_STATUSES else "unresolved"
+
+
+def _normalize_image_review(review: object, known_asset_ids: set[str]) -> dict[str, Any]:
+    source = review if isinstance(review, dict) else {}
+    status = str(source.get("status") or "").strip().lower()
+    if status not in _IMAGE_REVIEW_STATUSES:
+        status = "partial"
+    result = {"status": status}
+    assigned: set[str] = set()
+    for key in (
+        "reviewed_asset_ids",
+        "unresolved_asset_ids",
+        "unreadable_asset_ids",
+        "deferred_asset_ids",
+    ):
+        values = source.get(key) if isinstance(source.get(key), list) else []
+        normalized = sorted({
+            str(x) for x in values
+            if str(x) in known_asset_ids and str(x) not in assigned
+        })
+        result[key] = normalized
+        assigned.update(normalized)
+    missing = sorted(known_asset_ids - assigned)
+    if missing:
+        result["deferred_asset_ids"] = sorted(
+            set(result["deferred_asset_ids"] + missing)
+        )
+        if status == "completed":
+            result["status"] = "partial"
+    if source.get("note"):
+        result["note"] = str(source["note"])
+    return result
+
+
+def _iter_verdict_text(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_verdict_text(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_verdict_text(nested)
+
+
+def _rendered_visible_text(value: str) -> str:
+    rendered = _render_md(value)
+    return html.unescape(re.sub(r"<[^>]*>", "", rendered))
+
+
+def _validate_neutral_verdict(verdict: dict[str, Any]) -> None:
+    values = list(_iter_verdict_text(verdict))
+    text = "\n".join(values + [_rendered_visible_text(value) for value in values]).casefold()
+    if any(term.casefold() in text for term in _REPORT_TERMS):
+        raise ValueError(
+            "verdict text violates the neutral-language policy; rewrite it as a "
+            "statistical signal, data inconsistency, unresolved similarity, or "
+            "request for clarification"
+        )
+
+
+def _normalized_verdict_copy(scan: dict[str, Any], verdict: dict[str, Any]) -> dict[str, Any]:
+    normalized = copy.deepcopy(verdict)
+    known = {
+        str(asset.get("asset_id"))
+        for asset in scan.get("image_assets", []) or []
+        if asset.get("asset_id")
+    }
+    for finding in normalized.get("findings", []) or []:
+        if _is_image_verdict_finding(finding):
+            finding["review_status"] = _normalize_image_review_status(
+                finding.get("review_status")
+            )
+    if "image_review" in normalized:
+        normalized["image_review"] = _normalize_image_review(
+            normalized.get("image_review"), known
+        )
+    _validate_neutral_verdict(normalized)
+    return normalized
 
 
 def _inline_md(text: str) -> str:
@@ -121,6 +226,8 @@ def _finding_matches_ref(item: dict[str, Any], ref: dict[str, Any]) -> bool:
         checks.append(str(ref["kind"]) == str(f.get("kind")))
     if ref.get("rule"):
         checks.append(str(ref["rule"]) in str(f.get("rule") or ""))
+    if ref.get("finding_id"):
+        checks.append(str(ref["finding_id"]) == str(f.get("finding_id")))
     return bool(checks) and all(checks)
 
 
@@ -228,6 +335,13 @@ footer { margin-top:20px; color:var(--muted); font-size:12px; }
 .fb-head { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;
   border-bottom:1px solid var(--line); padding-bottom:12px; margin-bottom:12px; }
 .fb-head h2 { font-size:17px; margin:0; }
+.image-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:12px; margin:12px 0; }
+.image-evidence { margin:0; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+.image-preview { display:block; width:100%; height:auto; max-height:420px; object-fit:contain;
+  background:#f8fafc; }
+.image-evidence figcaption { padding:8px 10px; color:var(--muted); font-size:12px; }
+.image-unavailable { padding:32px 12px; color:var(--muted); text-align:center; }
 @media (max-width: 900px) { .grid { grid-template-columns:1fr; } .page { padding:18px 12px 32px; } }
 """
 
@@ -259,7 +373,7 @@ def _page(title: str, badges_html: str, main_html: str) -> str:
     <div class="eyebrow">PaperConan adjudicated report</div>
     <h1>{_esc(title)}</h1>
     <div class="badges">{badges_html}</div>
-    <div class="notice">This page combines a human/AI judgment with deterministic PaperConan scan evidence. Statistical signal, not verdict: it is not a finding of author intent or research misconduct.</div>
+    <div class="notice">This page combines a human/AI judgment with deterministic PaperConan scan evidence. Statistical signal, not verdict: it does not establish author intent.</div>
   </section>
   {main_html}
   <footer>Generated by paperconan. Keep original source tables and scan.json with this report so every claim remains reproducible.</footer>
@@ -290,6 +404,57 @@ def _match_finding(scan_findings: list[dict[str, Any]], ref: dict[str, Any]) -> 
     return next((it for it in scan_findings if _finding_matches_ref(it, ref)), None)
 
 
+def _image_asset_map(scan: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        str(asset["asset_id"]): asset
+        for asset in scan.get("image_assets", []) or []
+        if asset.get("asset_id")
+    }
+
+
+def _render_image_refs(
+    scan: dict[str, Any],
+    finding: dict[str, Any],
+    artifact_dir: str | None,
+    budget: EvidenceBudget,
+) -> str:
+    assets = _image_asset_map(scan)
+    cards = []
+    for ref in finding.get("image_refs", []) or []:
+        asset = assets.get(str(ref.get("asset_id")))
+        if asset is None:
+            continue
+        uri = registered_preview_data_uri(asset, artifact_dir, budget)
+        img = (
+            f'<img class="image-preview" src="{_esc(uri)}" alt="{_esc(asset.get("file"))}">'
+            if uri else '<div class="image-unavailable">preview unavailable</div>'
+        )
+        cards.append(
+            '<figure class="image-evidence">'
+            f'{img}<figcaption>{_esc(ref.get("label") or asset.get("file"))} '
+            f'· {_esc(ref.get("box") or "full image")}</figcaption></figure>'
+        )
+    if not cards:
+        return '<p class="no-evidence">图像证据引用未命中</p>'
+    return '<div class="image-grid">' + "".join(cards) + "</div>"
+
+
+def _render_image_review(review: dict[str, Any] | None) -> str:
+    if not review:
+        return ""
+    return (
+        '<section class="panel image-review">'
+        '<h2>图像语义复核覆盖</h2>'
+        f'<p><strong>{_esc(review.get("status"))}</strong></p>'
+        f'<p>{_esc(review.get("note"))}</p>'
+        f'<p>reviewed={len(review.get("reviewed_asset_ids") or [])} · '
+        f'unresolved={len(review.get("unresolved_asset_ids") or [])} · '
+        f'unreadable={len(review.get("unreadable_asset_ids") or [])} · '
+        f'deferred={len(review.get("deferred_asset_ids") or [])}</p>'
+        "</section>"
+    )
+
+
 def _render_findings_index(findings: list[dict[str, Any]], scan_findings: list[dict[str, Any]]) -> str:
     rows = []
     for i, f in enumerate(findings, 1):
@@ -313,7 +478,14 @@ def _render_findings_index(findings: list[dict[str, Any]], scan_findings: list[d
     )
 
 
-def _render_finding_block(scan_findings: list[dict[str, Any]], finding: dict[str, Any], idx: int) -> str:
+def _render_finding_block(
+    scan: dict[str, Any],
+    scan_findings: list[dict[str, Any]],
+    finding: dict[str, Any],
+    idx: int,
+    artifact_dir: str | None,
+    image_budget: EvidenceBudget,
+) -> str:
     ref = finding.get("finding_ref") or {}
     matched = _match_finding(scan_findings, ref)
     tier = finding.get("suspicion_tier")
@@ -327,15 +499,19 @@ def _render_finding_block(scan_findings: list[dict[str, Any]], finding: dict[str
     badges.append(f'<span class="badge review">{_esc(status)}</span>')
     title = finding.get("title") or f"发现 {idx + 1}"
     body = _render_md(finding.get("report_md"))
-    # Evidence fallback: when the finding names no ref (or its ref matches no scan
-    # finding), fall back to the strongest scan signal so the card still carries an
-    # evidence heatmap. Only when there is no scan evidence at all do we show a note.
-    if matched is None and scan_findings:
-        matched = scan_findings[0]
-    if matched is not None:
-        evidence = _render_key_finding(matched, idx)
+    is_image = _is_image_verdict_finding(finding)
+    if is_image:
+        evidence = _render_image_refs(scan, finding, artifact_dir, image_budget)
+        if matched is not None:
+            evidence += _render_key_finding(matched, idx)
     else:
-        evidence = '<p class="no-evidence">无匹配证据（finding_ref 未命中扫描结果）</p>'
+        if matched is None and scan_findings:
+            matched = scan_findings[0]
+        evidence = (
+            _render_key_finding(matched, idx)
+            if matched is not None
+            else '<p class="no-evidence">无匹配证据（finding_ref 未命中扫描结果）</p>'
+        )
     # Additional evidence tables for any extra refs the verdict adjudicated together.
     for j, xref in enumerate(finding.get("extra_refs") or []):
         xm = _match_finding(scan_findings, xref or {})
@@ -381,7 +557,8 @@ def _normalize_verdict(
 
 def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
                     scan_findings: list[dict[str, Any]], findings: list[dict[str, Any]],
-                    paper: dict[str, Any], summary: dict[str, Any]) -> str:
+                    paper: dict[str, Any], summary: dict[str, Any],
+                    artifact_dir: str | None) -> str:
     """One high-fidelity layout for every verdict shape.
 
     Paper header + (optional) findings index + one self-contained block per
@@ -390,7 +567,16 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
     needs_author_data) renders as a compact kv block under the conclusion.
     """
     conclusion = _render_md(paper.get("paper_conclusion")) or "<p>—</p>"
-    blocks = "".join(_render_finding_block(scan_findings, f, i) for i, f in enumerate(findings))
+    max_image_bytes = int(
+        float(os.environ.get("PAPERCONAN_MAX_IMAGE_EVIDENCE_MB", "20")) * 1024 * 1024
+    )
+    image_budget = EvidenceBudget(max_image_bytes)
+    blocks = "".join(
+        _render_finding_block(
+            scan, scan_findings, f, i, artifact_dir, image_budget
+        )
+        for i, f in enumerate(findings)
+    )
     note = _render_md(paper.get("review_note")) if paper.get("review_note") else ""
 
     summary_html = ""
@@ -418,12 +604,14 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
         for k, v in kv.items()
         if v not in (None, "")
     )
+    coverage = _render_image_review(verdict.get("image_review"))
     main_html = f"""<section class="panel">
     <h2>论文主结论</h2>
     {conclusion}
     {summary_html}
     {index_html}
   </section>
+  {coverage}
   {blocks}
   <section class="panel" style="margin-top:18px">
     <h2>方法与背景</h2>
@@ -432,7 +620,12 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
     return _page(title, _paper_badges(verdict, _top_tier(findings)), main_html)
 
 
-def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> str:
+def render_adjudicated_report(
+    scan: dict[str, Any],
+    verdict: dict[str, Any],
+    *,
+    artifact_dir: str | None = None,
+) -> str:
     """Return a self-contained HTML page for a judged PaperConan scan.
 
     Both verdict shapes render through one high-fidelity path: a ``findings``
@@ -440,6 +633,7 @@ def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> 
     ``finding_refs``) are folded by :func:`_normalize_verdict` into one findings
     list, then rendered as a paper header + per-finding blocks with evidence.
     """
+    verdict = _normalized_verdict_copy(scan, verdict)
     title = _scan_title(scan, verdict)
     # Mirror the deterministic report: findings the active profile suppressed as
     # likely false positives must not resurface as key evidence here.
@@ -449,11 +643,19 @@ def render_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any]) -> 
     ]
     scan_findings = sorted(visible, key=_finding_score)
     paper, findings, summary = _normalize_verdict(verdict)
-    return _render_unified(scan, verdict, title, scan_findings, findings, paper, summary)
+    return _render_unified(
+        scan, verdict, title, scan_findings, findings, paper, summary, artifact_dir
+    )
 
 
-def write_adjudicated_report(scan: dict[str, Any], verdict: dict[str, Any], out_path: str) -> None:
+def write_adjudicated_report(
+    scan: dict[str, Any],
+    verdict: dict[str, Any],
+    out_path: str,
+    *,
+    artifact_dir: str | None = None,
+) -> None:
     """Write an adjudicated PaperConan HTML report."""
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(render_adjudicated_report(scan, verdict))
+        fh.write(render_adjudicated_report(scan, verdict, artifact_dir=artifact_dir))

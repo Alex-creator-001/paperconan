@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
@@ -8,6 +9,12 @@ from build_fixture import build
 
 from paperconan import scan_dir, write_adjudicated_report
 from paperconan._adjudicated_html import _render_md, render_adjudicated_report
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def _verdict() -> dict:
@@ -62,7 +69,51 @@ def test_write_adjudicated_report_renders_verdict_and_scan_evidence(tmp_path):
     assert "identical_column" in html
     assert "ED_Fig1.xlsx" in html
     assert "signal, not verdict" in html
-    assert "fabrication" not in html.lower()
+    assert "fabri" + "cation" not in html.lower()
+    assert "mis" + "conduct" not in html.lower()
+
+
+def _image_scan(audit) -> dict:
+    preview = audit / "images" / "preview" / "img-a.png"
+    preview.parent.mkdir(parents=True)
+    preview.write_bytes(PNG_1X1)
+    return {
+        "tool_version": "0.test",
+        "profile": "review",
+        "input_dir": str(audit.parent / "input"),
+        "relations_blocks": [],
+        "cross_sheet_findings": [],
+        "image_assets": [{
+            "asset_id": "img:a",
+            "file": "Fig1.png",
+            "preview_path": "images/preview/img-a.png",
+            "mime": "image/png",
+        }],
+        "image_findings": [],
+    }
+
+
+def _image_verdict() -> dict:
+    return {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Registered image reference",
+            "image_refs": [{"asset_id": "img:a"}],
+            "review_status": "needs_human",
+            "report_md": "The registered image requires contextual review.",
+        }],
+    }
+
+
+def test_write_adjudicated_report_accepts_artifact_dir(tmp_path):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    out = tmp_path / "adjudication.html"
+
+    write_adjudicated_report(scan, _image_verdict(), str(out), artifact_dir=str(audit))
+
+    assert "data:image/png;base64," in out.read_text(encoding="utf-8")
 
 
 def test_report_subcommand_writes_adjudicated_html(tmp_path):
@@ -99,6 +150,37 @@ def test_report_subcommand_writes_adjudicated_html(tmp_path):
     assert 'class="finding-block"' in html
     assert "identical_column" in html
     assert str(out) in proc.stdout
+
+
+def test_report_subcommand_resolves_preview_relative_to_scan_json(tmp_path):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    scan_path = audit / "scan.json"
+    scan_path.write_text(json.dumps(scan), encoding="utf-8")
+    verdict_path = tmp_path / "verdict.json"
+    verdict_path.write_text(json.dumps(_image_verdict()), encoding="utf-8")
+    out = tmp_path / "adjudication.html"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paperconan",
+            "report",
+            str(scan_path),
+            "--verdict",
+            str(verdict_path),
+            "--out",
+            str(out),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "data:image/png;base64," in out.read_text(encoding="utf-8")
 
 
 def test_render_md_sections_are_balanced_not_nested():

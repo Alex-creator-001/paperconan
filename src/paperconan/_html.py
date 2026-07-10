@@ -70,6 +70,23 @@ def _all_findings(scan: dict) -> list[dict]:
             "header": [],
             "finding": cf,
         })
+    assets = {
+        str(asset.get("asset_id")): asset
+        for asset in scan.get("image_assets", []) or []
+        if asset.get("asset_id")
+    }
+    for image_finding in scan.get("image_findings", []) or []:
+        asset_ids = [str(x) for x in image_finding.get("asset_ids", []) or []]
+        files = [assets[x].get("file", x) for x in asset_ids if x in assets]
+        out.append({
+            "scope": "image",
+            "file": " / ".join(files) or "registered image asset",
+            "sheet": "image",
+            "block_rows": "native pixels",
+            "block_cols": "native pixels",
+            "header": [],
+            "finding": image_finding,
+        })
     return out
 
 
@@ -162,7 +179,23 @@ def _render_finding_card(item: dict) -> str:
     block_rows = item["block_rows"]
     profile_action = (f.get("profile_action") or "kept").lower()
 
-    if item["scope"] == "cross_sheet":
+    if item["scope"] == "image":
+        regions = f.get("regions") or []
+        chips = "".join(
+            f'<span class="val-chip">{_esc(r.get("asset_id"))} '
+            f'{_esc(r.get("box"))}</span>'
+            for r in regions
+        )
+        evidence_html = (
+            f'<div class="shared-values">{chips}</div>'
+            if chips else '<p class="no-evidence">no registered image region</p>'
+        )
+        loc = _esc(file_)
+        extra_meta = (
+            f' · score={_esc(f.get("score"))}'
+            f' · transform={_esc(f.get("transform"))}'
+        )
+    elif item["scope"] == "cross_sheet":
         evidence_html = _render_cross_sheet_examples(f)
         loc = f"{_esc(file_)} :: {_esc(sheet)}"
         extra_meta = ""

@@ -2911,10 +2911,20 @@ def main():
             scan = json.load(fh)
         with open(rargs.verdict, encoding="utf-8") as fh:
             verdict = json.load(fh)
-        write_adjudicated_report(scan, verdict, rargs.out)
+        write_adjudicated_report(
+            scan,
+            verdict,
+            rargs.out,
+            artifact_dir=os.path.dirname(os.path.abspath(rargs.scan_json)),
+        )
         print(f"wrote {rargs.out}")
         return
-    ap = argparse.ArgumentParser(description="Scan a paper's source data (xlsx/csv/tsv, or tables inside pdf/docx) for fabrication red flags")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Scan a paper's source data (xlsx/csv/tsv, or tables inside "
+            "pdf/docx) for statistical signals and data inconsistencies"
+        )
+    )
     ap.add_argument("in_dir", help="Directory with the paper's source data (*.xlsx/*.csv/*.tsv, or *.pdf/*.docx supplements)")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")
     ap.add_argument("--md", action="store_true",
