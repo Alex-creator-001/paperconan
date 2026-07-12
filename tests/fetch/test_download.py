@@ -683,7 +683,7 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
         sidecar.write_bytes(previous_bytes)
     payload = b"a,b\n1,2\n"
     replacement = b"x,y\n9,8\n"
-    sidecar_published = False
+    sidecar_writes = 0
 
     def fake_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
@@ -699,13 +699,22 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
     real_write_source_sidecar = _download._write_source_sidecar
 
     def publish_sidecar_then_replace_output(cand, output, downloads=None):
-        nonlocal sidecar_published
+        nonlocal sidecar_writes
+        sidecar_writes += 1
+        if sidecar_writes == 2:
+            if existing_sidecar:
+                assert sidecar.read_bytes() == previous_bytes
+            else:
+                assert not sidecar.exists()
         publication = real_write_source_sidecar(
             cand,
             output,
             downloads=downloads,
         )
         published = json.loads(sidecar.read_text(encoding="utf-8"))
+        if sidecar_writes == 2:
+            assert published["downloads"] == []
+            return publication
         assert published["downloads"] == [{
             "file": "data.csv",
             "source_url": "https://example.test/data.csv",
@@ -713,7 +722,6 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
             "asset_type": "tabular",
             "size": len(payload),
         }]
-        sidecar_published = True
         os.unlink("data.csv", dir_fd=output.fd)
         replacement_fd = os.open(
             "data.csv",
@@ -744,14 +752,12 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
 
     summary = _download.download_candidate(candidate, str(out_dir))
 
-    assert sidecar_published
+    assert sidecar_writes == 2
     assert summary["downloaded"] == []
     assert len(summary["skipped"]) == 1
     assert "stable regular file" in summary["skipped"][0]["reason"]
-    if existing_sidecar:
-        assert sidecar.read_bytes() == previous_bytes
-    else:
-        assert not sidecar.exists()
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
+    assert (out_dir / "data.csv").read_bytes() == replacement
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
@@ -769,6 +775,7 @@ def test_sidecar_rollback_uses_immutable_prior_bytes(
     payload = b"a,b\n1,2\n"
     replacement = b"x,y\n9,8\n"
     old_inode_mutated = False
+    sidecar_writes = 0
 
     def fake_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
@@ -784,13 +791,19 @@ def test_sidecar_rollback_uses_immutable_prior_bytes(
     real_write_source_sidecar = _download._write_source_sidecar
 
     def publish_then_mutate_old_inode(cand, output, downloads=None):
-        nonlocal old_inode_mutated
+        nonlocal old_inode_mutated, sidecar_writes
+        sidecar_writes += 1
+        if sidecar_writes == 2:
+            assert sidecar.read_bytes() == previous_bytes
         publication = real_write_source_sidecar(
             cand,
             output,
             downloads=downloads,
         )
         published = json.loads(sidecar.read_text(encoding="utf-8"))
+        if sidecar_writes == 2:
+            assert published["downloads"] == []
+            return publication
         assert published["downloads"][0]["file"] == "data.csv"
         os.lseek(old_writer_fd, 0, os.SEEK_SET)
         os.write(old_writer_fd, mutated_bytes)
@@ -833,10 +846,11 @@ def test_sidecar_rollback_uses_immutable_prior_bytes(
         os.close(old_writer_fd)
 
     assert old_inode_mutated
+    assert sidecar_writes == 2
     assert old_inode_bytes == mutated_bytes
     assert summary["downloaded"] == []
     assert len(summary["skipped"]) == 1
-    assert sidecar.read_bytes() == previous_bytes
+    assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
@@ -1047,6 +1061,226 @@ def test_write_collision_safe_does_not_clobber_file_created_during_publish(
     assert candidate.read_bytes() == b"concurrent"
     assert published == tmp_path / f"Fig1-{digest}.png"
     assert published.read_bytes() == data
+
+
+def test_write_collision_safe_binds_created_identity_before_link(
+    monkeypatch,
+    tmp_path,
+):
+    real_open = _download.os.open
+    real_fstat = _download.os.fstat
+    real_link = _download.os.link
+    real_publication = _download._PublishedOutputFile
+    staging_fd = None
+    staging_identity_bound = False
+    created_record_bound = False
+
+    def track_open(path, flags, *args, **kwargs):
+        nonlocal staging_fd
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path).startswith(".paperconan-publish-"):
+            staging_fd = fd
+        return fd
+
+    def track_fstat(fd):
+        nonlocal staging_identity_bound
+        current = real_fstat(fd)
+        if fd == staging_fd:
+            staging_identity_bound = True
+        return current
+
+    def track_publication(*args, **kwargs):
+        nonlocal created_record_bound
+        entry = real_publication(*args, **kwargs)
+        if entry.created:
+            created_record_bound = True
+        return entry
+
+    def require_bound_identity(*args, **kwargs):
+        assert staging_identity_bound, "publication identity was not bound before link"
+        assert created_record_bound, "created publication record was not bound before link"
+        return real_link(*args, **kwargs)
+
+    monkeypatch.setattr(_download.os, "open", track_open)
+    monkeypatch.setattr(_download.os, "fstat", track_fstat)
+    monkeypatch.setattr(_download, "_PublishedOutputFile", track_publication)
+    monkeypatch.setattr(_download.os, "link", require_bound_identity)
+
+    with _download._pinned_output_directory(str(tmp_path)) as output:
+        entry = _download._write_collision_safe(
+            output,
+            "data.csv",
+            b"a,b\n1,2\n",
+            _return_entry=True,
+        )
+
+    current = (tmp_path / "data.csv").stat()
+    assert entry.identity == (current.st_dev, current.st_ino)
+    assert entry.size == len(b"a,b\n1,2\n")
+    assert not list(tmp_path.glob(".paperconan-publish-*"))
+
+
+def test_write_collision_safe_retains_replacement_inserted_after_link(
+    monkeypatch,
+    tmp_path,
+):
+    original = b"a,b\n1,2\n"
+    replacement = b"x,y\n9,8\n"
+    assert len(original) == len(replacement)
+    real_link = _download.os.link
+    linked = False
+
+    def replace_after_link(src, dst, *args, **kwargs):
+        nonlocal linked
+        result = real_link(src, dst, *args, **kwargs)
+        if Path(dst).name == "data.csv":
+            output_fd = kwargs["dst_dir_fd"]
+            os.unlink(dst, dir_fd=output_fd)
+            replacement_fd = os.open(
+                dst,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=output_fd,
+            )
+            try:
+                os.write(replacement_fd, replacement)
+            finally:
+                os.close(replacement_fd)
+            linked = True
+        return result
+
+    monkeypatch.setattr(_download.os, "link", replace_after_link)
+
+    with _download._pinned_output_directory(str(tmp_path)) as output:
+        with pytest.raises(
+            OSError,
+            match="retained visible output for recovery: data.csv",
+        ):
+            _download._write_collision_safe(
+                output,
+                "data.csv",
+                original,
+                _return_entry=True,
+            )
+
+    assert linked
+    assert (tmp_path / "data.csv").read_bytes() == replacement
+    assert not list(tmp_path.glob(".paperconan-publish-*"))
+
+
+def test_write_collision_safe_retains_visible_path_when_first_post_link_stat_fails(
+    monkeypatch,
+    tmp_path,
+):
+    real_link = _download.os.link
+    real_stat = _download.os.stat
+    linked = False
+    failed = False
+
+    def track_link(*args, **kwargs):
+        nonlocal linked
+        result = real_link(*args, **kwargs)
+        linked = True
+        return result
+
+    def fail_first_visible_stat(path, *args, **kwargs):
+        nonlocal failed
+        if (
+            linked
+            and not failed
+            and Path(path).name == "data.csv"
+            and kwargs.get("dir_fd") is not None
+        ):
+            failed = True
+            raise OSError("post-link stat unavailable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(_download.os, "link", track_link)
+    monkeypatch.setattr(_download.os, "stat", fail_first_visible_stat)
+
+    with _download._pinned_output_directory(str(tmp_path)) as output:
+        with pytest.raises(
+            OSError,
+            match="retained visible output for recovery: data.csv",
+        ):
+            _download._write_collision_safe(
+                output,
+                "data.csv",
+                b"a,b\n1,2\n",
+                _return_entry=True,
+            )
+
+    assert failed
+    assert (tmp_path / "data.csv").read_bytes() == b"a,b\n1,2\n"
+    assert not list(tmp_path.glob(".paperconan-publish-*"))
+
+
+def test_write_collision_safe_retains_replacement_after_last_visible_stat(
+    monkeypatch,
+    tmp_path,
+):
+    replacement = b"x,y\n9,8\n"
+    real_link = _download.os.link
+    real_unlink = _download.os.unlink
+    real_verify = _download._PinnedOutputDirectory.verify
+    linked = False
+    replacement_inserted = False
+    visible_unlink_attempted = False
+
+    def track_link(*args, **kwargs):
+        nonlocal linked
+        result = real_link(*args, **kwargs)
+        linked = True
+        return result
+
+    def fail_after_visible_stat(output):
+        nonlocal replacement_inserted
+        real_verify(output)
+        if linked:
+            real_unlink("data.csv", dir_fd=output.fd)
+            replacement_fd = os.open(
+                "data.csv",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=output.fd,
+            )
+            try:
+                os.write(replacement_fd, replacement)
+            finally:
+                os.close(replacement_fd)
+            replacement_inserted = True
+            raise ValueError("post-link output verification unavailable")
+
+    def reject_visible_unlink(path, *args, **kwargs):
+        nonlocal visible_unlink_attempted
+        if Path(path).name == "data.csv":
+            visible_unlink_attempted = True
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(_download.os, "link", track_link)
+    monkeypatch.setattr(
+        _download._PinnedOutputDirectory,
+        "verify",
+        fail_after_visible_stat,
+    )
+    monkeypatch.setattr(_download.os, "unlink", reject_visible_unlink)
+
+    with _download._pinned_output_directory(str(tmp_path)) as output:
+        with pytest.raises(
+            OSError,
+            match="retained visible output for recovery: data.csv",
+        ):
+            _download._write_collision_safe(
+                output,
+                "data.csv",
+                b"a,b\n1,2\n",
+                _return_entry=True,
+            )
+
+    assert replacement_inserted is True
+    assert visible_unlink_attempted is False
+    assert (tmp_path / "data.csv").read_bytes() == replacement
+    assert not list(tmp_path.glob(".paperconan-publish-*"))
 
 
 def _archive_bytes(kind, member_name="tables/data.csv", data=b"a,b\n1,2\n"):
@@ -1308,8 +1542,64 @@ def test_archive_reconciles_entry_verification_failure_after_publication(
     assert not list(out_dir.glob(".paperconan-publish-*"))
 
 
+@pytest.mark.parametrize("has_entry", [False, True])
+def test_reconciliation_verifies_output_root_when_entry_verification_fails(
+    monkeypatch,
+    tmp_path,
+    has_entry,
+):
+    with _download._pinned_output_directory(str(tmp_path)) as output:
+        entries = []
+        if has_entry:
+            entries.append(_download._PublishedOutputFile(
+                filename="data.csv",
+                size=0,
+                identity=(0, 0),
+                sha256=hashlib.sha256(b"").hexdigest(),
+                created=True,
+            ))
+        entry_calls = 0
+        root_calls = 0
+
+        def fail_entry_verification(_output, _entry):
+            nonlocal entry_calls
+            entry_calls += 1
+            raise _download._UnstableRegularFileError(
+                "entry verification unavailable"
+            )
+
+        def fail_root_verification():
+            nonlocal root_calls
+            root_calls += 1
+            raise ValueError("output root verification unavailable")
+
+        monkeypatch.setattr(
+            _download,
+            "_verify_published_output_file",
+            fail_entry_verification,
+        )
+        monkeypatch.setattr(output, "verify", fail_root_verification)
+
+        reconciled, outcomes, error = _download._reconcile_publications(
+            output,
+            entries,
+            attempts=2,
+        )
+
+    assert reconciled == []
+    assert root_calls == 2
+    assert entry_calls == (2 if has_entry else 0)
+    assert error is not None
+    if has_entry:
+        assert outcomes == [
+            "retained visible output for recovery without reporting it: data.csv"
+        ]
+    else:
+        assert outcomes == []
+
+
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
-def test_archive_removes_new_output_after_output_root_verification_failure(
+def test_archive_retains_new_output_after_output_root_verification_failure(
     monkeypatch,
     tmp_path,
     archive_kind,
@@ -1346,11 +1636,11 @@ def test_archive_removes_new_output_after_output_root_verification_failure(
         "reason": (
             "downloaded archive is not a stable regular file: "
             "fetch output directory changed during publication; "
-            "removed unverified new output: data.csv"
+            "retained visible output for recovery without reporting it: data.csv"
         ),
     }]
     assert list(out_dir.iterdir()) == []
-    assert not (displaced / "data.csv").exists()
+    assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
     assert not list(displaced.glob(".paperconan-archive-*"))
     assert not list(displaced.glob(".paperconan-publish-*"))
 
@@ -1495,12 +1785,178 @@ def test_archive_reconciliation_never_removes_replacement_inode(
         "name": archive["name"],
         "reason": (
             "archive publication unavailable: published output entry is not "
-            "a stable regular file; retained replacement path for recovery: "
-            "data.csv"
+            "a stable regular file; retained visible output for recovery "
+            "without reporting it: data.csv"
         ),
     }]
     assert (out_dir / "data.csv").read_bytes() == replacement
     assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+def _publication_candidate(publication_kind):
+    url = f"https://example.test/{publication_kind}"
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if publication_kind == "direct":
+        candidate["tabular_files"] = [{
+            "name": "data.csv",
+            "download_url": url,
+        }]
+    elif publication_kind == "oa":
+        candidate["oa_package"] = {
+            "name": "oa.archive",
+            "url": url,
+        }
+    else:
+        candidate["supplementary_archive"] = {
+            "name": "supplementary.archive",
+            "url": url,
+        }
+    return candidate, url
+
+
+@pytest.mark.parametrize(
+    "publication_kind",
+    ["direct", "oa", "supplementary"],
+)
+@pytest.mark.parametrize("boundary", ["before", "after"])
+@pytest.mark.parametrize("failure_mode", ["transient", "persistent"])
+def test_final_verification_reconciles_and_coordinates_sidecar(
+    monkeypatch,
+    tmp_path,
+    publication_kind,
+    boundary,
+    failure_mode,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar_path = out_dir / _download.SOURCE_SIDECAR
+    previous_bytes = b'{"cand_id":"previous:1","downloads":[{"file":"old.csv"}]}'
+    sidecar_path.write_bytes(previous_bytes)
+    data = b"a,b\n1,2\n"
+    payload = (
+        data
+        if publication_kind == "direct"
+        else _archive_bytes(publication_kind, data=data)
+    )
+    candidate, source_url = _publication_candidate(publication_kind)
+    _install_archive_payload(monkeypatch, payload)
+    final_phase = False
+    sidecar_writes = 0
+    boundary_attempts = 0
+    sidecar_before_writes = []
+    real_verify = _download._verify_published_output_file
+    real_write_sidecar = _download._write_source_sidecar
+
+    if publication_kind == "direct":
+        real_publish = _download._write_collision_safe
+
+        def publish_then_arm(*args, **kwargs):
+            nonlocal final_phase
+            published = real_publish(*args, **kwargs)
+            final_phase = True
+            return published
+
+        monkeypatch.setattr(
+            _download,
+            "_write_collision_safe",
+            publish_then_arm,
+        )
+    else:
+        helper_name = (
+            "_download_oa_package"
+            if publication_kind == "oa"
+            else "_download_supplementary_archive"
+        )
+        real_helper = getattr(_download, helper_name)
+
+        def helper_then_arm(*args, **kwargs):
+            nonlocal final_phase
+            extracted = real_helper(*args, **kwargs)
+            final_phase = True
+            return extracted
+
+        monkeypatch.setattr(_download, helper_name, helper_then_arm)
+
+    def fail_at_final_boundary(output, entry):
+        nonlocal boundary_attempts
+        at_boundary = (
+            final_phase
+            and (
+                (boundary == "before" and sidecar_writes == 0)
+                or (boundary == "after" and sidecar_writes == 1)
+            )
+        )
+        if at_boundary:
+            boundary_attempts += 1
+            if failure_mode == "persistent" or boundary_attempts == 1:
+                raise _download._UnstableRegularFileError(
+                    "final verification unavailable"
+                )
+        return real_verify(output, entry)
+
+    def track_sidecar_writes(cand, output, downloads=None):
+        nonlocal sidecar_writes
+        sidecar_before_writes.append(sidecar_path.read_bytes())
+        publication = real_write_sidecar(
+            cand,
+            output,
+            downloads=downloads,
+        )
+        sidecar_writes += 1
+        return publication
+
+    monkeypatch.setattr(
+        _download,
+        "_verify_published_output_file",
+        fail_at_final_boundary,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_write_source_sidecar",
+        track_sidecar_writes,
+    )
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    expected_downloads = [] if failure_mode == "persistent" else [{
+        "file": "data.csv",
+        "source_url": source_url,
+        "content_type": None,
+        "asset_type": "tabular",
+        "size": len(data),
+    }]
+    expected_paths = (
+        []
+        if failure_mode == "persistent"
+        else [str(out_dir / "data.csv")]
+    )
+    assert summary["downloaded"] == expected_paths
+    assert sidecar["downloads"] == expected_downloads
+    assert boundary_attempts == 2
+    if boundary == "after" and failure_mode == "persistent":
+        assert sidecar_before_writes == [previous_bytes, previous_bytes]
+    else:
+        assert sidecar_before_writes == [previous_bytes]
+    assert len(summary["skipped"]) == 1
+    reason = summary["skipped"][0]["reason"]
+    assert f"{boundary} provenance publication" in reason
+    if failure_mode == "transient":
+        assert (
+            "recovered stable output after bounded verification retry: data.csv"
+            in reason
+        )
+    else:
+        assert (
+            "retained visible output for recovery without reporting it: data.csv"
+            in reason
+        )
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))
     assert not list(out_dir.glob(".paperconan-publish-*"))
 
 
@@ -1617,6 +2073,311 @@ def test_supplementary_zip_path_never_uses_unbounded_staged_read(
     assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
     assert read_sizes
     assert all(size >= 0 for size in read_sizes)
+
+
+def test_supplementary_zip_uses_snapshot_after_original_staging_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    original = _archive_bytes("supplementary")
+    replacement = _zero_byte_archive_bytes(
+        "supplementary",
+        "replacement",
+        3,
+    )
+    staging = None
+    real_preflight = _download._preflight_zip_entry_count
+
+    def fake_download(url, destination, **kwargs):
+        nonlocal staging
+        staging = destination
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, original)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(original),
+            "source_url": url,
+        }
+
+    def mutate_original_after_preflight(source, *, max_entries):
+        count = real_preflight(source, max_entries=max_entries)
+        os.ftruncate(staging.fd, 0)
+        os.lseek(staging.fd, 0, os.SEEK_SET)
+        os.write(staging.fd, replacement)
+        os.fsync(staging.fd)
+        return count
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_preflight_zip_entry_count",
+        mutate_original_after_preflight,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE",
+        2,
+    )
+    candidate, _ = _archive_candidate("supplementary")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert (out_dir / "data.csv").read_bytes() == b"a,b\n1,2\n"
+    assert not list(out_dir.glob("replacement-*.csv"))
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+
+
+def test_zip_snapshot_is_unlinked_and_read_only_before_preflight(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes("supplementary")
+    snapshot_directories = []
+    real_mkdtemp = _download.tempfile.mkdtemp
+    real_preflight = _download._preflight_zip_entry_count
+
+    def track_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        snapshot_directories.append(Path(path))
+        return path
+
+    def inspect_snapshot(source, *, max_entries):
+        assert snapshot_directories
+        assert all(not path.exists() for path in snapshot_directories)
+        with pytest.raises(OSError):
+            os.write(source.fileno(), b"x")
+        return real_preflight(source, max_entries=max_entries)
+
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download.tempfile, "mkdtemp", track_mkdtemp)
+    monkeypatch.setattr(
+        _download,
+        "_preflight_zip_entry_count",
+        inspect_snapshot,
+    )
+    candidate, _ = _archive_candidate("supplementary")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert snapshot_directories
+    assert all(not path.exists() for path in snapshot_directories)
+
+
+def test_zip_snapshot_copy_uses_positive_bounded_io(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes("supplementary")
+    read_sizes = []
+    write_sizes = []
+    real_open_download_staging = _download._open_download_staging
+    real_write = _download.os.write
+
+    class TrackingReader:
+        def __init__(self, source):
+            self._source = source
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self._source.read(size)
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+    @contextmanager
+    def track_staging_reads(staging):
+        with real_open_download_staging(staging) as source:
+            yield TrackingReader(source)
+
+    def fake_download(url, destination, **kwargs):
+        with os.fdopen(os.dup(destination.fd), "wb") as target:
+            target.write(payload)
+            target.flush()
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    def track_writes(fd, data):
+        write_sizes.append(len(data))
+        return real_write(fd, data)
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_open_download_staging",
+        track_staging_reads,
+    )
+    monkeypatch.setattr(_download.os, "write", track_writes)
+    candidate, _ = _archive_candidate("supplementary")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert read_sizes
+    assert write_sizes
+    assert all(
+        0 < size <= _download._FILE_COPY_CHUNK_BYTES
+        for size in read_sizes
+    )
+    assert all(
+        0 < size <= _download._FILE_COPY_CHUNK_BYTES
+        for size in write_sizes
+    )
+
+
+def test_zip_snapshot_setup_error_does_not_expose_private_path(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes("supplementary")
+    snapshot_directories = []
+    real_mkdtemp = _download.tempfile.mkdtemp
+    real_open = _download.os.open
+
+    def track_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        snapshot_directories.append(Path(path))
+        return path
+
+    def fail_snapshot_reopen(path, flags, *args, **kwargs):
+        if (
+            snapshot_directories
+            and Path(path).parent == snapshot_directories[-1]
+            and flags & os.O_ACCMODE == os.O_RDONLY
+        ):
+            raise OSError(13, "snapshot reopen denied", os.fspath(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download.tempfile, "mkdtemp", track_mkdtemp)
+    monkeypatch.setattr(_download.os, "open", fail_snapshot_reopen)
+    candidate, _ = _archive_candidate("supplementary")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    reasons = [item["reason"] for item in summary["skipped"]]
+    assert summary["downloaded"] == []
+    assert any("private ZIP snapshot unavailable" in reason for reason in reasons)
+    assert snapshot_directories
+    assert all(
+        os.fspath(directory) not in reason
+        for directory in snapshot_directories
+        for reason in reasons
+    )
+    assert all("archive.zip" not in reason for reason in reasons)
+    assert all(not path.exists() for path in snapshot_directories)
+    assert not list(out_dir.glob("*.csv"))
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+@pytest.mark.parametrize(
+    "failure_step",
+    ["write", "reopen", "unlink", "rmdir"],
+)
+def test_zip_snapshot_setup_failure_cleans_private_resources(
+    monkeypatch,
+    tmp_path,
+    failure_step,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes("supplementary")
+    snapshot_directories = []
+    real_mkdtemp = _download.tempfile.mkdtemp
+    real_open = _download.os.open
+    real_write = _download.os.write
+    real_unlink = _download.os.unlink
+    real_rmdir = _download.os.rmdir
+    snapshot_writer_fd = None
+    failed = False
+
+    def track_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        snapshot_directories.append(Path(path))
+        return path
+
+    def fail_snapshot_open(path, flags, *args, **kwargs):
+        nonlocal snapshot_writer_fd, failed
+        if snapshot_directories and Path(path).parent == snapshot_directories[-1]:
+            if (
+                failure_step == "reopen"
+                and not failed
+                and flags & os.O_ACCMODE == os.O_RDONLY
+            ):
+                failed = True
+                raise OSError("snapshot read-only reopen unavailable")
+        fd = real_open(path, flags, *args, **kwargs)
+        if (
+            snapshot_directories
+            and Path(path).parent == snapshot_directories[-1]
+            and flags & os.O_ACCMODE == os.O_WRONLY
+        ):
+            snapshot_writer_fd = fd
+        return fd
+
+    def fail_snapshot_write(fd, data):
+        nonlocal failed
+        if failure_step == "write" and not failed and fd == snapshot_writer_fd:
+            failed = True
+            raise OSError("snapshot write unavailable")
+        return real_write(fd, data)
+
+    def fail_snapshot_unlink(path, *args, **kwargs):
+        nonlocal failed
+        if (
+            failure_step == "unlink"
+            and not failed
+            and snapshot_directories
+            and Path(path).parent == snapshot_directories[-1]
+        ):
+            failed = True
+            raise OSError("snapshot unlink unavailable")
+        return real_unlink(path, *args, **kwargs)
+
+    def fail_snapshot_rmdir(path, *args, **kwargs):
+        nonlocal failed
+        if (
+            failure_step == "rmdir"
+            and not failed
+            and snapshot_directories
+            and Path(path) == snapshot_directories[-1]
+        ):
+            failed = True
+            raise OSError("snapshot directory removal unavailable")
+        return real_rmdir(path, *args, **kwargs)
+
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download.tempfile, "mkdtemp", track_mkdtemp)
+    monkeypatch.setattr(_download.os, "open", fail_snapshot_open)
+    monkeypatch.setattr(_download.os, "write", fail_snapshot_write)
+    monkeypatch.setattr(_download.os, "unlink", fail_snapshot_unlink)
+    monkeypatch.setattr(_download.os, "rmdir", fail_snapshot_rmdir)
+    candidate, _ = _archive_candidate("supplementary")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert failed is True
+    assert summary["downloaded"] == []
+    assert any(
+        "private ZIP snapshot unavailable" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert snapshot_directories
+    assert all(not path.exists() for path in snapshot_directories)
+    assert not list(out_dir.glob("*.csv"))
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
 
 
 def test_zip_preflight_accepts_archive_comment():
@@ -2476,7 +3237,7 @@ def test_archive_result_rejects_post_extraction_output_root_replacement(
     assert len(summary["skipped"]) == 1
     assert "output directory changed" in summary["skipped"][0]["reason"]
     assert (out_dir / "data.csv").read_bytes() == b"replacement,root\n"
-    assert not (displaced / "data.csv").exists()
+    assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])

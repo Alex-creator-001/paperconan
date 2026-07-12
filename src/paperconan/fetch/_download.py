@@ -62,6 +62,10 @@ class _SourceSidecarLimitError(ValueError):
     pass
 
 
+class _PublicationRecoveryError(OSError):
+    pass
+
+
 @dataclass(frozen=True)
 class _PublishedOutputFile:
     filename: str
@@ -279,6 +283,111 @@ def _open_download_staging(staging: _DownloadStagingFile):
 
 
 @contextmanager
+def _private_zip_snapshot(source, *, max_bytes: int):
+    directory = None
+    snapshot_path = None
+    writer_fd = -1
+    reader_fd = -1
+    snapshot = None
+    try:
+        try:
+            directory = tempfile.mkdtemp(prefix="paperconan-zip-snapshot-")
+            os.chmod(directory, 0o700)
+            directory_state = os.stat(directory, follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(directory_state.st_mode)
+                or stat.S_IMODE(directory_state.st_mode) != 0o700
+            ):
+                raise _UnstableRegularFileError(
+                    "private ZIP snapshot directory is unavailable"
+                )
+            snapshot_path = os.path.join(directory, "archive.zip")
+            writer_fd = os.open(
+                snapshot_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            source.seek(0, os.SEEK_SET)
+            total = 0
+            while True:
+                chunk = source.read(_FILE_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(
+                        f"private ZIP snapshot exceeds archive limit ({max_bytes})"
+                    )
+                pending = memoryview(chunk)
+                while pending:
+                    written = os.write(writer_fd, pending)
+                    if written <= 0:
+                        raise OSError("private ZIP snapshot write failed")
+                    pending = pending[written:]
+            os.fsync(writer_fd)
+            written_state = os.fstat(writer_fd)
+            if (
+                not stat.S_ISREG(written_state.st_mode)
+                or written_state.st_size != total
+            ):
+                raise _UnstableRegularFileError(
+                    "private ZIP snapshot is not a stable regular file"
+                )
+            os.close(writer_fd)
+            writer_fd = -1
+            reader_fd = os.open(
+                snapshot_path,
+                os.O_RDONLY | os.O_NOFOLLOW,
+            )
+            reader_state = os.fstat(reader_fd)
+            if (
+                not stat.S_ISREG(reader_state.st_mode)
+                or reader_state.st_size != written_state.st_size
+                or (reader_state.st_dev, reader_state.st_ino)
+                != (written_state.st_dev, written_state.st_ino)
+            ):
+                raise _UnstableRegularFileError(
+                    "private ZIP snapshot changed before read-only reopen"
+                )
+            os.unlink(snapshot_path)
+            snapshot_path = None
+            os.rmdir(directory)
+            directory = None
+            snapshot = os.fdopen(reader_fd, "rb")
+            reader_fd = -1
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, _UnstableRegularFileError):
+                raise
+            detail = str(exc)
+            for private_path in (snapshot_path, directory):
+                if private_path is not None:
+                    detail = detail.replace(
+                        os.fspath(private_path),
+                        "<private ZIP snapshot>",
+                    )
+            raise _UnstableRegularFileError(
+                f"private ZIP snapshot unavailable: {detail}"
+            ) from exc
+        with snapshot:
+            yield snapshot
+    finally:
+        if writer_fd >= 0:
+            os.close(writer_fd)
+        if reader_fd >= 0:
+            os.close(reader_fd)
+        if snapshot_path is not None:
+            try:
+                os.unlink(snapshot_path)
+            except FileNotFoundError:
+                pass
+        if directory is not None:
+            try:
+                os.rmdir(directory)
+            except FileNotFoundError:
+                pass
+
+
+@contextmanager
 def _open_stable_regular(path: str):
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
@@ -303,75 +412,6 @@ def _open_stable_regular(path: str):
         with os.fdopen(fd, "rb") as fh:
             fd = -1
             yield fh
-    finally:
-        if fd >= 0:
-            os.close(fd)
-
-
-def _remove_new_publication_if_same(
-    output: _PinnedOutputDirectory,
-    entry: _PublishedOutputFile,
-) -> str:
-    if not entry.created:
-        return "reused"
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        return "unavailable"
-    fd = -1
-    try:
-        try:
-            fd = os.open(
-                entry.filename,
-                os.O_RDONLY | nofollow,
-                dir_fd=output.fd,
-            )
-        except FileNotFoundError:
-            return "absent"
-        except (OSError, TypeError, NotImplementedError):
-            return "unavailable"
-        try:
-            opened = os.fstat(fd)
-        except OSError:
-            return "unavailable"
-        try:
-            current = os.stat(
-                entry.filename,
-                dir_fd=output.fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return "absent"
-        except (OSError, TypeError, NotImplementedError):
-            return "unavailable"
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not stat.S_ISREG(current.st_mode)
-            or (opened.st_dev, opened.st_ino) != entry.identity
-            or (current.st_dev, current.st_ino) != entry.identity
-        ):
-            return "replaced"
-        try:
-            final = os.stat(
-                entry.filename,
-                dir_fd=output.fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            return "absent"
-        except (OSError, TypeError, NotImplementedError):
-            return "unavailable"
-        if (
-            not stat.S_ISREG(final.st_mode)
-            or (final.st_dev, final.st_ino) != entry.identity
-        ):
-            return "replaced"
-        try:
-            os.unlink(entry.filename, dir_fd=output.fd)
-        except FileNotFoundError:
-            return "absent"
-        except (OSError, TypeError, NotImplementedError):
-            return "unavailable"
-        return "removed"
     finally:
         if fd >= 0:
             os.close(fd)
@@ -580,14 +620,15 @@ def _write_collision_safe(
 
     def publication(
         filename: str,
-        current: os.stat_result,
         *,
+        size: int,
+        identity: tuple[int, int],
         created: bool,
     ) -> _PublishedOutputFile:
         return _PublishedOutputFile(
             filename=filename,
-            size=current.st_size,
-            identity=(current.st_dev, current.st_ino),
+            size=size,
+            identity=identity,
             sha256=content_sha256,
             created=created,
         )
@@ -603,13 +644,14 @@ def _write_collision_safe(
     digest = content_sha256[:10]
     temp_name = None
     temp_fd = -1
+    private_entry = None
     try:
         for _ in range(128):
             temp_name = f".paperconan-publish-{secrets.token_hex(8)}"
             try:
                 temp_fd = os.open(
                     temp_name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                     0o600,
                     dir_fd=out_dir.fd,
                 )
@@ -618,9 +660,19 @@ def _write_collision_safe(
                 continue
         else:
             raise FileExistsError("could not allocate fetch publication staging file")
-        with os.fdopen(temp_fd, "wb") as fh:
-            temp_fd = -1
+        with os.fdopen(os.dup(temp_fd), "wb") as fh:
             fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        private = os.fstat(temp_fd)
+        if (
+            not stat.S_ISREG(private.st_mode)
+            or private.st_size != len(data)
+            or _hash_exact_fd(temp_fd, private.st_size) != content_sha256
+        ):
+            raise _UnstableRegularFileError(
+                "publication staging is not a stable regular file"
+            )
         collision_index = 0
         while True:
             if collision_index == 0:
@@ -629,6 +681,12 @@ def _write_collision_safe(
                 filename = f"{stem}-{digest}{suffix}"
             else:
                 filename = f"{stem}-{digest}-{collision_index}{suffix}"
+            private_entry = publication(
+                filename,
+                size=private.st_size,
+                identity=(private.st_dev, private.st_ino),
+                created=True,
+            )
             try:
                 os.link(
                     temp_name,
@@ -642,11 +700,23 @@ def _write_collision_safe(
                 if matched is not None:
                     out_dir.verify()
                     return result(
-                        publication(filename, matched, created=False)
+                        publication(
+                            filename,
+                            size=matched.st_size,
+                            identity=(matched.st_dev, matched.st_ino),
+                            created=False,
+                        )
                     )
                 collision_index += 1
                 continue
+            visible_fd = -1
             try:
+                visible_fd = os.open(
+                    filename,
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=out_dir.fd,
+                )
+                opened = os.fstat(visible_fd)
                 current = os.stat(
                     filename,
                     dir_fd=out_dir.fd,
@@ -654,17 +724,26 @@ def _write_collision_safe(
                 )
                 if (
                     not stat.S_ISREG(current.st_mode)
-                    or current.st_size != len(data)
+                    or not stat.S_ISREG(opened.st_mode)
+                    or current.st_size != private_entry.size
+                    or opened.st_size != private_entry.size
+                    or (current.st_dev, current.st_ino)
+                    != private_entry.identity
+                    or (opened.st_dev, opened.st_ino)
+                    != private_entry.identity
                 ):
                     raise _UnstableRegularFileError(
                         "published output entry is not a stable regular file"
                     )
                 out_dir.verify()
-            except Exception:
-                entry = publication(filename, current, created=True)
-                _remove_new_publication_if_same(out_dir, entry)
-                raise
-            return result(publication(filename, current, created=True))
+            except Exception as exc:
+                raise _PublicationRecoveryError(
+                    f"{exc}; retained visible output for recovery: {filename}"
+                ) from exc
+            finally:
+                if visible_fd >= 0:
+                    os.close(visible_fd)
+            return result(private_entry)
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
@@ -1198,48 +1277,85 @@ def _verify_published_output_file(
         os.close(fd)
 
 
-def _reconcile_archive_publications(
+def _reconcile_publications(
     output: _PinnedOutputDirectory,
-    accepted: list[_PublishedOutputFile],
-    pending: list[_PublishedOutputFile],
+    entries: list[_PublishedOutputFile],
+    *,
+    attempts: int,
+    report_verified: bool = False,
 ) -> tuple[list[_PublishedOutputFile], list[str], BaseException | None]:
     reconciled = []
     outcomes = []
     first_error = None
     seen = set()
-    for entry in [*accepted, *pending]:
+    attempt_count = max(1, attempts)
+    if not entries:
+        for _ in range(attempt_count):
+            try:
+                output.verify()
+            except (OSError, ValueError) as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            break
+        return reconciled, outcomes, first_error
+    for entry in entries:
         key = (entry.filename, entry.identity)
         if key in seen:
             continue
         seen.add(key)
-        try:
-            _verify_published_output_file(output, entry)
-            output.verify()
-        except (OSError, ValueError) as exc:
-            if first_error is None:
-                first_error = exc
+        entry_error = None
+        for _ in range(attempt_count):
+            attempt_error = None
+            try:
+                _verify_published_output_file(output, entry)
+            except (OSError, ValueError) as exc:
+                attempt_error = exc
+            try:
+                output.verify()
+            except (OSError, ValueError) as exc:
+                if attempt_error is None:
+                    attempt_error = exc
+            if attempt_error is not None:
+                entry_error = attempt_error
+                if first_error is None:
+                    first_error = attempt_error
+                continue
+            reconciled.append(entry)
+            if entry_error is not None:
+                outcomes.append(
+                    "recovered stable output after bounded verification retry: "
+                    f"{entry.filename}"
+                )
+            elif report_verified:
+                outcomes.append(f"retained verified output: {entry.filename}")
+            break
+        else:
             if not entry.created:
                 outcomes.append(
                     "retained collision-reused output without reporting it: "
                     f"{entry.filename}"
                 )
-                continue
-            removal = _remove_new_publication_if_same(output, entry)
-            if removal in {"removed", "absent"}:
-                outcomes.append(
-                    f"removed unverified new output: {entry.filename}"
-                )
-            elif removal == "replaced":
-                outcomes.append(
-                    f"retained replacement path for recovery: {entry.filename}"
-                )
             else:
                 outcomes.append(
-                    f"retained new output for recovery: {entry.filename}"
+                    "retained visible output for recovery without reporting it: "
+                    f"{entry.filename}"
                 )
             continue
-        reconciled.append(entry)
-        outcomes.append(f"retained verified output: {entry.filename}")
+    return reconciled, outcomes, first_error
+
+
+def _reconcile_archive_publications(
+    output: _PinnedOutputDirectory,
+    accepted: list[_PublishedOutputFile],
+    pending: list[_PublishedOutputFile],
+) -> tuple[list[_PublishedOutputFile], list[str], BaseException | None]:
+    reconciled, outcomes, first_error = _reconcile_publications(
+        output,
+        [*accepted, *pending],
+        attempts=2,
+        report_verified=True,
+    )
     accepted[:] = reconciled
     pending.clear()
     return reconciled, outcomes, first_error
@@ -1371,17 +1487,21 @@ def _download_supplementary_archive(
             try:
                 with _open_download_staging(tmp_zip) as archive_fh:
                     try:
-                        _extract_selected_zip(
+                        with _private_zip_snapshot(
                             archive_fh,
-                            out_dir,
-                            include_images=include_images,
-                            max_member_bytes=max_bytes,
-                            return_entries=True,
-                            cardinality=cardinality,
-                            limit_reasons=limit_reasons,
-                            published_entries=extracted,
-                            pending_entries=pending,
-                        )
+                            max_bytes=archive_max,
+                        ) as snapshot:
+                            _extract_selected_zip(
+                                snapshot,
+                                out_dir,
+                                include_images=include_images,
+                                max_member_bytes=max_bytes,
+                                return_entries=True,
+                                cardinality=cardinality,
+                                limit_reasons=limit_reasons,
+                                published_entries=extracted,
+                                pending_entries=pending,
+                            )
                     except (zipfile.BadZipFile, OSError, ValueError) as exc:
                         processing_error = exc
             except _UnstableRegularFileError as exc:
@@ -1897,42 +2017,139 @@ def download_candidate(
         by_file = {}
         for entry in provenance_files:
             by_file.setdefault(entry["file"], entry)
+        published_outputs = list({
+            (entry.filename, entry.identity): entry
+            for entry in published_outputs
+        }.values())
         sidecar_publication = None
-        try:
-            for entry in published_outputs:
-                _verify_published_output_file(output, entry)
-            output.verify()
+
+        def record_boundary_reconciliation(
+            boundary: str,
+            error: BaseException | None,
+            outcomes: list[str],
+        ) -> None:
+            if error is None:
+                return
+            error_text = str(error)
+            if any(
+                error_text in str(item.get("reason") or "")
+                for item in skipped
+            ):
+                return
+            reason = (
+                "published output verification required reconciliation "
+                f"{boundary} provenance publication: {error}"
+            )
+            if outcomes:
+                reason += "; " + "; ".join(outcomes)
+            skipped.append({
+                "name": cand.get("cand_id"),
+                "reason": reason,
+            })
+
+        published_outputs, outcomes, boundary_error = _reconcile_publications(
+            output,
+            published_outputs,
+            attempts=2,
+        )
+        record_boundary_reconciliation(
+            "before",
+            boundary_error,
+            outcomes,
+        )
+        transaction_failed = False
+        republish_required = False
+        for publication_round in range(2):
+            downloads = [
+                by_file[entry.filename]
+                for entry in published_outputs
+                if entry.filename in by_file
+            ]
             try:
-                sidecar_publication = _write_source_sidecar(
+                next_sidecar_publication = _write_source_sidecar(
                     cand,
                     output,
-                    downloads=list(by_file.values()),
+                    downloads=downloads,
                 )
             except _SourceSidecarLimitError as exc:
                 skipped.append({
                     "name": SOURCE_SIDECAR,
                     "reason": str(exc),
                 })
-            for entry in published_outputs:
-                _verify_published_output_file(output, entry)
-            output.verify()
-        except (OSError, ValueError) as exc:
-            if sidecar_publication is not None:
-                try:
-                    sidecar_publication.rollback()
-                except (OSError, ValueError) as rollback_exc:
-                    exc = _UnstableRegularFileError(
-                        "provenance sidecar rollback unavailable: "
-                        f"{rollback_exc}"
-                    )
-            if not any(
-                str(exc) in str(item.get("reason") or "")
-                for item in skipped
-            ):
+                next_sidecar_publication = None
+            if republish_required and next_sidecar_publication is None:
                 skipped.append({
                     "name": cand.get("cand_id"),
-                    "reason": f"published output verification failed: {exc}",
+                    "reason": (
+                        "provenance republish unavailable after stable output "
+                        "set changed; prior sidecar retained for recovery"
+                    ),
                 })
+                transaction_failed = True
+                break
+            sidecar_publication = next_sidecar_publication
+            reconciled, outcomes, boundary_error = _reconcile_publications(
+                output,
+                published_outputs,
+                attempts=2,
+            )
+            record_boundary_reconciliation(
+                "after",
+                boundary_error,
+                outcomes,
+            )
+            before_keys = [
+                (entry.filename, entry.identity)
+                for entry in published_outputs
+            ]
+            after_keys = [
+                (entry.filename, entry.identity)
+                for entry in reconciled
+            ]
+            published_outputs = reconciled
+            if before_keys == after_keys:
+                break
+            if sidecar_publication is None:
+                skipped.append({
+                    "name": cand.get("cand_id"),
+                    "reason": (
+                        "provenance publication unavailable after stable "
+                        "output set changed"
+                    ),
+                })
+                transaction_failed = True
+                break
+            try:
+                sidecar_publication.rollback()
+            except (OSError, ValueError) as rollback_exc:
+                reason = (
+                    "provenance sidecar rollback unavailable after stable "
+                    f"output set changed: {_safe_failure_context(rollback_exc)}"
+                )
+                if sidecar_publication.backup_name is not None:
+                    reason += (
+                        "; retained recovery backup: "
+                        f"{os.path.basename(sidecar_publication.backup_name)}"
+                    )
+                skipped.append({
+                    "name": cand.get("cand_id"),
+                    "reason": reason,
+                })
+                transaction_failed = True
+                break
+            sidecar_publication = None
+            if publication_round == 1:
+                skipped.append({
+                    "name": cand.get("cand_id"),
+                    "reason": (
+                        "provenance reconciliation did not stabilize after "
+                        "bounded republish"
+                    ),
+                })
+                transaction_failed = True
+                break
+            republish_required = True
+        if transaction_failed:
             downloaded = []
         else:
             try:
@@ -1943,32 +2160,27 @@ def download_candidate(
                     "provenance sidecar commit failed: "
                     f"{_safe_failure_context(exc)}"
                 )
-                if sidecar_publication is not None:
-                    try:
-                        sidecar_publication.rollback()
-                    except (OSError, ValueError) as rollback_exc:
+                try:
+                    sidecar_publication.rollback()
+                except (OSError, ValueError) as rollback_exc:
+                    reason += (
+                        "; provenance sidecar rollback failed: "
+                        f"{_safe_failure_context(rollback_exc)}"
+                    )
+                    if sidecar_publication.backup_name is not None:
                         reason += (
-                            "; provenance sidecar rollback failed: "
-                            f"{_safe_failure_context(rollback_exc)}"
+                            "; retained recovery backup: "
+                            f"{os.path.basename(sidecar_publication.backup_name)}"
                         )
-                        if sidecar_publication.backup_name is not None:
-                            reason += (
-                                "; retained recovery backup: "
-                                f"{os.path.basename(sidecar_publication.backup_name)}"
-                            )
                 skipped.append({
                     "name": cand.get("cand_id"),
                     "reason": reason,
                 })
                 downloaded = []
             else:
-                unique_outputs = list({
-                    entry.filename: entry
-                    for entry in published_outputs
-                }.values())
                 downloaded = [
                     entry.display_path(output)
-                    for entry in unique_outputs
+                    for entry in published_outputs
                 ]
         return {
             "cand_id": cand.get("cand_id"),
