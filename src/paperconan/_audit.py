@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-paper_audit.py — scan a paper's published source data (xlsx) for data-fabrication red flags.
+paper_audit.py — scan a paper's published source data (xlsx) for statistical signals.
 
 Usage:
     python3 paper_audit.py <dir-with-xlsx-files> [--out OUT_DIR]
@@ -9,7 +9,7 @@ Outputs to <OUT_DIR or <dir>/audit>:
   - scan.json   structured findings (every block, every detector)
   - REPORT.md   ranked top-5 + supporting evidence in markdown
 
-What it detects (red flags for fabricated numeric data):
+What it detects (numeric patterns requiring contextual review):
   1. Identical / constant-offset / constant-ratio / exact-linear column relations
   2. Arithmetic-progression columns (constant first difference)
   3. Repeated last-two-decimal endings beyond chance
@@ -1708,7 +1708,7 @@ def _decimal_tail_constant_transform(pairs):
     """True if the matched value pairs share a constant additive offset (vb = va + k) or a constant
     ratio (vb = va * r). That is a benign linear/derived relationship between the two sheets (a shift,
     rescale, or baseline correction that incidentally preserves the fractional tail), NOT the
-    leading-digit fabrication the detector targets (which produces *irregular* per-pair differences)."""
+    irregular leading-digit edit pattern the detector targets."""
     vp = [(va, vb) for _ka, _kb, va, vb, _sig in pairs if va is not None and vb is not None]
     if len(vp) < 3:
         return False
@@ -2033,7 +2033,7 @@ def _shared_cross_sheet_context(ctx_a, ctx_b, pattern, fraction):
 
 def detect_collisions(grids, profile="review", sheets=None):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
-    values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
+    values at the SAME (row, col). Catches copy-then-edit data inconsistencies,
     whether the copy lives in another sheet of the same workbook or in a separate file.
 
     `grids` maps (file, sheet) -> grid (from _grid_from_rows). Returns one dict per
@@ -2604,6 +2604,13 @@ def _cap_block_findings(groups, cap):
     return omitted
 
 
+def _optional_image_error(prefix, exc):
+    detail = " ".join((str(exc) or exc.__class__.__name__).split())
+    if len(detail) > 500:
+        detail = detail[:497] + "..."
+    return {"error": f"{prefix}: {detail}"}
+
+
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
              profile="review", write_json=True, evidence=True, images=False,
              image_diagnostics=False):
@@ -2632,16 +2639,6 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             supported += " / .png / .jpg / .jpeg / .tif / .tiff / .webp"
         raise PaperconanInputError(
             f"no {supported} files in {in_dir}"
-        )
-    if images:
-        from .image._dependencies import preflight_image_dependencies
-        image_pdfs = any(
-            path.is_file() and path.suffix.lower() == ".pdf"
-            for path in Path(in_dir).iterdir()
-        )
-        preflight_image_dependencies(
-            render_pdf=image_pdfs,
-            diagnostics=image_diagnostics,
         )
 
     report_blocks = []
@@ -2810,6 +2807,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     image_assets = []
     image_findings = []
     if images:
+        from .image import ImageDependencyError
         from .image._assets import prepare_image_assets
         from .image._budget import ImageArtifactBudget
         try:
@@ -2817,28 +2815,67 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         except ValueError as exc:
             scan_errors.append({"error": str(exc)})
         else:
-            image_assets, image_errors = prepare_image_assets(
-                in_dir,
-                out_dir,
-                artifact_budget=image_budget,
-            )
-            scan_errors.extend(image_errors)
-            if image_diagnostics:
+            try:
+                from .image._dependencies import preflight_image_dependencies
+                image_pdfs = any(
+                    path.is_file() and path.suffix.lower() == ".pdf"
+                    for path in Path(in_dir).iterdir()
+                )
+                preflight_image_dependencies(
+                    render_pdf=image_pdfs,
+                    diagnostics=False,
+                )
+            except ImageDependencyError as exc:
+                scan_errors.append(_optional_image_error(
+                    "optional image inventory unavailable",
+                    exc,
+                ))
+            except Exception as exc:
+                scan_errors.append(_optional_image_error(
+                    "optional image inventory unavailable",
+                    exc,
+                ))
+            else:
                 try:
-                    from .image import ImageDependencyError
-                    from .image._diagnostics import diagnose_image_assets
-                    image_findings, diagnostic_errors = diagnose_image_assets(
-                        image_assets,
+                    image_assets, image_errors = prepare_image_assets(
+                        in_dir,
                         out_dir,
                         artifact_budget=image_budget,
                     )
-                    scan_errors.extend(diagnostic_errors)
-                except ImageDependencyError:
-                    raise
+                    scan_errors.extend(image_errors)
+                except ImageDependencyError as exc:
+                    scan_errors.append(_optional_image_error(
+                        "optional image inventory unavailable",
+                        exc,
+                    ))
                 except Exception as exc:
-                    scan_errors.append({
-                        "error": f"optional image diagnostics unavailable: {exc}",
-                    })
+                    scan_errors.append(_optional_image_error(
+                        "optional image inventory unavailable",
+                        exc,
+                    ))
+                if image_diagnostics:
+                    try:
+                        preflight_image_dependencies(
+                            render_pdf=False,
+                            diagnostics=True,
+                        )
+                        from .image._diagnostics import diagnose_image_assets
+                        image_findings, diagnostic_errors = diagnose_image_assets(
+                            image_assets,
+                            out_dir,
+                            artifact_budget=image_budget,
+                        )
+                        scan_errors.extend(diagnostic_errors)
+                    except ImageDependencyError as exc:
+                        scan_errors.append(_optional_image_error(
+                            "optional image diagnostics unavailable",
+                            exc,
+                        ))
+                    except Exception as exc:
+                        scan_errors.append(_optional_image_error(
+                            "optional image diagnostics unavailable",
+                            exc,
+                        ))
 
     out = dict(tool="paperconan",
                tool_version=_version(),

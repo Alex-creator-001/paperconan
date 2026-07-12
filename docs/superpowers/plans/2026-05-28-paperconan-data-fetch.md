@@ -1118,7 +1118,7 @@ Replace the first two lines of `main()` (the `ap = argparse.ArgumentParser(...)`
 
 ```python
 def main():
-    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for fabrication red flags")
+    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for statistical signals")
 ```
 
 Insert the dispatch immediately inside `main()`, before that line:
@@ -1128,7 +1128,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "fetch":
         from .fetch._cli import fetch_main
         sys.exit(fetch_main(sys.argv[2:]))
-    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for fabrication red flags")
+    ap = argparse.ArgumentParser(description="Scan a paper's source-data xlsx files for statistical signals")
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**

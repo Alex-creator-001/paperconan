@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import base64
 import builtins
 import importlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -11,11 +17,17 @@ from paperconan._html import write_html_report
 from paperconan.image import ImageDependencyError
 
 
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
 def _csv_source(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     (source / "data.csv").write_text(
-        "a,b\n1,2\n2,3\n3,4\n",
+        "a,b\n1,2\n2,3\n3,4\n4,5\n",
         encoding="utf-8",
     )
     return source
@@ -47,66 +59,113 @@ def _missing(monkeypatch, *missing_names):
         monkeypatch.setattr(dependencies, "_import_module", import_module)
 
 
-def test_images_preflight_missing_pillow_before_processing(tmp_path, monkeypatch):
+def _assert_numeric_publication_survives(
+    scan,
+    output,
+    *,
+    image_asset_count=0,
+):
+    assert scan["relations_blocks"]
+    assert len(scan["image_assets"]) == image_asset_count
+    assert scan["image_findings"] == []
+    assert (output / "scan.json").exists()
+
+
+def test_missing_pillow_is_non_gating_for_numeric_publication(tmp_path, monkeypatch):
     source = _csv_source(tmp_path)
     output = tmp_path / "audit"
     _missing(monkeypatch, "PIL.Image")
 
-    with pytest.raises(ImageDependencyError) as exc:
-        scan_dir(
-            str(source),
-            str(output),
-            write_html=False,
-            images=True,
-        )
+    scan = scan_dir(
+        str(source),
+        str(output),
+        write_html=False,
+        images=True,
+    )
 
-    assert 'pip install "paperconan[image]"' in str(exc.value)
-    assert not output.exists()
+    _assert_numeric_publication_survives(scan, output)
+    assert any(
+        'pip install "paperconan[image]"' in item["error"]
+        for item in scan["scan_errors"]
+    )
 
 
-def test_pdf_render_preflight_missing_renderer_before_processing(
+def test_missing_pillow_is_non_gating_for_image_only_requested_reports(
     tmp_path,
     monkeypatch,
 ):
     source = tmp_path / "source"
     source.mkdir()
-    (source / "supp.pdf").write_bytes(b"synthetic-pdf")
+    (source / "Fig1.png").write_bytes(PNG_1X1)
     output = tmp_path / "audit"
-    _missing(monkeypatch, "pypdfium2")
+    _missing(monkeypatch, "PIL.Image")
 
-    with pytest.raises(ImageDependencyError) as exc:
-        scan_dir(
-            str(source),
-            str(output),
-            write_html=False,
-            images=True,
-        )
+    scan = scan_dir(
+        str(source),
+        str(output),
+        images=True,
+    )
 
-    assert "PDF image rendering requires" in str(exc.value)
-    assert 'pip install "paperconan[image]"' in str(exc.value)
-    assert not output.exists()
+    assert scan["relations_blocks"] == []
+    assert scan["image_assets"] == []
+    assert scan["image_findings"] == []
+    assert (output / "scan.json").exists()
+    assert (output / "report.html").exists()
+    assert any(
+        'pip install "paperconan[image]"' in item["error"]
+        for item in scan["scan_errors"]
+    )
 
 
-def test_diagnostics_preflight_missing_opencv_before_partial_image_work(
+def test_missing_pdf_renderer_is_non_gating_for_numeric_publication(
     tmp_path,
     monkeypatch,
 ):
     source = _csv_source(tmp_path)
+    (source / "supp.pdf").write_bytes(b"synthetic-pdf")
+    output = tmp_path / "audit"
+    _missing(monkeypatch, "pypdfium2")
+
+    scan = scan_dir(
+        str(source),
+        str(output),
+        write_html=False,
+        images=True,
+    )
+
+    _assert_numeric_publication_survives(scan, output)
+    assert any(
+        "PDF image rendering requires" in item["error"]
+        for item in scan["scan_errors"]
+    )
+
+
+def test_missing_diagnostics_dependency_is_non_gating_for_numeric_publication(
+    tmp_path,
+    monkeypatch,
+):
+    source = _csv_source(tmp_path)
+    (source / "Fig1.png").write_bytes(PNG_1X1)
     output = tmp_path / "audit"
     _missing(monkeypatch, "cv2")
 
-    with pytest.raises(ImageDependencyError) as exc:
-        scan_dir(
-            str(source),
-            str(output),
-            write_html=False,
-            images=True,
-            image_diagnostics=True,
-        )
+    scan = scan_dir(
+        str(source),
+        str(output),
+        write_html=False,
+        images=True,
+        image_diagnostics=True,
+    )
 
-    assert "image diagnostics require" in str(exc.value)
-    assert 'pip install "paperconan[image]"' in str(exc.value)
-    assert not output.exists()
+    _assert_numeric_publication_survives(
+        scan,
+        output,
+        image_asset_count=1,
+    )
+    assert any(
+        "image diagnostics require" in item["error"]
+        for item in scan["scan_errors"]
+    )
 
 
 def test_pdf_renderer_is_not_required_without_pdf_sources(tmp_path, monkeypatch):
@@ -166,9 +225,10 @@ def test_numeric_only_report_ignores_image_dependency_and_limit_state(
     assert out.exists()
 
 
-def test_cli_exits_nonzero_with_image_install_guidance(
+def test_cli_publishes_numeric_results_with_image_install_guidance(
     tmp_path,
     monkeypatch,
+    capsys,
 ):
     source = _csv_source(tmp_path)
     _missing(monkeypatch, "PIL.Image")
@@ -185,18 +245,23 @@ def test_cli_exits_nonzero_with_image_install_guidance(
         ],
     )
 
-    with pytest.raises(SystemExit) as exc:
-        _audit.main()
+    _audit.main()
 
-    assert exc.value.code != 0
-    assert 'pip install "paperconan[image]"' in str(exc.value.code)
+    output = tmp_path / "audit"
+    scan = json.loads((output / "scan.json").read_text(encoding="utf-8"))
+    _assert_numeric_publication_survives(scan, output)
+    captured = capsys.readouterr()
+    assert "wrote " in captured.out
+    assert any(
+        'pip install "paperconan[image]"' in item["error"]
+        for item in scan["scan_errors"]
+    )
 
 
-def test_scan_propagates_late_pdf_dependency_error(tmp_path, monkeypatch):
+def test_scan_records_late_pdf_dependency_error(tmp_path, monkeypatch):
     from paperconan.image import _assets, _dependencies
 
-    source = tmp_path / "source"
-    source.mkdir()
+    source = _csv_source(tmp_path)
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
     error = ImageDependencyError(
         'PDF image rendering requires `pip install "paperconan[image]"`'
@@ -218,12 +283,112 @@ def test_scan_propagates_late_pdf_dependency_error(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(_assets, "_render_pdf_pages", unavailable)
 
-    with pytest.raises(ImageDependencyError) as exc:
-        scan_dir(
-            str(source),
-            str(tmp_path / "audit"),
-            write_html=False,
-            images=True,
-        )
+    output = tmp_path / "audit"
+    scan = scan_dir(
+        str(source),
+        str(output),
+        write_html=False,
+        images=True,
+    )
 
-    assert exc.value is error
+    _assert_numeric_publication_survives(scan, output)
+    assert any(str(error) in item["error"] for item in scan["scan_errors"])
+
+
+def test_scan_records_late_diagnostics_dependency_error(tmp_path, monkeypatch):
+    from paperconan.image import _diagnostics
+
+    source = _csv_source(tmp_path)
+    output = tmp_path / "audit"
+    error = ImageDependencyError(
+        'image diagnostics require `pip install "paperconan[image]"`'
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "diagnose_image_assets",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    scan = scan_dir(
+        str(source),
+        str(output),
+        write_html=False,
+        images=True,
+        image_diagnostics=True,
+    )
+
+    _assert_numeric_publication_survives(scan, output)
+    assert any(str(error) in item["error"] for item in scan["scan_errors"])
+
+
+def test_optional_image_error_context_is_bounded(tmp_path, monkeypatch):
+    from paperconan.image import _dependencies
+
+    source = _csv_source(tmp_path)
+    output = tmp_path / "audit"
+    detail = "x" * 2000
+    monkeypatch.setattr(
+        _dependencies,
+        "preflight_image_dependencies",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError(detail)),
+    )
+
+    scan = scan_dir(
+        str(source),
+        str(output),
+        write_html=False,
+        images=True,
+    )
+
+    _assert_numeric_publication_survives(scan, output)
+    errors = [item["error"] for item in scan["scan_errors"]]
+    assert len(errors) == 1
+    assert errors[0].startswith("optional image inventory unavailable: ")
+    assert len(errors[0]) < 550
+    assert errors[0].endswith("...")
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("PAPERCONAN_MAX_IMAGE_MB", "not-a-number"),
+        ("PAPERCONAN_MAX_IMAGE_PIXELS", "inf"),
+        ("PAPERCONAN_MAX_IMAGE_ASSETS", "9" * 5000),
+    ],
+)
+def test_invalid_optional_image_limits_are_lazy_and_non_gating_in_subprocess(
+    tmp_path,
+    name,
+    value,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data.csv").write_text(
+        "a,b\n1,2\n2,3\n3,4\n4,5\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "audit"
+    script = """
+import json
+import sys
+from paperconan import scan_dir
+import paperconan.image._assets
+
+scan = scan_dir(sys.argv[1], sys.argv[2], write_html=False, images=True)
+assert scan["relations_blocks"]
+assert scan["image_assets"] == []
+assert any(sys.argv[3] in item["error"] for item in scan["scan_errors"])
+assert __import__("pathlib").Path(sys.argv[2], "scan.json").exists()
+"""
+    env = os.environ.copy()
+    env[name] = value
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(source), str(output), name],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

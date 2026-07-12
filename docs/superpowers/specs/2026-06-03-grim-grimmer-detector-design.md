@@ -18,7 +18,7 @@ well-validated forensic tests that catch impossible mean/SD values in exactly
 this kind of table. They fit paperconan's engine style (per-block, pure
 numeric, zero external deps) and fill a genuine capability gap.
 
-Borrowed conceptually from the `geng-academic-fraud-detector` skill's second
+Borrowed conceptually from an earlier academic-data detector's second
 "form" ("能否反推出三个合理的原始值?"), but implemented as deterministic code,
 not LLM reasoning.
 

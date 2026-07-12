@@ -830,7 +830,7 @@ def _write_collision_safe(
         )
         if projected > max_total_bytes:
             raise _PaperDataLimitError(
-                "direct file skipped because projected paper data exceeds "
+                "publication skipped because projected paper data exceeds "
                 "per-paper cap"
             )
 
@@ -1276,10 +1276,10 @@ def _extract_selected_zip(
     limit_reasons=None,
     published_entries=None,
     pending_entries=None,
+    transient_files=(),
 ):
     extracted = published_entries if published_entries is not None else []
     pending = pending_entries if pending_entries is not None else []
-    written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
         allowed.update({"image", "document"})
@@ -1296,8 +1296,6 @@ def _extract_selected_zip(
     source.seek(0, os.SEEK_SET)
     with zipfile.ZipFile(source) as zf:
         for info in zf.infolist():
-            if written >= _MAX_PAPER_BYTES:
-                break
             if info.is_dir():
                 continue
             name = os.path.basename(info.filename)
@@ -1305,7 +1303,6 @@ def _extract_selected_zip(
                 not name
                 or asset_type(name) not in allowed
                 or info.file_size > max_member_bytes
-                or written + info.file_size > _MAX_PAPER_BYTES
             ):
                 continue
             if cardinality is not None:
@@ -1325,17 +1322,22 @@ def _extract_selected_zip(
                 data = src.read(max_member_bytes + 1)
                 if len(data) > max_member_bytes:
                     continue
-            dest = _write_collision_safe(
-                out_dir,
-                name,
-                data,
-                _return_entry=return_entries,
-            )
+            try:
+                dest = _write_collision_safe(
+                    out_dir,
+                    name,
+                    data,
+                    _return_entry=return_entries,
+                    max_total_bytes=_MAX_PAPER_BYTES,
+                    transient_files=transient_files,
+                )
+            except _PaperDataLimitError as exc:
+                _append_limit_reason(limit_reasons, str(exc))
+                continue
             if return_entries:
                 pending.append(dest)
             if cardinality is not None:
                 cardinality.record_publication()
-            written += len(data)
             if return_entries:
                 _verify_published_output_file(out_dir, dest)
                 out_dir.verify()
@@ -1355,10 +1357,10 @@ def _extract_selected_tar(
     limit_reasons=None,
     published_entries=None,
     pending_entries=None,
+    transient_files=(),
 ):
     extracted = published_entries if published_entries is not None else []
     pending = pending_entries if pending_entries is not None else []
-    written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
         allowed.update({"image", "document"})
@@ -1376,8 +1378,6 @@ def _extract_selected_tar(
             )
             with tarfile.open(fileobj=bounded, mode="r|") as tf:
                 for member in tf:
-                    if written >= _MAX_PAPER_BYTES:
-                        break
                     if not member.isfile():
                         continue
                     name = os.path.basename(member.name)
@@ -1385,7 +1385,6 @@ def _extract_selected_tar(
                         not name
                         or asset_type(name) not in allowed
                         or member.size > max_member_bytes
-                        or written + member.size > _MAX_PAPER_BYTES
                     ):
                         continue
                     if cardinality is not None:
@@ -1407,17 +1406,22 @@ def _extract_selected_tar(
                     data = src.read(max_member_bytes + 1)
                     if len(data) > max_member_bytes:
                         continue
-                    dest = _write_collision_safe(
-                        out_dir,
-                        name,
-                        data,
-                        _return_entry=return_entries,
-                    )
+                    try:
+                        dest = _write_collision_safe(
+                            out_dir,
+                            name,
+                            data,
+                            _return_entry=return_entries,
+                            max_total_bytes=_MAX_PAPER_BYTES,
+                            transient_files=transient_files,
+                        )
+                    except _PaperDataLimitError as exc:
+                        _append_limit_reason(limit_reasons, str(exc))
+                        continue
                     if return_entries:
                         pending.append(dest)
                     if cardinality is not None:
                         cardinality.record_publication()
-                    written += len(data)
                     if return_entries:
                         _verify_published_output_file(out_dir, dest)
                         out_dir.verify()
@@ -1632,6 +1636,7 @@ def _download_oa_package(
                             limit_reasons=limit_reasons,
                             published_entries=extracted,
                             pending_entries=pending,
+                            transient_files=(tmp,),
                         )
                     except (tarfile.TarError, OSError, ValueError) as exc:
                         processing_error = exc
@@ -1731,6 +1736,7 @@ def _download_supplementary_archive(
                                 limit_reasons=limit_reasons,
                                 published_entries=extracted,
                                 pending_entries=pending,
+                                transient_files=(tmp_zip,),
                             )
                     except (zipfile.BadZipFile, OSError, ValueError) as exc:
                         processing_error = exc
@@ -1801,8 +1807,28 @@ def _download_supplementary_archive(
 def _safe_source_url(url: object) -> str | None:
     if not isinstance(url, str) or not url:
         return None
-    parsed = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        scheme not in {"http", "https"}
+        or not hostname
+        or any(character.isspace() or ord(character) < 32 for character in hostname)
+    ):
+        return None
+    authority_host = f"[{hostname}]" if ":" in hostname else hostname
+    authority = (
+        f"{authority_host}:{port}"
+        if port is not None
+        else authority_host
+    )
+    return urllib.parse.urlunsplit(
+        (scheme, authority, parsed.path, "", "")
+    )
 
 
 def _hash_exact_fd(fd: int, size: int) -> str:

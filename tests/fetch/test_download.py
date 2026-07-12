@@ -1425,6 +1425,21 @@ def _two_member_archive_bytes(kind):
     return payload.getvalue()
 
 
+def _archive_bytes_with_members(kind, members):
+    payload = io.BytesIO()
+    if kind == "oa":
+        with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+    else:
+        with zipfile.ZipFile(payload, "w") as archive:
+            for name, data in members:
+                archive.writestr(name, data)
+    return payload.getvalue()
+
+
 def _classic_eocd_bytes(
     *,
     disk_number=0,
@@ -1606,6 +1621,169 @@ def _install_archive_payload(monkeypatch, payload):
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_member_at_exact_paper_cap_is_published(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    data = b"1234"
+    payload = _archive_bytes(archive_kind, data=data)
+    candidate, _ = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(data))
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == [str(tmp_path / "data.csv")]
+    assert (tmp_path / "data.csv").read_bytes() == data
+    assert summary["skipped"] == []
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_member_one_byte_over_paper_cap_is_reported_and_skipped(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    data = b"1234"
+    payload = _archive_bytes(archive_kind, data=data)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(data) - 1)
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == []
+    assert not (tmp_path / "data.csv").exists()
+    assert any(
+        item["name"] == archive["name"]
+        and "projected paper data exceeds per-paper cap" in item["reason"]
+        for item in summary["skipped"]
+    )
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_exact_content_reuse_is_not_charged_twice(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    data = b"1234"
+    existing = tmp_path / "data.csv"
+    existing.write_bytes(data)
+    payload = _archive_bytes(archive_kind, data=data)
+    candidate, _ = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(data))
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == [str(existing)]
+    assert existing.read_bytes() == data
+    assert summary["skipped"] == []
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_cap_rejection_continues_to_later_smaller_member(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    payload = _archive_bytes_with_members(
+        archive_kind,
+        [
+            ("tables/large.csv", b"12345"),
+            ("tables/small.csv", b"1234"),
+        ],
+    )
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 4)
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == [str(tmp_path / "small.csv")]
+    assert not (tmp_path / "large.csv").exists()
+    assert (tmp_path / "small.csv").read_bytes() == b"1234"
+    assert any(
+        item["name"] == archive["name"]
+        and "projected paper data exceeds per-paper cap" in item["reason"]
+        and "direct file skipped" not in item["reason"]
+        for item in summary["skipped"]
+    )
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_cap_rejection_continues_to_exact_content_reuse(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    existing = tmp_path / "reuse.csv"
+    existing.write_bytes(b"1234")
+    payload = _archive_bytes_with_members(
+        archive_kind,
+        [
+            ("tables/new.csv", b"x"),
+            ("tables/reuse.csv", b"1234"),
+        ],
+    )
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", 4)
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == [str(existing)]
+    assert not (tmp_path / "new.csv").exists()
+    assert existing.read_bytes() == b"1234"
+    assert any(
+        item["name"] == archive["name"]
+        and "projected paper data exceeds per-paper cap" in item["reason"]
+        for item in summary["skipped"]
+    )
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_fresh_accounting_counts_visible_insertion_before_publication(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    data = b"1234"
+    payload = _archive_bytes(archive_kind, data=data)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(data))
+    real_write = _download._write_collision_safe
+    inserted = False
+
+    def insert_before_publication(*args, **kwargs):
+        nonlocal inserted
+        if not inserted:
+            (tmp_path / "external.bin").write_bytes(b"x")
+            inserted = True
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        _download,
+        "_write_collision_safe",
+        insert_before_publication,
+    )
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert inserted
+    assert summary["downloaded"] == []
+    assert not (tmp_path / "data.csv").exists()
+    assert any(
+        item["name"] == archive["name"]
+        and "projected paper data exceeds per-paper cap" in item["reason"]
+        for item in summary["skipped"]
+    )
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
 def test_archive_reconciles_entry_verification_failure_after_publication(
     monkeypatch,
     tmp_path,
@@ -1650,6 +1828,76 @@ def test_archive_reconciles_entry_verification_failure_after_publication(
     assert (out_dir / "data.csv").read_bytes() == b"a,b\n1,2\n"
     assert not list(out_dir.glob(".paperconan-archive-*"))
     assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        (
+            "https://user:password@example.test:8443/path?token=secret#part",
+            "https://example.test:8443/path",
+        ),
+        (
+            "https://user:password@[2001:db8::1]:9443/data?token=secret",
+            "https://[2001:db8::1]:9443/data",
+        ),
+        ("ftp://example.test/data.csv", None),
+        ("https://example.test:not-a-port/data.csv", None),
+        ("https://[2001:db8::1/data.csv", None),
+        ("https:///missing-host.csv", None),
+    ],
+)
+def test_safe_source_url_rebuilds_valid_authority(url, expected):
+    assert _download._safe_source_url(url) == expected
+
+
+@pytest.mark.parametrize("publication_kind", ["direct", "oa", "supplementary"])
+def test_published_provenance_strips_credentials_and_preserves_ipv6(
+    monkeypatch,
+    tmp_path,
+    publication_kind,
+):
+    source_url = (
+        "https://reader:private@[2001:db8::1]:8443/source/data.csv"
+        "?signature=hidden#fragment"
+    )
+    data = b"a,b\n1,2\n"
+    if publication_kind == "direct":
+        def fake_download(url, destination, **kwargs):
+            os.ftruncate(destination.fd, 0)
+            os.lseek(destination.fd, 0, os.SEEK_SET)
+            os.write(destination.fd, data)
+            return {
+                "ok": True,
+                "path": destination,
+                "size": len(data),
+                "source_url": url,
+            }
+
+        monkeypatch.setattr(_download, "download_file", fake_download)
+        candidate = {
+            "cand_id": "source:1",
+            "source": "source",
+            "tabular_files": [{
+                "name": "data.csv",
+                "download_url": source_url,
+            }],
+        }
+    else:
+        payload = _archive_bytes(publication_kind, data=data)
+        _install_archive_payload(monkeypatch, payload)
+        candidate, archive = _archive_candidate(publication_kind)
+        archive["url"] = source_url
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert summary["downloaded"] == [str(tmp_path / "data.csv")]
+    assert sidecar["downloads"][0]["source_url"] == (
+        "https://[2001:db8::1]:8443/source/data.csv"
+    )
 
 
 @pytest.mark.parametrize("has_entry", [False, True])

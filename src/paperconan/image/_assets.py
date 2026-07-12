@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal, DecimalException
 import hashlib
 import json
 import math
@@ -17,34 +18,89 @@ from . import ImageDependencyError
 from ._budget import (
     ImageArtifactBudget,
     ImageArtifactBudgetExceeded,
+    image_publication_lock,
     regular_file_size,
 )
 from ._dependencies import preflight_image_dependencies
 
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
-_MAX_IMAGE_MB = float(os.environ.get("PAPERCONAN_MAX_IMAGE_MB", "100"))
+_MAX_IMAGE_MB = 100.0
 _MAX_IMAGE_BYTES = int(_MAX_IMAGE_MB * 1024 * 1024)
-_MAX_IMAGE_PIXELS = int(os.environ.get("PAPERCONAN_MAX_IMAGE_PIXELS", "100000000"))
-_MAX_IMAGE_ASSETS = int(os.environ.get("PAPERCONAN_MAX_IMAGE_ASSETS", "1000"))
+_MAX_IMAGE_PIXELS = 100_000_000
+_MAX_IMAGE_ASSETS = 1000
 _MAX_SOURCE_PROVENANCE_BYTES = 8 * 1024 * 1024
 _SOURCE_PROVENANCE_NAME = "paperconan_source.json"
 _SOURCE_PROVENANCE_READ_BYTES = 64 * 1024
 _PDF_DPI = 200
+_MEBIBYTE = Decimal(1024 * 1024)
 
 
 class _AssetPublicationRecoveryError(RuntimeError):
     pass
 
 
-def _load_pillow():
+def _max_image_bytes() -> int:
+    name = "PAPERCONAN_MAX_IMAGE_MB"
+    raw = os.environ.get(name)
+    if raw is None:
+        return _MAX_IMAGE_BYTES
+    try:
+        value = Decimal(raw)
+        byte_value = value * _MEBIBYTE
+    except (DecimalException, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {name} limit") from exc
+    if (
+        not value.is_finite()
+        or value < 0
+        or not byte_value.is_finite()
+        or byte_value > sys.maxsize
+    ):
+        raise ValueError(f"invalid {name} limit")
+    return int(byte_value)
+
+
+def _max_image_pixels() -> int:
+    return _non_negative_int_limit(
+        "PAPERCONAN_MAX_IMAGE_PIXELS",
+        _MAX_IMAGE_PIXELS,
+    )
+
+
+def _max_image_assets() -> int:
+    return _non_negative_int_limit(
+        "PAPERCONAN_MAX_IMAGE_ASSETS",
+        _MAX_IMAGE_ASSETS,
+    )
+
+
+def _non_negative_int_limit(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        value = default
+    else:
+        try:
+            value = int(raw)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid {name} limit") from exc
+    if value < 0 or value > sys.maxsize:
+        raise ValueError(f"invalid {name} limit")
+    return value
+
+
+def _image_mb_limit_label() -> str:
+    raw = os.environ.get("PAPERCONAN_MAX_IMAGE_MB")
+    return raw if raw is not None else f"{_MAX_IMAGE_MB:g}"
+
+
+def _load_pillow(max_image_pixels: int):
     try:
         from PIL import Image, ImageOps
     except ImportError as exc:
         raise ImageDependencyError(
             'image support requires `pip install "paperconan[image]"`'
         ) from exc
-    Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = max_image_pixels
     return Image, ImageOps
 
 
@@ -782,7 +838,13 @@ def _record_image(
     directory_fds: tuple[int, int, int, int] | None = None,
     artifact_budget: ImageArtifactBudget | None = None,
     source_fd: int | None = None,
+    max_image_bytes: int | None = None,
+    max_image_pixels: int | None = None,
 ) -> dict:
+    if max_image_bytes is None:
+        max_image_bytes = _max_image_bytes()
+    if max_image_pixels is None:
+        max_image_pixels = _max_image_pixels()
     if directory_fds is None:
         budget = artifact_budget or ImageArtifactBudget.from_environment()
         with _asset_output_directories(output_root) as opened_directories:
@@ -799,14 +861,17 @@ def _record_image(
                 directory_fds=opened_directories,
                 artifact_budget=budget,
                 source_fd=source_fd,
+                max_image_bytes=max_image_bytes,
+                max_image_pixels=max_image_pixels,
             )
     if artifact_budget is None:
         raise ValueError("image artifact budget is required")
-    Image, ImageOps = _load_pillow()
+    Image, ImageOps = _load_pillow(max_image_pixels)
     source_stat = os.fstat(source_fd) if source_fd is not None else source.stat()
-    if source_stat.st_size > _MAX_IMAGE_BYTES:
+    if source_stat.st_size > max_image_bytes:
         raise ValueError(
-            f"{source.name}: exceeds PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
+            f"{source.name}: exceeds "
+            f"PAPERCONAN_MAX_IMAGE_MB={_image_mb_limit_label()}"
         )
     digest = digest or (
         _sha256_fd(source_fd) if source_fd is not None else _sha256(source)
@@ -821,16 +886,15 @@ def _record_image(
     root_fd, images_fd, native_fd, preview_fd = directory_fds
     native_temp_name = preview_temp_name = None
     native_temp_fd = preview_temp_fd = None
-    publication_incomplete = False
-    try:
-        _verify_asset_directories(
-            output_root,
-            root_fd,
-            images_fd,
-            native_fd,
-            preview_fd,
-        )
+    with image_publication_lock(root_fd):
         try:
+            _verify_asset_directories(
+                output_root,
+                root_fd,
+                images_fd,
+                native_fd,
+                preview_fd,
+            )
             native_temp_name, native_temp_fd = _asset_temp_path(
                 native_fd,
                 suffix=suffix,
@@ -859,10 +923,10 @@ def _record_image(
                         )
                     exif_orientation = int(image.getexif().get(274, 1) or 1)
                     width, height = image.size
-                    if width * height > _MAX_IMAGE_PIXELS:
+                    if width * height > max_image_pixels:
                         raise ValueError(
                             f"{source.name}: exceeds "
-                            f"PAPERCONAN_MAX_IMAGE_PIXELS={_MAX_IMAGE_PIXELS}"
+                            f"PAPERCONAN_MAX_IMAGE_PIXELS={max_image_pixels}"
                         )
                     display_image = ImageOps.exif_transpose(image)
                     try:
@@ -876,6 +940,21 @@ def _record_image(
                         Image.MIME.get(image.format)
                         or mimetypes.guess_type(native.name)[0]
                     )
+            native_temp_state = os.fstat(native_temp_fd)
+            preview_temp_state = os.fstat(preview_temp_fd)
+            artifact_budget.resynchronize_from_images_fd(
+                images_fd,
+                excluded_entries={
+                    ("native", native_temp_name): (
+                        native_temp_state.st_dev,
+                        native_temp_state.st_ino,
+                    ),
+                    ("preview", preview_temp_name): (
+                        preview_temp_state.st_dev,
+                        preview_temp_state.st_ino,
+                    ),
+                },
+            )
             existing_size = (
                 regular_file_size(native_fd, native_name)
                 + regular_file_size(preview_fd, preview_name)
@@ -888,42 +967,38 @@ def _record_image(
                 existing_size=existing_size,
                 staged_size=staged_size,
             )
-            try:
-                _publish_asset_pair(
-                    output_root=output_root,
-                    root_fd=root_fd,
-                    images_fd=images_fd,
-                    native_fd=native_fd,
-                    preview_fd=preview_fd,
-                    native_temp_name=native_temp_name,
-                    preview_temp_name=preview_temp_name,
-                    native_temp_fd=native_temp_fd,
-                    preview_temp_fd=preview_temp_fd,
-                    native_name=native_name,
-                    preview_name=preview_name,
-                )
-            except _AssetPublicationRecoveryError:
-                publication_incomplete = True
-                raise
+            _publish_asset_pair(
+                output_root=output_root,
+                root_fd=root_fd,
+                images_fd=images_fd,
+                native_fd=native_fd,
+                preview_fd=preview_fd,
+                native_temp_name=native_temp_name,
+                preview_temp_name=preview_temp_name,
+                native_temp_fd=native_temp_fd,
+                preview_temp_fd=preview_temp_fd,
+                native_name=native_name,
+                preview_name=preview_name,
+            )
             artifact_budget.commit_replacement(
                 existing_size=existing_size,
                 staged_size=staged_size,
             )
-        except _AssetPublicationRecoveryError:
-            raise
-        except Exception:
-            raise
-    finally:
-        try:
+        finally:
+            active_error = sys.exc_info()[0] is not None
             if native_temp_fd is not None:
                 os.close(native_temp_fd)
             if preview_temp_fd is not None:
                 os.close(preview_temp_fd)
             _unlink_at(native_temp_name, native_fd)
             _unlink_at(preview_temp_name, preview_fd)
-        finally:
-            if publication_incomplete:
+            try:
                 artifact_budget.resynchronize_from_images_fd(images_fd)
+                if not active_error:
+                    artifact_budget.ensure_within_limit()
+            except Exception:
+                if not active_error:
+                    raise
     return {
         "asset_id": asset_id,
         "file": source.name,
@@ -963,7 +1038,11 @@ def _render_pdf_pages(
     pdf_fh,
     temp_dir_fd: int,
     artifact_budget: ImageArtifactBudget,
+    *,
+    max_image_pixels: int | None = None,
 ):
+    if max_image_pixels is None:
+        max_image_pixels = _max_image_pixels()
     try:
         import pypdfium2 as pdfium
     except ImportError as exc:
@@ -988,10 +1067,10 @@ def _render_pdf_pages(
                 width, height = page.get_size()
                 pixel_width = math.ceil(width * scale)
                 pixel_height = math.ceil(height * scale)
-                if pixel_width * pixel_height > _MAX_IMAGE_PIXELS:
+                if pixel_width * pixel_height > max_image_pixels:
                     raise ValueError(
                         f"{pdf_path.name} page {index + 1}: exceeds "
-                        f"PAPERCONAN_MAX_IMAGE_PIXELS={_MAX_IMAGE_PIXELS}"
+                        f"PAPERCONAN_MAX_IMAGE_PIXELS={max_image_pixels}"
                     )
                 reserved_size = _pdf_page_render_bound(
                     pixel_width,
@@ -1080,6 +1159,9 @@ def prepare_image_assets(
     output_root = Path(out_dir)
     try:
         budget = artifact_budget or ImageArtifactBudget.from_environment()
+        max_image_bytes = _max_image_bytes()
+        max_image_pixels = _max_image_pixels()
+        max_image_assets = _max_image_assets()
     except ValueError as exc:
         return [], [{"error": str(exc)}]
     downloads = _source_provenance(source_root)
@@ -1127,9 +1209,10 @@ def prepare_image_assets(
                 if source_fd is not None
                 else path.stat()
             )
-            if source_stat.st_size > _MAX_IMAGE_BYTES:
+            if source_stat.st_size > max_image_bytes:
                 raise ValueError(
-                    f"{path.name}: exceeds PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
+                    f"{path.name}: exceeds "
+                    f"PAPERCONAN_MAX_IMAGE_MB={_image_mb_limit_label()}"
                 )
             digest = (
                 _sha256_fd(source_fd)
@@ -1146,7 +1229,7 @@ def prepare_image_assets(
                 key=_stable_name_key,
             )
             return "duplicate"
-        if len(assets_by_digest) >= _MAX_IMAGE_ASSETS:
+        if len(assets_by_digest) >= max_image_assets:
             errors.append({"file": path.name, "error": _asset_limit_error()})
             return "limit"
         try:
@@ -1157,6 +1240,8 @@ def prepare_image_assets(
                 directory_fds=directory_fds,
                 artifact_budget=budget,
                 source_fd=source_fd,
+                max_image_bytes=max_image_bytes,
+                max_image_pixels=max_image_pixels,
                 **metadata,
             )
         except ImageDependencyError:
@@ -1191,19 +1276,20 @@ def prepare_image_assets(
                 for pdf in pdfs:
                     try:
                         with _open_stable_source_regular(pdf) as pdf_fh:
-                            if os.fstat(pdf_fh.fileno()).st_size > _MAX_IMAGE_BYTES:
+                            if os.fstat(pdf_fh.fileno()).st_size > max_image_bytes:
                                 raise ValueError(
                                     f"{pdf.name}: exceeds "
-                                    f"PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
+                                    "PAPERCONAN_MAX_IMAGE_MB="
+                                    f"{_image_mb_limit_label()}"
                                 )
-                            if pdf_page_attempts >= _MAX_IMAGE_ASSETS:
+                            if pdf_page_attempts >= max_image_assets:
                                 errors.append({
                                     "file": pdf.name,
                                     "page": 1,
                                     "error": _asset_limit_error(),
                                 })
                                 continue
-                            if len(assets_by_digest) >= _MAX_IMAGE_ASSETS:
+                            if len(assets_by_digest) >= max_image_assets:
                                 errors.append({
                                     "file": pdf.name,
                                     "error": _asset_limit_error(),
@@ -1214,6 +1300,7 @@ def prepare_image_assets(
                                 pdf_fh,
                                 temp_dir_fd,
                                 budget,
+                                max_image_pixels=max_image_pixels,
                             )
                             try:
                                 for (
@@ -1244,9 +1331,9 @@ def prepare_image_assets(
                                         )
                                     if (
                                         (
-                                            pdf_page_attempts >= _MAX_IMAGE_ASSETS
+                                            pdf_page_attempts >= max_image_assets
                                             or len(assets_by_digest)
-                                            >= _MAX_IMAGE_ASSETS
+                                            >= max_image_assets
                                         )
                                         and page_number < page_count
                                     ):

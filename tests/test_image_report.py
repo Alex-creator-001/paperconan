@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import io
 from pathlib import Path
 
@@ -33,6 +34,9 @@ def _scan(tmp_path: Path) -> dict:
     preview = tmp_path / "images" / "preview" / "img-a.png"
     preview.parent.mkdir(parents=True)
     preview.write_bytes(PNG_1X1)
+    native = tmp_path / "images" / "native" / "img-a.png"
+    native.parent.mkdir(parents=True)
+    native.write_bytes(PNG_1X1)
     return {
         "tool_version": "0.test",
         "profile": "review",
@@ -60,7 +64,7 @@ def _scan(tmp_path: Path) -> dict:
             "parent_file": None,
             "page": None,
             "figure_label": "Fig. 1",
-            "sha256": "a" * 64,
+            "sha256": hashlib.sha256(PNG_1X1).hexdigest(),
             "width": 1,
             "height": 1,
             "mime": "image/png",
@@ -247,6 +251,231 @@ def test_completed_coverage_with_missing_assets_becomes_partial(tmp_path):
     html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
     assert "partial" in html
     assert "completed" not in html
+
+
+def test_empty_modern_findings_render_no_blocks_or_unrelated_numeric_evidence(
+    tmp_path,
+):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": "Coverage was recorded without adjudicated findings.",
+        "findings": [],
+        "image_review": {
+            "status": "completed",
+            "reviewed_asset_ids": ["img:a"],
+        },
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert 'class="finding-block"' not in html
+    assert "constant_offset" not in html
+    assert "Coverage was recorded" in html
+
+
+@pytest.mark.parametrize("findings", [None, {}, "not-a-list"])
+def test_modern_findings_key_requires_a_list(tmp_path, findings):
+    with pytest.raises(ValueError, match="findings.*list"):
+        render_adjudicated_report(
+            _scan(tmp_path),
+            {"verdict": "NEEDS_HUMAN", "findings": findings},
+            artifact_dir=str(tmp_path),
+        )
+
+
+def test_modern_numeric_finding_without_match_does_not_use_legacy_fallback(
+    tmp_path,
+):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": "The selected evidence was unavailable.",
+        "findings": [{
+            "finding_type": "numeric",
+            "title": "Unmatched numeric observation",
+            "finding_ref": {"sheet": "missing"},
+            "report_md": "The selected evidence could not be matched.",
+        }],
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert "无匹配证据" in html
+    assert "constant_offset" not in html
+
+
+def test_boxed_image_reference_renders_native_region_not_full_preview(tmp_path):
+    scan = _scan(tmp_path)
+    native = tmp_path / scan["image_assets"][0]["path"]
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    Image.new("RGB", (8, 4), (0, 255, 0)).save(preview)
+    source = Image.new("RGB", (8, 4), (0, 0, 255))
+    for x in range(4):
+        for y in range(4):
+            source.putpixel((x, y), (255, 0, 0))
+    source.save(native)
+    scan["image_assets"][0].update(
+        width=8,
+        height=4,
+        sha256=hashlib.sha256(native.read_bytes()).hexdigest(),
+    )
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Native region",
+            "image_refs": [{"asset_id": "img:a", "box": [0, 0, 4, 4]}],
+            "report_md": "The native-pixel region requires contextual review.",
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
+    marker = "data:image/png;base64,"
+    encoded = html.split(marker, 1)[1].split('"', 1)[0]
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as crop:
+        assert crop.size == (4, 4)
+        assert crop.convert("RGB").getpixel((2, 2)) == (255, 0, 0)
+    assert "data:image/jpeg;base64," not in html
+
+
+def test_boxed_reference_rejects_same_dimension_native_content_replacement(
+    tmp_path,
+):
+    scan = _scan(tmp_path)
+    native = tmp_path / scan["image_assets"][0]["path"]
+    Image.new("RGB", (1, 1), (255, 0, 0)).save(native)
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Replaced native region",
+            "image_refs": [{"asset_id": "img:a", "box": [0, 0, 1, 1]}],
+            "report_md": "The requested native region is unavailable.",
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
+
+    assert "requested native-pixel region unavailable" in html
+    assert "data:image/" not in html
+
+
+@pytest.mark.parametrize(
+    "registered_digest",
+    [None, "", "a" * 63, "g" * 64],
+    ids=["missing", "empty", "short", "non-hex"],
+)
+def test_registered_native_crop_rejects_missing_or_malformed_digest(
+    tmp_path,
+    registered_digest,
+):
+    scan = _scan(tmp_path)
+    asset = scan["image_assets"][0]
+    if registered_digest is None:
+        asset.pop("sha256")
+    else:
+        asset["sha256"] = registered_digest
+    budget = EvidenceBudget(1024)
+
+    uri = _evidence.registered_native_crop_data_uri(
+        asset,
+        [0, 0, 1, 1],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert budget.used_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "box",
+    [
+        [0, 0, 9, 4],
+        [0, 0, 0, 4],
+        [0, 0, 4],
+        [0, 0, 4, 4.0],
+        [True, 0, 4, 4],
+    ],
+)
+def test_invalid_box_never_falls_back_to_full_preview(tmp_path, box):
+    scan = _scan(tmp_path)
+    scan["image_assets"][0].update(width=1, height=1)
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Invalid native region",
+            "image_refs": [{"asset_id": "img:a", "box": box}],
+            "report_md": "The requested native region is unavailable.",
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
+
+    assert "requested native-pixel region unavailable" in html
+    assert "data:image/" not in html
+
+
+def test_boxed_reference_rejects_registered_native_path_escape(tmp_path):
+    scan = _scan(tmp_path)
+    outside = tmp_path.parent / "outside-native.png"
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(outside)
+    scan["image_assets"][0].update(
+        path="../outside-native.png",
+        width=2,
+        height=2,
+    )
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Escaped native region",
+            "image_refs": [{"asset_id": "img:a", "box": [0, 0, 1, 1]}],
+            "report_md": "The requested native region is unavailable.",
+        }],
+    }
+
+    html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
+
+    assert "requested native-pixel region unavailable" in html
+    assert "data:image/" not in html
+
+
+def test_missing_image_decoder_during_box_render_is_non_gating(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Native region",
+            "image_refs": [{"asset_id": "img:a", "box": [0, 0, 1, 1]}],
+            "report_md": "The requested native region is unavailable.",
+        }],
+    }
+    real_import = __import__
+
+    def missing_image(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "PIL" and "Image" in fromlist:
+            raise ImportError("synthetic missing image decoder")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr("builtins.__import__", missing_image)
+
+    html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
+
+    assert "requested native-pixel region unavailable" in html
+    assert "Native region" in html
 
 
 def test_public_renderer_missing_image_review_does_not_mutate_verdict(tmp_path):
@@ -660,6 +889,59 @@ def test_zero_preview_budget_skips_pillow_and_payload_read(tmp_path, monkeypatch
     assert uri is None
     assert not pillow_called
     assert not payload_read
+    assert budget.used_bytes == 0
+
+
+def test_native_crop_tiny_remaining_budget_skips_encoding(tmp_path, monkeypatch):
+    scan = _scan(tmp_path)
+    budget = EvidenceBudget(3)
+    save_called = False
+
+    def track_save(self, fp, *args, **kwargs):
+        nonlocal save_called
+        save_called = True
+
+    monkeypatch.setattr(Image.Image, "save", track_save)
+
+    uri = _evidence.registered_native_crop_data_uri(
+        scan["image_assets"][0],
+        [0, 0, 1, 1],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert not save_called
+    assert budget.used_bytes == 0
+
+
+def test_native_crop_writer_blocks_payload_above_remaining_budget(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    budget = EvidenceBudget(4)
+    overflow_blocked = False
+
+    def overflow_save(self, fp, *args, **kwargs):
+        nonlocal overflow_blocked
+        try:
+            fp.write(b"1234")
+        except ValueError:
+            overflow_blocked = True
+            raise
+
+    monkeypatch.setattr(Image.Image, "save", overflow_save)
+
+    uri = _evidence.registered_native_crop_data_uri(
+        scan["image_assets"][0],
+        [0, 0, 1, 1],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert overflow_blocked
     assert budget.used_bytes == 0
 
 

@@ -20,7 +20,11 @@ from typing import Any
 
 from ._html import _all_findings, _esc, _render_cross_sheet_examples, _render_evidence_table
 from .image._budget import report_image_evidence_bytes
-from .image._evidence import EvidenceBudget, registered_preview_data_uri
+from .image._evidence import (
+    EvidenceBudget,
+    registered_native_crop_data_uri,
+    registered_preview_data_uri,
+)
 
 
 _SECTION_TITLES = (
@@ -136,6 +140,15 @@ def _is_image_verdict_finding(finding: dict[str, Any]) -> bool:
     return finding.get("finding_type") == "image" or bool(finding.get("image_refs"))
 
 
+def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
+    if "findings" not in verdict:
+        return None
+    findings = verdict["findings"]
+    if not isinstance(findings, list):
+        raise ValueError("verdict findings must be a list")
+    return findings
+
+
 def _normalize_image_review_status(value: object) -> str:
     status = str(value or "").strip().lower()
     return status if status in _IMAGE_FINDING_STATUSES else "unresolved"
@@ -214,9 +227,10 @@ def _iter_verdict_text(
         markdown=False,
     )
     yield from visible_values(verdict, ("review_note",), markdown=True)
-    if verdict.get("findings"):
+    findings = _modern_findings(verdict)
+    if findings is not None:
         yield from visible_values(verdict, ("paper_conclusion",), markdown=True)
-        for finding in verdict["findings"]:
+        for finding in findings:
             if not isinstance(finding, dict):
                 continue
             yield from visible_values(
@@ -258,7 +272,6 @@ def _iter_verdict_text(
             ("status", "note"),
             markdown=False,
         )
-    findings = verdict.get("findings")
     if scan_findings is not None and isinstance(findings, list) and len(findings) > 1:
         for finding in findings:
             if not isinstance(finding, dict):
@@ -305,12 +318,15 @@ def _normalized_verdict_copy(
     scan_findings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     normalized = copy.deepcopy(verdict)
+    findings = _modern_findings(normalized)
     known = {
         str(asset.get("asset_id"))
         for asset in scan.get("image_assets", []) or []
         if asset.get("asset_id")
     }
-    for finding in normalized.get("findings", []) or []:
+    for finding in findings or []:
+        if not isinstance(finding, dict):
+            continue
         if _is_image_verdict_finding(finding):
             finding["review_status"] = _normalize_image_review_status(
                 finding.get("review_status")
@@ -619,18 +635,36 @@ def _render_image_refs(
     assets = _image_asset_map(scan)
     cards = []
     for ref in finding.get("image_refs", []) or []:
+        if not isinstance(ref, dict):
+            continue
         asset = assets.get(str(ref.get("asset_id")))
         if asset is None:
             continue
-        uri = registered_preview_data_uri(asset, artifact_dir, budget)
+        boxed = "box" in ref
+        uri = (
+            registered_native_crop_data_uri(
+                asset,
+                ref.get("box"),
+                artifact_dir,
+                budget,
+            )
+            if boxed
+            else registered_preview_data_uri(asset, artifact_dir, budget)
+        )
+        unavailable = (
+            "requested native-pixel region unavailable"
+            if boxed
+            else "preview unavailable"
+        )
         img = (
             f'<img class="image-preview" src="{_esc(uri)}" alt="{_esc(asset.get("file"))}">'
-            if uri else '<div class="image-unavailable">preview unavailable</div>'
+            if uri else f'<div class="image-unavailable">{unavailable}</div>'
         )
+        region_label = ref.get("box") if boxed else "full image"
         cards.append(
             '<figure class="image-evidence">'
             f'{img}<figcaption>{_esc(ref.get("label") or asset.get("file"))} '
-            f'· {_esc(ref.get("box") or "full image")}</figcaption></figure>'
+            f'· {_esc(region_label)}</figcaption></figure>'
         )
     if not cards:
         return '<p class="no-evidence">图像证据引用未命中</p>'
@@ -683,6 +717,7 @@ def _render_finding_block(
     idx: int,
     artifact_dir: str | None,
     image_budget: EvidenceBudget,
+    legacy_fallback: bool,
 ) -> str:
     ref = finding.get("finding_ref") or {}
     matched = _match_finding(scan_findings, ref)
@@ -703,7 +738,7 @@ def _render_finding_block(
         if matched is not None:
             evidence += _render_key_finding(matched, idx)
     else:
-        if matched is None and scan_findings:
+        if legacy_fallback and matched is None and scan_findings:
             matched = scan_findings[0]
         evidence = (
             _render_key_finding(matched, idx)
@@ -732,10 +767,11 @@ def _normalize_verdict(
     - legacy single shape (report_md + finding_refs): synthesize one finding and
       carry tier_why / innocent_explanation / needs_author_data as ``summary``.
     """
-    if verdict.get("findings"):
+    findings = _modern_findings(verdict)
+    if findings is not None:
         paper = {"paper_conclusion": verdict.get("paper_conclusion"),
                  "review_note": verdict.get("review_note")}
-        return paper, list(verdict["findings"]), {}
+        return paper, list(findings), {}
     refs = verdict.get("finding_refs") or []
     single = {
         "title": verdict.get("title") or "发现",
@@ -756,7 +792,7 @@ def _normalize_verdict(
 def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
                     scan_findings: list[dict[str, Any]], findings: list[dict[str, Any]],
                     paper: dict[str, Any], summary: dict[str, Any],
-                    artifact_dir: str | None) -> str:
+                    artifact_dir: str | None, *, legacy_fallback: bool) -> str:
     """One high-fidelity layout for every verdict shape.
 
     Paper header + (optional) findings index + one self-contained block per
@@ -768,7 +804,13 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
     image_budget = EvidenceBudget(report_image_evidence_bytes())
     blocks = "".join(
         _render_finding_block(
-            scan, scan_findings, f, i, artifact_dir, image_budget
+            scan,
+            scan_findings,
+            f,
+            i,
+            artifact_dir,
+            image_budget,
+            legacy_fallback,
         )
         for i, f in enumerate(findings)
     )
@@ -835,9 +877,18 @@ def render_adjudicated_report(
         scan_findings=scan_findings,
     )
     title = _scan_title(scan, verdict)
+    legacy_fallback = "findings" not in verdict
     paper, findings, summary = _normalize_verdict(verdict)
     return _render_unified(
-        scan, verdict, title, scan_findings, findings, paper, summary, artifact_dir
+        scan,
+        verdict,
+        title,
+        scan_findings,
+        findings,
+        paper,
+        summary,
+        artifact_dir,
+        legacy_fallback=legacy_fallback,
     )
 
 

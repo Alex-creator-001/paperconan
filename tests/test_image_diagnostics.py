@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -927,6 +928,134 @@ def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
     assert "budget exhausted" in diagnostic_errors[0]["error"]
     evidence_dir = out / "images" / "evidence"
     assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
+
+
+def test_evidence_budget_fresh_accounting_counts_visible_insertion(tmp_path):
+    baseline_root, baseline_assets = _diagnostic_asset(tmp_path / "baseline")
+    baseline_native = baseline_root / baseline_assets[0]["path"]
+    baseline_evidence = write_native_pair_evidence(
+        str(baseline_native),
+        (0, 0, 8, 8),
+        (8, 0, 16, 8),
+        str(baseline_root),
+        "image-pair-baseline-budget",
+    )
+    native_size = baseline_native.stat().st_size
+    bundle_size = sum(
+        (baseline_root / path).stat().st_size
+        for path in baseline_evidence.values()
+    )
+    root, assets = _diagnostic_asset(tmp_path / "shared")
+    native = root / assets[0]["path"]
+    budget = ImageArtifactBudget(native_size + bundle_size)
+    budget.initialize_from_root(root)
+    (root / "images" / "external.bin").write_bytes(b"x")
+
+    with pytest.raises(ValueError, match="PAPERCONAN_MAX_IMAGE_TOTAL_MB"):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 8, 8),
+            (8, 0, 16, 8),
+            str(root),
+            "image-pair-fresh-accounting",
+            artifact_budget=budget,
+        )
+
+    assert budget.used_bytes == native_size + 1
+    assert not any(
+        path.name.startswith("image-pair-fresh-accounting")
+        for path in (root / "images" / "evidence").iterdir()
+    )
+
+
+def test_evidence_bundle_budget_coordinates_concurrent_paperconan_writers(
+    tmp_path,
+    monkeypatch,
+):
+    baseline_root, baseline_assets = _diagnostic_asset(tmp_path / "baseline")
+    baseline_native = baseline_root / baseline_assets[0]["path"]
+    baseline_evidence = write_native_pair_evidence(
+        str(baseline_native),
+        (0, 0, 8, 8),
+        (8, 0, 16, 8),
+        str(baseline_root),
+        "image-pair-baseline-concurrency",
+    )
+    cap = baseline_native.stat().st_size + sum(
+        (baseline_root / path).stat().st_size
+        for path in baseline_evidence.values()
+    )
+    root, assets = _diagnostic_asset(tmp_path / "shared")
+    native = root / assets[0]["path"]
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    second_inside = threading.Event()
+    original_stage_image = _evidence._stage_image
+    local = threading.local()
+
+    def controlled_stage_image(image, evidence_fd, image_format, **save_kwargs):
+        calls = getattr(local, "calls", 0)
+        local.calls = calls + 1
+        if calls == 0 and threading.current_thread().name == "evidence-first":
+            first_inside.set()
+            assert release_first.wait(5)
+        elif calls == 0 and threading.current_thread().name == "evidence-second":
+            second_inside.set()
+        return original_stage_image(
+            image,
+            evidence_fd,
+            image_format,
+            **save_kwargs,
+        )
+
+    monkeypatch.setattr(_evidence, "_stage_image", controlled_stage_image)
+    results = {}
+
+    def run(name, evidence_id):
+        try:
+            results[name] = write_native_pair_evidence(
+                str(native),
+                (0, 0, 8, 8),
+                (8, 0, 16, 8),
+                str(root),
+                evidence_id,
+                artifact_budget=ImageArtifactBudget(cap),
+            )
+        except Exception as exc:
+            results[name] = exc
+
+    first = threading.Thread(
+        target=run,
+        args=("first", "image-pair-concurrent-a"),
+        name="evidence-first",
+    )
+    second = threading.Thread(
+        target=run,
+        args=("second", "image-pair-concurrent-b"),
+        name="evidence-second",
+    )
+    first.start()
+    assert first_inside.wait(5)
+    second.start()
+    second_entered_while_first_active = second_inside.wait(0.2)
+    release_first.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not second_entered_while_first_active
+    successful = [value for value in results.values() if isinstance(value, dict)]
+    rejected = [value for value in results.values() if isinstance(value, Exception)]
+    assert len(successful) == 1
+    assert len(rejected) == 1
+    assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in str(rejected[0])
+    visible_bytes = sum(
+        path.stat().st_size
+        for path in (root / "images").rglob("*")
+        if path.is_file()
+    )
+    assert visible_bytes <= cap
 
 
 def test_scan_records_total_artifact_budget_exhaustion_without_losing_assets(

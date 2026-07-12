@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import ast
+import io
 import json
 import re
+import subprocess
+import tokenize
 from pathlib import Path
 
 
@@ -42,8 +46,8 @@ def test_new_judgment_docs_keep_signal_not_verdict_boundary() -> None:
     text = "\n".join(path.read_text(encoding="utf-8") for path in docs)
 
     assert "signal-not-verdict" in text
-    assert re.search(r"misconduct probabilit(?:y|ies)", text)
-    assert "not a misconduct accusation" in text
+    assert "review priority labels" in text
+    assert "not author-intent conclusions" in text
 
 
 def test_case_patterns_do_not_publish_real_paper_identifiers() -> None:
@@ -68,7 +72,70 @@ def test_readme_points_to_public_adjudication_docs() -> None:
     ]:
         assert f"skills/paperconan/references/{name}" in readme
 
-    assert "不是造假概率" in readme
+    assert "不是作者意图判断" in readme
+
+
+def _python_comments_and_docstrings(path: Path) -> str:
+    source = path.read_text(encoding="utf-8")
+    comments = [
+        token.string
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT
+    ]
+    tree = ast.parse(source, filename=str(path))
+    docstrings = [
+        value
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+        )
+        if (value := ast.get_docstring(node, clean=False)) is not None
+    ]
+    return "\n".join([*comments, *docstrings])
+
+
+def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
+    prohibited = (
+        "fr" + "aud",
+        "fabri" + "cation",
+        "fa" + "ked",
+        "fal" + "sified",
+        "mis" + "conduct",
+        "guil" + "ty",
+        "造" + "假",
+    )
+    tracked = subprocess.check_output(
+        ["git", "ls-files"],
+        cwd=ROOT,
+        text=True,
+    ).splitlines()
+    violations = []
+    for relative in tracked:
+        path = ROOT / relative
+        if relative in {"README.md", "pyproject.toml"} or relative.startswith(
+            ("docs/", "skills/")
+        ):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+        elif relative.endswith(".py") and relative.startswith(("src/", "tests/")):
+            text = _python_comments_and_docstrings(path)
+        else:
+            continue
+        folded = text.casefold()
+        if any(term.casefold() in folded for term in prohibited):
+            violations.append(relative)
+    assert violations == []
+
+
+def test_image_budget_lock_scope_is_documented() -> None:
+    cli = (ROOT / "docs" / "cli.md").read_text(encoding="utf-8")
+
+    assert "PaperConan writers" in cli
+    assert "external writers that ignore the lock" in cli
+    assert "observed external changes" in cli
 
 
 def test_skill_routes_adaptive_image_review() -> None:

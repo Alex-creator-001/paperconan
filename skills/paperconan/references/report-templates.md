@@ -14,7 +14,7 @@ Use this for normal interactive audits.
 
 ```text
 I scanned <input>. <N> files were read; <M> files failed to parse.
-These are numerical signals, not misconduct conclusions.
+These are numerical signals, not author-intent conclusions.
 
 Highest-priority finding:
 - Location: <file> :: <sheet>, rows <range>, columns <labels>

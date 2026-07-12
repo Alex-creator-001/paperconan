@@ -111,3 +111,12 @@ paperconan report data/audit/scan.json --verdict verdict.json --out adjudication
 | `PAPERCONAN_MAX_IMAGE_FINDINGS` | `200` | 可选确定性图像提示上限；超出部分写入 `scan_errors` |
 | `PAPERCONAN_MAX_IMAGE_COMPARISONS` | `100000` | 可选确定性图像提示在整次扫描中最多尝试的区域比较数；达到后停止并写入 `scan_errors` |
 | `PAPERCONAN_MAX_IMAGE_EVIDENCE_MB` | `20` | 一份 HTML 中登记预览的总内嵌预算；格式错误、非有限、负数或溢出值按 `0` 处理，只关闭图像内嵌，不影响数值报告 |
+
+单图体积、像素和资产数设置在图像阶段按需解析。格式错误、非有限、负数或超出平台
+范围的值会写入 `scan_errors` 并停止相应图像工作，但已完成的数值结果和请求的报告仍会发布。
+
+图像产物发布使用输出根目录中的持久锁来协调 **PaperConan writers**。这个锁只能约束
+遵守同一协议的写入者；**external writers that ignore the lock** 无法被原子控制。
+临界区会重新统计已固定的 `images/` 树，只排除本次操作已验证身份的私有暂存项；
+**observed external changes** 会被保守计入预算并记录为产物预算错误，而不会假定它们
+受锁保护。

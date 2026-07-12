@@ -72,7 +72,7 @@ Choose the lightest mode that satisfies the user request:
   load [references/adjudication-tiers.md](references/adjudication-tiers.md) and
   [references/report-templates.md](references/report-templates.md). Use Tier
   labels only as review priority / innocent-explanation difficulty, never as
-  misconduct probability.
+  author-intent conclusions.
 - **Batch review**: use [references/batch-workflow.md](references/batch-workflow.md).
   Keep deterministic paperconan output separate from agent judgment. Preserve
   DROP reasons because repeated false positives can guide future filters.
@@ -177,13 +177,13 @@ Load references only when needed:
 
 ## Judgment Discipline
 
-- Never convert `severity` into a misconduct conclusion. Severity means anomaly strength after the active profile, not author intent.
-- Never convert `Tier 1/2/3` into a misconduct probability. Tier means follow-up priority and difficulty of innocent explanation after context review.
+- Never convert `severity` into an author-intent conclusion. Severity means anomaly strength after the active profile, not author intent.
+- Never convert `Tier 1/2/3` into an author-intent conclusion. Tier means follow-up priority and difficulty of innocent explanation after context review.
 - Inspect cross-sheet reuse and cross-column transforms before weaker single-column patterns.
 - Prefer benign structural explanations first: shared controls, re-plots, unit conversions, formulas, indices, ratios, normalized values, model outputs, detection floors, and bounded scoring scales.
 - Treat `within_col_*` findings as false-positive-heavy by default. Do not strongly report `n < 10`, categorical/index labels, derived columns, fixed-denominator ratios, rounded grids, floors/ceilings, or repeated fill values.
 - Use "needs human context" when you cannot confirm row independence, raw measurement status, formula generation, Methods/legend meaning, or original-table provenance.
-- For PubPeer-style writing, provide concrete file/sheet/column evidence and questions for the authors; do not say "fake", "fraud", "fabricated", "实锤", or name authors as wrongdoers.
+- For PubPeer-style writing, provide concrete file/sheet/column evidence and questions for the authors; do not accuse authors or state an intent conclusion.
 - Do not use real papers as public calibration examples unless the user has
   explicitly asked to prepare a specific public note and the evidence has been
   checked against source data and paper context.
@@ -222,4 +222,4 @@ confuse this with the default deterministic `audit/report.html`; the
 adjudicated report is only as reliable as the human/AI verdict and source
 context behind it.
 
-If the user asks "is this fraud?", answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.
+If the user asks for an author-intent conclusion, answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.

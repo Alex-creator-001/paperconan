@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from decimal import Decimal, DecimalException
 import os
 from pathlib import Path
 import stat
 import sys
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - supported production targets are POSIX
+    fcntl = None
 
 
 _BUDGET_NAME = "PAPERCONAN_MAX_IMAGE_TOTAL_MB"
@@ -12,6 +18,7 @@ _DEFAULT_MAX_IMAGE_TOTAL_MB = Decimal("1500")
 _EVIDENCE_BUDGET_NAME = "PAPERCONAN_MAX_IMAGE_EVIDENCE_MB"
 _DEFAULT_MAX_IMAGE_EVIDENCE_MB = Decimal("20")
 _MEBIBYTE = Decimal(1024 * 1024)
+_PUBLICATION_LOCK_NAME = ".paperconan-image-publication.lock"
 
 
 class ImageArtifactBudgetExceeded(ValueError):
@@ -71,26 +78,93 @@ def regular_file_size(directory_fd: int, name: str) -> int:
     return current.st_size if stat.S_ISREG(current.st_mode) else 0
 
 
-def _regular_tree_size(directory_fd: int) -> int:
+def _regular_tree_size(
+    directory_fd: int,
+    *,
+    path_parts: tuple[str, ...] = (),
+    excluded_entries: dict[tuple[str, ...], tuple[int, int]] | None = None,
+) -> int:
     total = 0
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     for name in os.listdir(directory_fd):
+        relative_parts = (*path_parts, name)
         current = os.stat(
             name,
             dir_fd=directory_fd,
             follow_symlinks=False,
         )
         if stat.S_ISREG(current.st_mode):
+            expected_identity = (excluded_entries or {}).get(relative_parts)
+            if expected_identity == (current.st_dev, current.st_ino):
+                continue
             total += current.st_size
         elif stat.S_ISDIR(current.st_mode):
             child_fd = os.open(name, flags, dir_fd=directory_fd)
             try:
-                total += _regular_tree_size(child_fd)
+                total += _regular_tree_size(
+                    child_fd,
+                    path_parts=relative_parts,
+                    excluded_entries=excluded_entries,
+                )
             finally:
                 os.close(child_fd)
         if total > sys.maxsize:
             raise ValueError("image artifact tree is too large to budget")
     return total
+
+
+def _verify_publication_lock_entry(root_fd: int, lock_fd: int) -> None:
+    opened = os.fstat(lock_fd)
+    current = os.stat(
+        _PUBLICATION_LOCK_NAME,
+        dir_fd=root_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise ValueError("image artifact publication lock changed")
+
+
+@contextmanager
+def image_publication_lock(root_fd: int):
+    if fcntl is None or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("image artifact publication locking is unavailable")
+    lock_fd = -1
+    try:
+        try:
+            lock_fd = os.open(
+                _PUBLICATION_LOCK_NAME,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=root_fd,
+            )
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _verify_publication_lock_entry(root_fd, lock_fd)
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise ValueError(
+                "image artifact publication locking is unavailable"
+            ) from exc
+        active_error = False
+        try:
+            yield
+        except BaseException:
+            active_error = True
+            raise
+        finally:
+            try:
+                _verify_publication_lock_entry(root_fd, lock_fd)
+            except (OSError, ValueError):
+                if not active_error:
+                    raise
+    finally:
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
 class ImageArtifactBudget:
@@ -110,9 +184,21 @@ class ImageArtifactBudget:
         self.used_bytes = _regular_tree_size(images_fd)
         self._initialized = True
 
-    def resynchronize_from_images_fd(self, images_fd: int) -> None:
-        self.used_bytes = _regular_tree_size(images_fd)
+    def resynchronize_from_images_fd(
+        self,
+        images_fd: int,
+        *,
+        excluded_entries: dict[tuple[str, ...], tuple[int, int]] | None = None,
+    ) -> None:
+        self.used_bytes = _regular_tree_size(
+            images_fd,
+            excluded_entries=excluded_entries,
+        )
         self._initialized = True
+
+    def ensure_within_limit(self) -> None:
+        if self.used_bytes + self.temporary_bytes > self.max_bytes:
+            raise _budget_exhausted_error()
 
     def initialize_from_root(self, root: Path) -> None:
         if self._initialized:

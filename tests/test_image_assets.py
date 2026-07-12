@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -316,6 +317,122 @@ def test_total_image_artifact_budget_credits_rerun_replacements(
     assert rerun_errors[0]["file"] == "FigB.png"
     assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in rerun_errors[0]["error"]
     assert "budget exhausted" in rerun_errors[0]["error"]
+
+
+def test_asset_budget_fresh_accounting_counts_visible_insertion(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    baseline = tmp_path / "baseline"
+    baseline_assets, baseline_errors = _assets.prepare_image_assets(
+        str(source),
+        str(baseline),
+    )
+    assert baseline_errors == []
+    pair_size = sum(
+        (baseline / baseline_assets[0][key]).stat().st_size
+        for key in ("path", "preview_path")
+    )
+    output = tmp_path / "audit"
+    (output / "images").mkdir(parents=True)
+    budget = _assets.ImageArtifactBudget(pair_size)
+    budget.initialize_from_root(output)
+    (output / "images" / "external.bin").write_bytes(b"x")
+
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+        artifact_budget=budget,
+    )
+
+    assert assets == []
+    assert any("PAPERCONAN_MAX_IMAGE_TOTAL_MB" in item["error"] for item in errors)
+    assert budget.used_bytes == 1
+    assert not list((output / "images" / "native").glob("img-*"))
+    assert not list((output / "images" / "preview").glob("img-*"))
+
+
+def test_asset_pair_budget_coordinates_concurrent_paperconan_writers(
+    tmp_path,
+    monkeypatch,
+):
+    sources = []
+    pair_sizes = []
+    for index, color in enumerate(((20, 90, 180), (180, 60, 20))):
+        source = tmp_path / f"source-{index}"
+        source.mkdir()
+        _image(source / f"Fig{index}.png", color=color)
+        baseline = tmp_path / f"baseline-{index}"
+        assets, errors = _assets.prepare_image_assets(str(source), str(baseline))
+        assert errors == []
+        pair_sizes.append(sum(
+            (baseline / assets[0][key]).stat().st_size
+            for key in ("path", "preview_path")
+        ))
+        sources.append(source)
+    cap = max(pair_sizes)
+    output = tmp_path / "shared"
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    second_inside = threading.Event()
+    original_temp_path = _assets._asset_temp_path
+    local = threading.local()
+
+    def controlled_temp_path(directory_fd, *, suffix):
+        calls = getattr(local, "calls", 0)
+        local.calls = calls + 1
+        if calls == 0 and threading.current_thread().name == "asset-first":
+            first_inside.set()
+            assert release_first.wait(5)
+        elif calls == 0 and threading.current_thread().name == "asset-second":
+            second_inside.set()
+        return original_temp_path(directory_fd, suffix=suffix)
+
+    monkeypatch.setattr(_assets, "_asset_temp_path", controlled_temp_path)
+    results = {}
+
+    def run(name, source):
+        results[name] = _assets.prepare_image_assets(
+            str(source),
+            str(output),
+            artifact_budget=_assets.ImageArtifactBudget(cap),
+        )
+
+    first = threading.Thread(
+        target=run,
+        args=("first", sources[0]),
+        name="asset-first",
+    )
+    second = threading.Thread(
+        target=run,
+        args=("second", sources[1]),
+        name="asset-second",
+    )
+    first.start()
+    assert first_inside.wait(5)
+    second.start()
+    second_entered_while_first_active = second_inside.wait(0.2)
+    release_first.set()
+    first.join(5)
+    second.join(5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert not second_entered_while_first_active
+    successful = [name for name, (assets, _) in results.items() if assets]
+    rejected = [name for name, (_, errors) in results.items() if errors]
+    assert len(successful) == 1
+    assert len(rejected) == 1
+    assert any(
+        "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in item["error"]
+        for item in results[rejected[0]][1]
+    )
+    visible_bytes = sum(
+        path.stat().st_size
+        for path in (output / "images").rglob("*")
+        if path.is_file()
+    )
+    assert visible_bytes <= cap
 
 
 def test_prepare_image_assets_renders_pdf_pages(tmp_path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 import hashlib
+import io
 import math
 import mimetypes
 import os
@@ -13,6 +14,7 @@ import sys
 
 from ._budget import (
     ImageArtifactBudget,
+    image_publication_lock,
     regular_file_size,
 )
 
@@ -34,6 +36,38 @@ class _EvidencePublicationRecoveryError(RuntimeError):
     pass
 
 
+class _EvidenceEncodingLimitError(ValueError):
+    pass
+
+
+class _BoundedBytesIO(io.BytesIO):
+    def __init__(self, max_bytes: int):
+        super().__init__()
+        self._max_bytes = max(0, int(max_bytes))
+
+    def write(self, data) -> int:
+        position = self.tell()
+        with self.getbuffer() as current:
+            projected_size = max(current.nbytes, position + len(data))
+        if projected_size > self._max_bytes:
+            raise _EvidenceEncodingLimitError(
+                "encoded image evidence exceeds its byte ceiling"
+            )
+        return super().write(data)
+
+    def writelines(self, lines) -> None:
+        for line in lines:
+            self.write(line)
+
+    def truncate(self, size=None) -> int:
+        target = self.tell() if size is None else size
+        if target > self._max_bytes:
+            raise _EvidenceEncodingLimitError(
+                "encoded image evidence exceeds its byte ceiling"
+            )
+        return super().truncate(size)
+
+
 class EvidenceBudget:
     def __init__(self, max_bytes: int):
         self.max_bytes = max(0, int(max_bytes))
@@ -53,6 +87,20 @@ def _base64_encoded_size(raw_size: int) -> int:
     if raw_size < 0:
         raise ValueError("encoded evidence size cannot be negative")
     return 4 * ((raw_size + 2) // 3)
+
+
+def _max_raw_size_for_base64_budget(encoded_bytes: int) -> int:
+    return max(0, encoded_bytes // 4) * 3
+
+
+def _registered_sha256(value: object) -> str | None:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in value)
+    ):
+        return None
+    return value.lower()
 
 
 def _crop_encoding(image) -> tuple[str, str, dict]:
@@ -777,7 +825,7 @@ def registered_preview_data_uri(
             encoded = base64.b64encode(payload).decode("ascii")
             if len(encoded) != encoded_size:
                 return None
-    except (OSError, ValueError):
+    except Exception:
         return None
     if not budget.consume(len(encoded)):
         return None
@@ -787,6 +835,98 @@ def registered_preview_data_uri(
         guessed = mimetypes.guess_type(parts[-1])[0] or ""
         mime = guessed if guessed in _SUPPORTED_PREVIEW_MIMES else "image/jpeg"
     return f"data:{mime};base64,{encoded}"
+
+
+def registered_native_crop_data_uri(
+    asset: dict,
+    box: object,
+    artifact_dir: str | None,
+    budget: EvidenceBudget,
+) -> str | None:
+    native_path = asset.get("path")
+    parts = _registered_relative_parts(native_path)
+    width = asset.get("width")
+    height = asset.get("height")
+    registered_sha256 = _registered_sha256(asset.get("sha256"))
+    if (
+        not artifact_dir
+        or parts is None
+        or registered_sha256 is None
+        or not isinstance(width, int)
+        or isinstance(width, bool)
+        or not isinstance(height, int)
+        or isinstance(height, bool)
+        or width <= 0
+        or height <= 0
+    ):
+        return None
+    try:
+        max_bytes = _max_image_bytes()
+        max_pixels = _max_image_pixels()
+        if width * height > max_pixels:
+            return None
+        crop_box = _validated_crop_box(
+            box,
+            width=width,
+            height=height,
+            max_pixels=max_pixels,
+        )
+        remaining_encoded_bytes = max(
+            0,
+            budget.max_bytes - budget.used_bytes,
+        )
+        payload_limit = min(
+            max_bytes,
+            _max_raw_size_for_base64_budget(remaining_encoded_bytes),
+        )
+        if payload_limit <= 0:
+            return None
+        with _open_registered_artifact_regular(
+            artifact_dir,
+            native_path,
+            verify_stable=True,
+        ) as fh:
+            if os.fstat(fh.fileno()).st_size > max_bytes:
+                return None
+            native_sha256 = _sha256_fd(fh.fileno())
+            fh.seek(0)
+            if native_sha256 != registered_sha256:
+                return None
+            try:
+                from PIL import Image
+            except ImportError:
+                return None
+            with Image.open(fh) as image:
+                if image.size != (width, height):
+                    return None
+                image.load()
+                crop = image.crop(crop_box)
+            try:
+                encoded_crop = crop
+                if crop.mode not in _PNG_NATIVE_MODES:
+                    encoded_crop = crop.convert(
+                        "RGBA" if "A" in crop.getbands() else "RGB"
+                    )
+                try:
+                    payload_buffer = _BoundedBytesIO(payload_limit)
+                    encoded_crop.save(payload_buffer, format="PNG")
+                    payload = payload_buffer.getvalue()
+                finally:
+                    if encoded_crop is not crop:
+                        encoded_crop.close()
+            finally:
+                crop.close()
+    except Exception:
+        return None
+    if len(payload) > max_bytes:
+        return None
+    encoded_size = _base64_encoded_size(len(payload))
+    if not budget.can_consume(encoded_size):
+        return None
+    encoded = base64.b64encode(payload).decode("ascii")
+    if len(encoded) != encoded_size or not budget.consume(encoded_size):
+        return None
+    return f"data:image/png;base64,{encoded}"
 
 
 def write_native_pair_evidence(
@@ -883,51 +1023,59 @@ def write_native_pair_evidence(
             root_fd=pinned_root_fd,
         ) as directory_fds:
             root_fd, images_fd, evidence_fd = directory_fds
-            budget.initialize_from_images_fd(images_fd)
-            staged: list[tuple[str, int, str]] = []
-            publication_incomplete = False
-            try:
-                temp_name, temp_fd = _stage_image(
-                    crop_a,
-                    evidence_fd,
-                    format_a,
-                    **save_a,
-                )
-                staged.append((temp_name, temp_fd, crop_a_path.name))
-                _verify_evidence_directories(
-                    root,
-                    root_fd,
-                    images_fd,
-                    evidence_fd,
-                )
-                temp_name, temp_fd = _stage_image(
-                    crop_b,
-                    evidence_fd,
-                    format_b,
-                    **save_b,
-                )
-                staged.append((temp_name, temp_fd, crop_b_path.name))
-                temp_name, temp_fd = _stage_image(
-                    canvas,
-                    evidence_fd,
-                    "JPEG",
-                    quality=88,
-                    optimize=True,
-                )
-                staged.append((temp_name, temp_fd, preview_path.name))
-                existing_size = sum(
-                    regular_file_size(evidence_fd, final_name)
-                    for _, _, final_name in staged
-                )
-                staged_size = sum(
-                    os.fstat(temp_fd).st_size
-                    for _, temp_fd, _ in staged
-                )
-                budget.require_replacement(
-                    existing_size=existing_size,
-                    staged_size=staged_size,
-                )
+            with image_publication_lock(root_fd):
+                staged: list[tuple[str, int, str]] = []
                 try:
+                    temp_name, temp_fd = _stage_image(
+                        crop_a,
+                        evidence_fd,
+                        format_a,
+                        **save_a,
+                    )
+                    staged.append((temp_name, temp_fd, crop_a_path.name))
+                    _verify_evidence_directories(
+                        root,
+                        root_fd,
+                        images_fd,
+                        evidence_fd,
+                    )
+                    temp_name, temp_fd = _stage_image(
+                        crop_b,
+                        evidence_fd,
+                        format_b,
+                        **save_b,
+                    )
+                    staged.append((temp_name, temp_fd, crop_b_path.name))
+                    temp_name, temp_fd = _stage_image(
+                        canvas,
+                        evidence_fd,
+                        "JPEG",
+                        quality=88,
+                        optimize=True,
+                    )
+                    staged.append((temp_name, temp_fd, preview_path.name))
+                    budget.resynchronize_from_images_fd(
+                        images_fd,
+                        excluded_entries={
+                            ("evidence", temp_name): (
+                                os.fstat(temp_fd).st_dev,
+                                os.fstat(temp_fd).st_ino,
+                            )
+                            for temp_name, temp_fd, _ in staged
+                        },
+                    )
+                    existing_size = sum(
+                        regular_file_size(evidence_fd, final_name)
+                        for _, _, final_name in staged
+                    )
+                    staged_size = sum(
+                        os.fstat(temp_fd).st_size
+                        for _, temp_fd, _ in staged
+                    )
+                    budget.require_replacement(
+                        existing_size=existing_size,
+                        staged_size=staged_size,
+                    )
                     _publish_staged_images(
                         root,
                         root_fd,
@@ -935,21 +1083,22 @@ def write_native_pair_evidence(
                         evidence_fd,
                         staged,
                     )
-                except _EvidencePublicationRecoveryError:
-                    publication_incomplete = True
-                    raise
-                budget.commit_replacement(
-                    existing_size=existing_size,
-                    staged_size=staged_size,
-                )
-            finally:
-                try:
+                    budget.commit_replacement(
+                        existing_size=existing_size,
+                        staged_size=staged_size,
+                    )
+                finally:
+                    active_error = sys.exc_info()[0] is not None
                     for temp_name, temp_fd, _ in staged:
                         os.close(temp_fd)
                         _unlink_at(temp_name, evidence_fd)
-                finally:
-                    if publication_incomplete:
+                    try:
                         budget.resynchronize_from_images_fd(images_fd)
+                        if not active_error:
+                            budget.ensure_within_limit()
+                    except Exception:
+                        if not active_error:
+                            raise
     return {
         "crop_a_path": _relative_path(crop_a_path, root),
         "crop_b_path": _relative_path(crop_b_path, root),

@@ -29,7 +29,7 @@ def test_reused_axis_progression_demoted_out_of_high():
 
 
 def test_one_off_non_integer_progression_keeps_high():
-    # a single non-integer progression (possible linear-fill fabrication) stays HIGH
+    # a single non-integer progression (possible linear-fill inconsistency) stays HIGH
     blocks = [_block("Fig 1", [_prog(2.5, 6, 2.5, sev="high")])]
     _demote_reused_progressions(blocks)
     f = blocks[0]["progressions"][0]

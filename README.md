@@ -16,7 +16,7 @@
 
 `paperconan` 是一个 **论文源数据 sanity check** 工具。你给它一个目录（`.xlsx` / 旧版 `.xls` / `.xlsm` / `.csv` / `.tsv`，也可以混放补充材料 `.pdf` / `.docx` 里的结构化表格，以及经 `--images` 明确启用的本地图像），它运行数值检测器、登记图像资产，并把"值得人工复核的位置"交给外部 Agent 统一判断。
 
-**它输出的是 statistical signal，不是 misconduct verdict。** 最终判断仍要看原表、figure legend、Methods、作者回应和期刊/机构核实。
+**它输出的是 statistical signal，不是作者意图判断。** 最终判断仍要看原表、figure legend、Methods、作者回应和期刊/机构核实。
 
 它最常见、也最被推荐的用法，是 **让 AI agent（Claude Code / Codex 等）搭配本仓库的 skill 来跑**：你用自然语言提需求，agent 调真实的 Python 检测器、解析结果、按规则解读，而不是肉眼猜数字。下面就以这个场景为主线。纯 CLI / Python 库用法见 [命令行与库参考](docs/cli.md)。
 
@@ -29,7 +29,7 @@
 
 **不做什么：**
 
-- 不判断"是不是造假"，也不替代统计学审稿
+- 不判断作者意图或责任，也不替代统计学审稿
 - 不自主判断 Western blot、显微镜图、凝胶图或图像拼接；图像语义复核由能读取本地图片的外部多模态 Agent 完成
 - 不从柱状图 / 折线图像素里数字化数据点
 - 不配置模型 API、密钥或 provider SDK；确定性 `image_findings` 只是可选提示，不是完整复核清单
@@ -49,7 +49,7 @@ paperconan 的 `constant_offset` 检测器**独立地**指出：`Source Data Fig
 
 这份判定还经过了一轮**红队对抗复核**（默认假设它是误报去反驳，10 类良性机制逐一排除）才标为 `confirmed`。同一次扫描其实抛出了 700+ 个信号，报告只把**扛得住反向质疑的那一条**纳入判定、其余降级——这份克制正是 signal-not-verdict 的落地。
 
-> **守住红线**：paperconan 输出的是**可复核的数值模式**，不是"造假"结论。上面的机构处理是**已公开事实**，不是 paperconan 的判定。工具只负责把任何人都能复现的信号定位清楚；是否上升为不端，仍要靠原始数据、作者回应和机构/期刊核实。
+> **守住红线**：paperconan 输出的是**可复核的数值模式**，不是作者意图结论。上面的机构处理是**已公开事实**，不是 paperconan 的判定。工具只负责把任何人都能复现的信号定位清楚；后续判断仍要靠原始数据、作者回应和机构/期刊核实。
 >
 > 复现这份报告的完整命令见 [报告与调参 › 判定后 HTML 报告](docs/reports.md#判定后-html-报告)。
 
@@ -103,7 +103,7 @@ echo '@'"$(pwd)"'/paperconan/skills/paperconan/SKILL.md' >> AGENTS.md
 
 [`skills/paperconan/SKILL.md`](skills/paperconan/SKILL.md) 是 agent 的入口，它强制 agent 跑真实检测器、按 `references/` 里的规则解读，并守住 **signal-not-verdict** 红线。
 
-skill 里还包含公开可复用的判定协议：[`adjudication-tiers.md`](skills/paperconan/references/adjudication-tiers.md) 定义 Tier 1/2/3、`KEEP` / `DROP` / `NEEDS_HUMAN`，[`report-templates.md`](skills/paperconan/references/report-templates.md) 定义短报告和正式 8 节报告，[`adversarial-review.md`](skills/paperconan/references/adversarial-review.md) 定义红队复核流程。这里的 Tier 只表示复核优先级和无辜解释难度，**不是造假概率**。
+skill 里还包含公开可复用的判定协议：[`adjudication-tiers.md`](skills/paperconan/references/adjudication-tiers.md) 定义 Tier 1/2/3、`KEEP` / `DROP` / `NEEDS_HUMAN`，[`report-templates.md`](skills/paperconan/references/report-templates.md) 定义短报告和正式 8 节报告，[`adversarial-review.md`](skills/paperconan/references/adversarial-review.md) 定义红队复核流程。这里的 Tier 只表示复核优先级和无辜解释难度，**不是作者意图判断**。
 
 ### 3. 直接用自然语言提需求
 
