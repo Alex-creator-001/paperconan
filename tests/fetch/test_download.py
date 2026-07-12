@@ -1060,6 +1060,350 @@ def _archive_bytes(kind, member_name="tables/data.csv", data=b"a,b\n1,2\n"):
     return payload.getvalue()
 
 
+def _zero_byte_archive_bytes(kind, prefix, count):
+    payload = io.BytesIO()
+    if kind == "oa":
+        with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            for index in range(count):
+                info = tarfile.TarInfo(f"tables/{prefix}-{index:03d}.csv")
+                info.size = 0
+                archive.addfile(info, io.BytesIO())
+    else:
+        with zipfile.ZipFile(payload, "w") as archive:
+            for index in range(count):
+                archive.writestr(f"tables/{prefix}-{index:03d}.csv", b"")
+    return payload.getvalue()
+
+
+def test_tar_member_ceiling_streams_without_materializing_member_list(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _zero_byte_archive_bytes("oa", "oa", 4)
+    download_calls = []
+
+    def fake_download(url, destination, **kwargs):
+        download_calls.append(url)
+        if url != "https://example.test/oa":
+            raise AssertionError("shared archive member ceiling was not enforced")
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    def fail_getmembers(archive):
+        raise AssertionError("tar member list was materialized")
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(tarfile.TarFile, "getmembers", fail_getmembers)
+    monkeypatch.setattr(_download, "_MAX_PUBLISHED_FILES_PER_CANDIDATE", 10)
+    monkeypatch.setattr(_download, "_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE", 2)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "oa_package": {
+            "url": "https://example.test/oa",
+            "name": "oa.tar.gz",
+        },
+        "supplementary_archive": {
+            "url": "https://example.test/supplementary",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(out_dir),
+        include_images=True,
+    )
+
+    downloaded_names = [Path(path).name for path in summary["downloaded"]]
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert download_calls == ["https://example.test/oa"]
+    assert downloaded_names == ["oa-000.csv", "oa-001.csv"]
+    assert [entry["file"] for entry in sidecar["downloads"]] == downloaded_names
+    assert any(
+        "archive member cardinality ceiling" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(out_dir.glob(".paperconan-*"))
+
+
+def test_zero_byte_archive_member_ceiling_is_shared_across_tar_and_zip(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payloads = {
+        "https://example.test/oa": _zero_byte_archive_bytes("oa", "oa", 2),
+        "https://example.test/supplementary": _zero_byte_archive_bytes(
+            "supplementary",
+            "supplementary",
+            4,
+        ),
+    }
+
+    def fake_download(url, destination, **kwargs):
+        payload = payloads[url]
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_MAX_PUBLISHED_FILES_PER_CANDIDATE", 10)
+    monkeypatch.setattr(_download, "_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE", 3)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "oa_package": {
+            "url": "https://example.test/oa",
+            "name": "oa.tar.gz",
+        },
+        "supplementary_archive": {
+            "url": "https://example.test/supplementary",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(out_dir),
+        include_images=True,
+    )
+
+    downloaded_names = [Path(path).name for path in summary["downloaded"]]
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    published_names = sorted(
+        path.name
+        for path in out_dir.iterdir()
+        if path.name != _download.SOURCE_SIDECAR
+    )
+    assert downloaded_names == [
+        "oa-000.csv",
+        "oa-001.csv",
+        "supplementary-000.csv",
+    ]
+    assert published_names == sorted(downloaded_names)
+    assert [entry["file"] for entry in sidecar["downloads"]] == sorted(
+        downloaded_names
+    )
+    assert any(
+        "archive member cardinality ceiling" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(out_dir.glob(".paperconan-*"))
+
+
+def test_published_file_ceiling_spans_direct_and_all_archive_sources(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payloads = {
+        "https://example.test/oa": _zero_byte_archive_bytes("oa", "oa", 2),
+        "https://example.test/supplementary": _zero_byte_archive_bytes(
+            "supplementary",
+            "supplementary",
+            2,
+        ),
+    }
+
+    def fake_download(url, destination, **kwargs):
+        payload = payloads.get(url, b"")
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_MAX_PUBLISHED_FILES_PER_CANDIDATE", 3)
+    monkeypatch.setattr(_download, "_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE", 10)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "direct.csv",
+            "download_url": "https://example.test/direct.csv",
+        }],
+        "oa_package": {
+            "url": "https://example.test/oa",
+            "name": "oa.tar.gz",
+        },
+        "supplementary_archive": {
+            "url": "https://example.test/supplementary",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(out_dir),
+        include_images=True,
+    )
+
+    downloaded_names = [Path(path).name for path in summary["downloaded"]]
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert downloaded_names == ["direct.csv", "oa-000.csv", "oa-001.csv"]
+    assert len(sidecar["downloads"]) == 3
+    assert {
+        path.name
+        for path in out_dir.iterdir()
+        if path.name != _download.SOURCE_SIDECAR
+    } == set(downloaded_names)
+    assert any(
+        "published file cardinality ceiling" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(out_dir.glob(".paperconan-*"))
+
+
+@pytest.mark.parametrize("existing_sidecar", [False, True])
+def test_oversized_generated_sidecar_is_not_published(
+    monkeypatch,
+    tmp_path,
+    existing_sidecar,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    previous_bytes = b'{"cand_id":"previous:1","downloads":[]}'
+    if existing_sidecar:
+        sidecar.write_bytes(previous_bytes)
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, b"")
+        return {
+            "ok": True,
+            "path": destination,
+            "size": 0,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_MAX_SOURCE_SIDECAR_BYTES", 32)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "title": "generated provenance exceeds the configured bound",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert any(
+        "new provenance sidecar exceeds" in item["reason"]
+        for item in summary["skipped"]
+    )
+    if existing_sidecar:
+        assert sidecar.read_bytes() == previous_bytes
+    else:
+        assert not sidecar.exists()
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))
+
+
+def test_sidecar_commit_and_rollback_failures_preserve_recovery_context(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    sidecar.write_bytes(b'{"cand_id":"previous:1","downloads":[]}')
+    retained_backup_names = []
+    real_write_source_sidecar = _download._write_source_sidecar
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, b"")
+        return {
+            "ok": True,
+            "path": destination,
+            "size": 0,
+            "source_url": url,
+        }
+
+    def track_publication(cand, output, downloads=None):
+        publication = real_write_source_sidecar(
+            cand,
+            output,
+            downloads=downloads,
+        )
+        retained_backup_names.append(publication.backup_name)
+        return publication
+
+    def fail_commit(publication):
+        raise OSError(
+            "commit unavailable at "
+            "https://user:secret@example.test/source?token=commit-secret"
+        )
+
+    def fail_rollback(publication):
+        raise OSError(
+            "rollback unavailable at "
+            "https://user:secret@example.test/recovery?token=rollback-secret"
+        )
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_write_source_sidecar", track_publication)
+    monkeypatch.setattr(_download._SidecarPublication, "commit", fail_commit)
+    monkeypatch.setattr(_download._SidecarPublication, "rollback", fail_rollback)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert summary["downloaded"] == []
+    assert len(retained_backup_names) == 1
+    backup_name = retained_backup_names[0]
+    assert backup_name
+    assert (out_dir / backup_name).exists()
+    reason = summary["skipped"][-1]["reason"]
+    assert "commit unavailable" in reason
+    assert "rollback unavailable" in reason
+    assert backup_name in reason
+    assert "commit-secret" not in reason
+    assert "rollback-secret" not in reason
+    assert "user:secret" not in reason
+
+
 @pytest.mark.parametrize("publication_kind", ["direct", "oa", "supplementary"])
 def test_download_candidate_rejects_equal_size_in_place_content_mutation(
     monkeypatch,

@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import stat
 import tarfile
@@ -33,11 +34,18 @@ _ARCHIVE_MAX = 250 * 1024 * 1024    # 250 MB — whole supplementary zip
 # a paper's out_dir reaches this. Default 1.5 GB; raise PAPERCONAN_MAX_PAPER_MB on big disks.
 _MAX_PAPER_MB = float(os.environ.get("PAPERCONAN_MAX_PAPER_MB", "1500"))
 _MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
+_MAX_PUBLISHED_FILES_PER_CANDIDATE = 1000
+_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE = 1000
 _MAX_SOURCE_SIDECAR_BYTES = 8 * 1024 * 1024
 _FILE_COPY_CHUNK_BYTES = 64 * 1024
+_URL_IN_ERROR = re.compile(r"https?://[^\s]+")
 
 
 class _UnstableRegularFileError(OSError):
+    pass
+
+
+class _SourceSidecarLimitError(ValueError):
     pass
 
 
@@ -50,6 +58,26 @@ class _PublishedOutputFile:
 
     def display_path(self, output: _PinnedOutputDirectory) -> str:
         return os.path.join(output.path, self.filename)
+
+
+@dataclass
+class _CandidateCardinality:
+    max_published_files: int
+    max_archive_members: int
+    published_files: int = 0
+    archive_members: int = 0
+
+    def can_publish(self) -> bool:
+        return self.published_files < self.max_published_files
+
+    def record_publication(self) -> None:
+        self.published_files += 1
+
+    def claim_archive_member(self) -> bool:
+        if self.archive_members >= self.max_archive_members:
+            return False
+        self.archive_members += 1
+        return True
 
 
 class _PinnedOutputDirectory:
@@ -567,6 +595,37 @@ def _archive_staging_file(
     )
 
 
+def _published_file_limit_reason(cardinality: _CandidateCardinality) -> str:
+    return (
+        "published file cardinality ceiling reached "
+        f"({cardinality.max_published_files}); remaining files were skipped"
+    )
+
+
+def _archive_member_limit_reason(cardinality: _CandidateCardinality) -> str:
+    return (
+        "archive member cardinality ceiling reached "
+        f"({cardinality.max_archive_members}); remaining eligible members were skipped"
+    )
+
+
+def _append_limit_reason(reasons: list[str] | None, reason: str) -> None:
+    if reasons is not None and reason not in reasons:
+        reasons.append(reason)
+
+
+def _archive_blocking_reason(
+    cardinality: _CandidateCardinality | None,
+) -> str | None:
+    if cardinality is None:
+        return None
+    if not cardinality.can_publish():
+        return _published_file_limit_reason(cardinality)
+    if cardinality.archive_members >= cardinality.max_archive_members:
+        return _archive_member_limit_reason(cardinality)
+    return None
+
+
 def _extract_selected_zip(
     zip_bytes,
     out_dir,
@@ -574,6 +633,8 @@ def _extract_selected_zip(
     include_images=False,
     max_member_bytes=_DEFAULT_MAX,
     return_entries=False,
+    cardinality=None,
+    limit_reasons=None,
 ):
     extracted = []
     written = _dir_size(out_dir)
@@ -594,6 +655,19 @@ def _extract_selected_zip(
                 or written + info.file_size > _MAX_PAPER_BYTES
             ):
                 continue
+            if cardinality is not None:
+                if not cardinality.can_publish():
+                    _append_limit_reason(
+                        limit_reasons,
+                        _published_file_limit_reason(cardinality),
+                    )
+                    break
+                if not cardinality.claim_archive_member():
+                    _append_limit_reason(
+                        limit_reasons,
+                        _archive_member_limit_reason(cardinality),
+                    )
+                    break
             with zf.open(info) as src:
                 data = src.read(max_member_bytes + 1)
                 if len(data) > max_member_bytes:
@@ -604,6 +678,8 @@ def _extract_selected_zip(
                 data,
                 _return_entry=return_entries,
             )
+            if cardinality is not None:
+                cardinality.record_publication()
             written += len(data)
             extracted.append(dest)
     return extracted
@@ -616,6 +692,8 @@ def _extract_selected_tar(
     include_images=False,
     max_member_bytes=_DEFAULT_MAX,
     return_entries=False,
+    cardinality=None,
+    limit_reasons=None,
 ):
     extracted = []
     written = _dir_size(out_dir)
@@ -627,7 +705,7 @@ def _extract_selected_tar(
     else:
         archive = tarfile.open(tar_source, "r:gz")
     with archive as tf:
-        for member in tf.getmembers():
+        for member in tf:
             if written >= _MAX_PAPER_BYTES:
                 break
             if not member.isfile():
@@ -640,6 +718,19 @@ def _extract_selected_tar(
                 or written + member.size > _MAX_PAPER_BYTES
             ):
                 continue
+            if cardinality is not None:
+                if not cardinality.can_publish():
+                    _append_limit_reason(
+                        limit_reasons,
+                        _published_file_limit_reason(cardinality),
+                    )
+                    break
+                if not cardinality.claim_archive_member():
+                    _append_limit_reason(
+                        limit_reasons,
+                        _archive_member_limit_reason(cardinality),
+                    )
+                    break
             src = tf.extractfile(member)
             if src is None:
                 continue
@@ -652,6 +743,8 @@ def _extract_selected_tar(
                 data,
                 _return_entry=return_entries,
             )
+            if cardinality is not None:
+                cardinality.record_publication()
             written += len(data)
             extracted.append(dest)
     return extracted
@@ -746,8 +839,13 @@ def _download_oa_package(
     max_bytes,
     *,
     include_images=False,
+    cardinality=None,
 ):
     """Download the static PMC OA tar.gz, extract selected members, drop the tarball."""
+    blocking_reason = _archive_blocking_reason(cardinality)
+    if blocking_reason is not None:
+        skipped.append({"name": pkg.get("name"), "reason": blocking_reason})
+        return []
     tmp = None
     try:
         tmp = _archive_staging_file(out_dir, ".tar.gz")
@@ -756,6 +854,7 @@ def _download_oa_package(
             skipped.append({"name": pkg.get("name"), "reason": res.get("skipped_reason")})
             return []
         try:
+            limit_reasons = []
             with _open_download_staging(tmp) as archive_fh:
                 extracted = _extract_selected_tar(
                     archive_fh,
@@ -763,6 +862,8 @@ def _download_oa_package(
                     include_images=include_images,
                     max_member_bytes=max_bytes,
                     return_entries=True,
+                    cardinality=cardinality,
+                    limit_reasons=limit_reasons,
                 )
         except _UnstableRegularFileError as e:
             skipped.append({
@@ -774,6 +875,10 @@ def _download_oa_package(
             _verify_published_output_file(out_dir, entry)
         out_dir.verify()
         published_outputs.extend(extracted)
+        skipped.extend(
+            {"name": pkg.get("name"), "reason": reason}
+            for reason in limit_reasons
+        )
         return extracted
     except (tarfile.TarError, OSError, ValueError) as e:
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
@@ -791,11 +896,16 @@ def _download_supplementary_archive(
     archive_max=_ARCHIVE_MAX,
     *,
     include_images=False,
+    cardinality=None,
 ):
     """Fetch a supplementary zip, extract selected members, and drop the zip.
 
     The archive downloads with the larger ``archive_max`` cap; each extracted member is
     still capped at the per-file ``max_bytes``."""
+    blocking_reason = _archive_blocking_reason(cardinality)
+    if blocking_reason is not None:
+        skipped.append({"name": arch.get("name"), "reason": blocking_reason})
+        return []
     tmp_zip = None
     try:
         tmp_zip = _archive_staging_file(out_dir, ".zip")
@@ -804,6 +914,7 @@ def _download_supplementary_archive(
             skipped.append({"name": arch.get("name"), "reason": res.get("skipped_reason")})
             return []
         try:
+            limit_reasons = []
             with _open_download_staging(tmp_zip) as archive_fh:
                 extracted = _extract_selected_zip(
                     archive_fh.read(),
@@ -811,6 +922,8 @@ def _download_supplementary_archive(
                     include_images=include_images,
                     max_member_bytes=max_bytes,
                     return_entries=True,
+                    cardinality=cardinality,
+                    limit_reasons=limit_reasons,
                 )
         except _UnstableRegularFileError as e:
             skipped.append({
@@ -822,6 +935,10 @@ def _download_supplementary_archive(
             _verify_published_output_file(out_dir, entry)
         out_dir.verify()
         published_outputs.extend(extracted)
+        skipped.extend(
+            {"name": arch.get("name"), "reason": reason}
+            for reason in limit_reasons
+        )
         return extracted
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
         reason = (
@@ -844,6 +961,26 @@ def _safe_source_url(url: object) -> str | None:
         return None
     parsed = urllib.parse.urlsplit(url)
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _safe_failure_context(exc: BaseException) -> str:
+    text = str(exc) or type(exc).__name__
+
+    def redact_url(match: re.Match) -> str:
+        parsed = urllib.parse.urlsplit(match.group(0))
+        hostname = parsed.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        netloc = f"{hostname}:{port}" if port is not None else hostname
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, "", "")
+        )
+
+    return _URL_IN_ERROR.sub(redact_url, text)
 
 
 def _hash_exact_fd(fd: int, size: int) -> str:
@@ -1017,7 +1154,7 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
                 )
                 if publication is not None:
                     publication.commit()
-        except OSError:
+        except (OSError, _SourceSidecarLimitError):
             pass
         return
     temp_name = None
@@ -1036,6 +1173,12 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
             current = None
         if current is not None and not stat.S_ISREG(current.st_mode):
             return None
+        encoded = json.dumps(prov, indent=2, default=str).encode("utf-8")
+        if len(encoded) > _MAX_SOURCE_SIDECAR_BYTES:
+            raise _SourceSidecarLimitError(
+                "new provenance sidecar exceeds "
+                f"{_MAX_SOURCE_SIDECAR_BYTES}-byte limit"
+            )
         temp_name = f".paperconan-sidecar-{secrets.token_hex(8)}"
         temp_fd = os.open(
             temp_name,
@@ -1043,9 +1186,9 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
             0o600,
             dir_fd=out_dir.fd,
         )
-        with os.fdopen(temp_fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(temp_fd, "wb") as fh:
             temp_fd = -1
-            json.dump(prov, fh, indent=2, default=str)
+            fh.write(encoded)
             fh.flush()
             os.fsync(fh.fileno())
         out_dir.verify()
@@ -1065,6 +1208,8 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
         backup_name = None
         out_dir.verify()
         return publication
+    except _SourceSidecarLimitError:
+        raise
     except (OSError, ValueError):
         if publication is not None:
             try:
@@ -1135,7 +1280,17 @@ def download_candidate(
         published_outputs, skipped = [], []
         provenance_files = []
         direct_asset_types = set()
+        cardinality = _CandidateCardinality(
+            max_published_files=_MAX_PUBLISHED_FILES_PER_CANDIDATE,
+            max_archive_members=_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE,
+        )
         for f in files:
+            if not cardinality.can_publish():
+                skipped.append({
+                    "name": f["name"],
+                    "reason": _published_file_limit_reason(cardinality),
+                })
+                break
             if _dir_size(output) > _MAX_PAPER_BYTES:
                 skipped.append({
                     "name": f["name"],
@@ -1187,6 +1342,7 @@ def download_candidate(
                             "reason": f"secure publication failed: {exc}",
                         })
                         continue
+                    cardinality.record_publication()
                     published_outputs.append(published)
                     direct_asset_types.add(asset_type(f.get("name") or ""))
                     provenance_files.append(_provenance_entry(
@@ -1211,6 +1367,7 @@ def download_candidate(
                 skipped,
                 max_bytes,
                 include_images=include_images,
+                cardinality=cardinality,
             )
             provenance_files.extend(
                 _provenance_entry(
@@ -1235,6 +1392,7 @@ def download_candidate(
                 max_bytes,
                 archive_max=archive_max,
                 include_images=include_images,
+                cardinality=cardinality,
             )
             provenance_files.extend(
                 _provenance_entry(
@@ -1252,11 +1410,17 @@ def download_candidate(
             for entry in published_outputs:
                 _verify_published_output_file(output, entry)
             output.verify()
-            sidecar_publication = _write_source_sidecar(
-                cand,
-                output,
-                downloads=list(by_file.values()),
-            )
+            try:
+                sidecar_publication = _write_source_sidecar(
+                    cand,
+                    output,
+                    downloads=list(by_file.values()),
+                )
+            except _SourceSidecarLimitError as exc:
+                skipped.append({
+                    "name": SOURCE_SIDECAR,
+                    "reason": str(exc),
+                })
             for entry in published_outputs:
                 _verify_published_output_file(output, entry)
             output.verify()
@@ -1283,14 +1447,26 @@ def download_candidate(
                 if sidecar_publication is not None:
                     sidecar_publication.commit()
             except (OSError, ValueError) as exc:
+                reason = (
+                    "provenance sidecar commit failed: "
+                    f"{_safe_failure_context(exc)}"
+                )
                 if sidecar_publication is not None:
                     try:
                         sidecar_publication.rollback()
-                    except (OSError, ValueError):
-                        pass
+                    except (OSError, ValueError) as rollback_exc:
+                        reason += (
+                            "; provenance sidecar rollback failed: "
+                            f"{_safe_failure_context(rollback_exc)}"
+                        )
+                        if sidecar_publication.backup_name is not None:
+                            reason += (
+                                "; retained recovery backup: "
+                                f"{os.path.basename(sidecar_publication.backup_name)}"
+                            )
                 skipped.append({
                     "name": cand.get("cand_id"),
-                    "reason": f"provenance sidecar commit failed: {exc}",
+                    "reason": reason,
                 })
                 downloaded = []
             else:
