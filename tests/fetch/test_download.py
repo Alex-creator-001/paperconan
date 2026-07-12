@@ -1,7 +1,9 @@
+from contextlib import contextmanager
 import hashlib
 import io
 import json
 import os
+import struct
 import tarfile
 import zipfile
 from pathlib import Path
@@ -1058,6 +1060,439 @@ def _archive_bytes(kind, member_name="tables/data.csv", data=b"a,b\n1,2\n"):
         with zipfile.ZipFile(payload, "w") as archive:
             archive.writestr(member_name, data)
     return payload.getvalue()
+
+
+def _two_member_archive_bytes(kind):
+    payload = io.BytesIO()
+    members = [
+        ("tables/first.csv", b"first,value\n1,2\n"),
+        ("tables/second.csv", b"second,value\n3,4\n"),
+    ]
+    if kind == "oa":
+        with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+    else:
+        with zipfile.ZipFile(payload, "w") as archive:
+            for name, data in members:
+                archive.writestr(name, data)
+    return payload.getvalue()
+
+
+def _classic_eocd_bytes(
+    *,
+    disk_number=0,
+    central_directory_disk=0,
+    entries_on_disk=0,
+    total_entries=0,
+    central_directory_size=0,
+    central_directory_offset=0,
+    comment=b"",
+):
+    return struct.pack(
+        "<4s4H2IH",
+        b"PK\x05\x06",
+        disk_number,
+        central_directory_disk,
+        entries_on_disk,
+        total_entries,
+        central_directory_size,
+        central_directory_offset,
+        len(comment),
+    ) + comment
+
+
+def _zip64_archive_bytes(files=()):
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        for name, data in files:
+            archive.writestr(name, data)
+    classic = payload.getvalue()
+    eocd_offset = len(classic) - 22
+    (
+        signature,
+        disk_number,
+        central_directory_disk,
+        entries_on_disk,
+        total_entries,
+        central_directory_size,
+        central_directory_offset,
+        comment_size,
+    ) = struct.unpack("<4s4H2IH", classic[eocd_offset:])
+    assert signature == b"PK\x05\x06"
+    assert disk_number == central_directory_disk == 0
+    assert entries_on_disk == total_entries
+    assert comment_size == 0
+    zip64_offset = eocd_offset
+    zip64_eocd = struct.pack(
+        "<4sQ2H2I4Q",
+        b"PK\x06\x06",
+        44,
+        45,
+        45,
+        0,
+        0,
+        total_entries,
+        total_entries,
+        central_directory_size,
+        central_directory_offset,
+    )
+    locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, zip64_offset, 1)
+    sentinel_eocd = _classic_eocd_bytes(
+        entries_on_disk=0xFFFF,
+        total_entries=0xFFFF,
+        central_directory_size=0xFFFFFFFF,
+        central_directory_offset=0xFFFFFFFF,
+    )
+    return classic[:eocd_offset] + zip64_eocd + locator + sentinel_eocd
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_later_publication_failure_keeps_verified_partial_entry(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    existing = out_dir / "first.csv"
+    existing.write_bytes(b"pre-existing")
+    payload = _two_member_archive_bytes(archive_kind)
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    real_write_collision_safe = _download._write_collision_safe
+    publication_calls = 0
+
+    def fail_second_publication(*args, **kwargs):
+        nonlocal publication_calls
+        publication_calls += 1
+        if publication_calls == 2:
+            raise OSError("later archive member publication unavailable")
+        return real_write_collision_safe(*args, **kwargs)
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_write_collision_safe",
+        fail_second_publication,
+    )
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": f"{archive_kind}.archive",
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert publication_calls == 2
+    assert existing.read_bytes() == b"pre-existing"
+    assert len(summary["downloaded"]) == 1
+    published = Path(summary["downloaded"][0])
+    assert published.name != existing.name
+    assert published.read_bytes() == b"first,value\n1,2\n"
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert [entry["file"] for entry in sidecar["downloads"]] == [
+        published.name
+    ]
+    assert sum(
+        item["file"] == published.name
+        for item in sidecar["downloads"]
+    ) == 1
+    assert any(
+        "publication unavailable" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not (out_dir / "second.csv").exists()
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+def test_excessive_zip_entries_are_rejected_before_zipfile_construction(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _zero_byte_archive_bytes("supplementary", "entry", 3)
+    zipfile_init_called = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    def fail_zipfile_init(archive, *args, **kwargs):
+        nonlocal zipfile_init_called
+        zipfile_init_called = True
+        raise AssertionError("ZipFile was constructed before ZIP preflight")
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE",
+        2,
+        raising=False,
+    )
+    monkeypatch.setattr(zipfile.ZipFile, "__init__", fail_zipfile_init)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementary",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert zipfile_init_called is False
+    assert summary["downloaded"] == []
+    assert any(
+        "raw ZIP entry count" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(out_dir.glob("*.csv"))
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+
+
+def test_supplementary_zip_path_never_uses_unbounded_staged_read(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes("supplementary")
+    read_sizes = []
+    real_open_download_staging = _download._open_download_staging
+
+    class BoundedReader:
+        def __init__(self, source):
+            self._source = source
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            if size < 0:
+                raise AssertionError("unbounded staged ZIP read")
+            return self._source.read(size)
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+    @contextmanager
+    def tracked_open_download_staging(staging):
+        with real_open_download_staging(staging) as source:
+            yield BoundedReader(source)
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_open_download_staging",
+        tracked_open_download_staging,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementary",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert read_sizes
+    assert all(size >= 0 for size in read_sizes)
+
+
+def test_zip_preflight_accepts_archive_comment():
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr("tables/data.csv", b"a,b\n1,2\n")
+        archive.comment = b"source data comment with PK\x05\x06 marker"
+
+    count = _download._preflight_zip_entry_count(
+        io.BytesIO(payload.getvalue()),
+        max_entries=10,
+    )
+
+    assert count == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _classic_eocd_bytes(),
+        _zip64_archive_bytes(),
+    ],
+    ids=["classic", "zip64"],
+)
+def test_zip_preflight_accepts_empty_archives(payload):
+    count = _download._preflight_zip_entry_count(
+        io.BytesIO(payload),
+        max_entries=10,
+    )
+
+    assert count == 0
+
+
+def test_zip_preflight_accepts_valid_zip64_archive(tmp_path):
+    payload = _zip64_archive_bytes([
+        ("tables/data.csv", b"a,b\n1,2\n"),
+    ])
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    count = _download._preflight_zip_entry_count(
+        io.BytesIO(payload),
+        max_entries=10,
+    )
+    extracted = _download._extract_selected_zip(payload, str(out_dir))
+
+    assert count == 1
+    assert [Path(path).name for path in extracted] == ["data.csv"]
+
+
+def _ambiguous_eocd_bytes():
+    nested = _classic_eocd_bytes()
+    return _classic_eocd_bytes(comment=nested)
+
+
+def _zip64_without_locator_bytes():
+    return _classic_eocd_bytes(
+        entries_on_disk=0xFFFF,
+        total_entries=0xFFFF,
+        central_directory_size=0xFFFFFFFF,
+        central_directory_offset=0xFFFFFFFF,
+    )
+
+
+def _zip64_multidisk_locator_bytes():
+    payload = _zip64_archive_bytes()
+    locator_offset = len(payload) - 22 - 20
+    locator = struct.pack("<4sIQI", b"PK\x06\x07", 1, 0, 2)
+    return payload[:locator_offset] + locator + payload[locator_offset + 20:]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"PK\x05\x06truncated",
+        _classic_eocd_bytes(disk_number=1),
+        _ambiguous_eocd_bytes(),
+        _zip64_without_locator_bytes(),
+        _zip64_multidisk_locator_bytes(),
+        _zip64_archive_bytes()[:-98] + (
+            struct.pack(
+                "<4sQ2H2I4Q",
+                b"PK\x06\x06",
+                45,
+                45,
+                45,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+            + _zip64_archive_bytes()[-42:]
+        ),
+    ],
+    ids=[
+        "truncated-eocd",
+        "multi-disk-classic",
+        "ambiguous-eocd",
+        "missing-zip64-locator",
+        "multi-disk-zip64",
+        "invalid-zip64-record-size",
+    ],
+)
+def test_malformed_zip_metadata_is_rejected_before_zipfile_construction(
+    monkeypatch,
+    tmp_path,
+    payload,
+):
+    out_dir = tmp_path / "out"
+    zipfile_init_called = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    def fail_zipfile_init(archive, *args, **kwargs):
+        nonlocal zipfile_init_called
+        zipfile_init_called = True
+        raise AssertionError("ZipFile constructed for invalid ZIP metadata")
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(zipfile.ZipFile, "__init__", fail_zipfile_init)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementary",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert zipfile_init_called is False
+    assert summary["downloaded"] == []
+    assert any(
+        "archive processing unavailable" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(out_dir.glob("*.csv"))
+    assert not list(out_dir.glob(".paperconan-archive-*"))
 
 
 def _zero_byte_archive_bytes(kind, prefix, count):

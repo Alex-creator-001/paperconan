@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import stat
+import struct
 import tarfile
 import tempfile
 import time
@@ -36,9 +37,20 @@ _MAX_PAPER_MB = float(os.environ.get("PAPERCONAN_MAX_PAPER_MB", "1500"))
 _MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
 _MAX_PUBLISHED_FILES_PER_CANDIDATE = 1000
 _MAX_ARCHIVE_MEMBERS_PER_CANDIDATE = 1000
+_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE = 4096
 _MAX_SOURCE_SIDECAR_BYTES = 8 * 1024 * 1024
 _FILE_COPY_CHUNK_BYTES = 64 * 1024
 _URL_IN_ERROR = re.compile(r"https?://[^\s]+")
+_ZIP_EOCD = struct.Struct("<4s4H2IH")
+_ZIP64_LOCATOR = struct.Struct("<4sIQI")
+_ZIP64_EOCD = struct.Struct("<4sQ2H2I4Q")
+_ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP64_LOCATOR_SIGNATURE = b"PK\x06\x07"
+_ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
+_ZIP_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
+_ZIP_MAX_COMMENT_BYTES = 0xFFFF
+_ZIP16_SENTINEL = 0xFFFF
+_ZIP32_SENTINEL = 0xFFFFFFFF
 
 
 class _UnstableRegularFileError(OSError):
@@ -626,8 +638,223 @@ def _archive_blocking_reason(
     return None
 
 
+def _read_exact_zip_range(source, offset: int, size: int, label: str) -> bytes:
+    if offset < 0 or size < 0:
+        raise ValueError(f"ZIP {label} position is invalid")
+    source.seek(offset, os.SEEK_SET)
+    data = source.read(size)
+    if len(data) != size:
+        raise ValueError(f"ZIP {label} is truncated")
+    return data
+
+
+def _validate_zip_central_directory(
+    source,
+    *,
+    entry_count: int,
+    directory_size: int,
+    directory_offset: int,
+    record_position: int,
+    prefix_adjustment: int | None = None,
+) -> None:
+    if entry_count == 0:
+        if directory_size != 0 or directory_offset > record_position:
+            raise ValueError("ZIP central directory metadata is inconsistent")
+        return
+    if directory_size < entry_count * 46:
+        raise ValueError("ZIP central directory length is inconsistent")
+    actual_offset = record_position - directory_size
+    if actual_offset < directory_offset or actual_offset < 0:
+        raise ValueError("ZIP central directory position is invalid")
+    if (
+        prefix_adjustment is not None
+        and actual_offset - directory_offset != prefix_adjustment
+    ):
+        raise ValueError("ZIP central directory position is inconsistent")
+    signature = _read_exact_zip_range(
+        source,
+        actual_offset,
+        len(_ZIP_CENTRAL_DIRECTORY_SIGNATURE),
+        "central directory",
+    )
+    if signature != _ZIP_CENTRAL_DIRECTORY_SIGNATURE:
+        raise ValueError("ZIP central directory signature is invalid")
+
+
+def _preflight_zip_entry_count(source, *, max_entries: int) -> int:
+    if not isinstance(max_entries, int) or max_entries < 0:
+        raise ValueError("ZIP entry ceiling is invalid")
+    try:
+        source.seek(0, os.SEEK_END)
+        file_size = source.tell()
+    except (AttributeError, OSError, ValueError) as exc:
+        raise ValueError("ZIP source is not seekable") from exc
+    if file_size < _ZIP_EOCD.size:
+        raise ValueError("ZIP EOCD record is missing or truncated")
+
+    tail_size = min(
+        file_size,
+        _ZIP_EOCD.size + _ZIP_MAX_COMMENT_BYTES,
+    )
+    tail_offset = file_size - tail_size
+    tail = _read_exact_zip_range(source, tail_offset, tail_size, "EOCD tail")
+    candidates = []
+    for relative_offset in range(tail_size - _ZIP_EOCD.size, -1, -1):
+        fields = _ZIP_EOCD.unpack_from(tail, relative_offset)
+        if fields[0] != _ZIP_EOCD_SIGNATURE:
+            continue
+        comment_size = fields[-1]
+        record_position = tail_offset + relative_offset
+        if record_position + _ZIP_EOCD.size + comment_size == file_size:
+            candidates.append((record_position, fields))
+    if not candidates:
+        raise ValueError("ZIP EOCD record is missing or truncated")
+    if len(candidates) != 1:
+        raise ValueError("ZIP EOCD metadata is ambiguous")
+
+    record_position, fields = candidates[0]
+    (
+        _,
+        disk_number,
+        central_directory_disk,
+        entries_on_disk,
+        total_entries,
+        directory_size,
+        directory_offset,
+        _,
+    ) = fields
+    needs_zip64 = (
+        disk_number == _ZIP16_SENTINEL
+        or central_directory_disk == _ZIP16_SENTINEL
+        or entries_on_disk == _ZIP16_SENTINEL
+        or total_entries == _ZIP16_SENTINEL
+        or directory_size == _ZIP32_SENTINEL
+        or directory_offset == _ZIP32_SENTINEL
+    )
+
+    if not needs_zip64:
+        if disk_number != 0 or central_directory_disk != 0:
+            raise ValueError("multi-disk ZIP archives are unavailable")
+        if entries_on_disk != total_entries:
+            raise ValueError("ZIP entry counts are inconsistent")
+        if total_entries > max_entries:
+            raise ValueError(
+                f"raw ZIP entry count {total_entries} exceeds "
+                f"preflight ceiling {max_entries}"
+            )
+        _validate_zip_central_directory(
+            source,
+            entry_count=total_entries,
+            directory_size=directory_size,
+            directory_offset=directory_offset,
+            record_position=record_position,
+        )
+        return total_entries
+
+    locator_position = record_position - _ZIP64_LOCATOR.size
+    locator_data = _read_exact_zip_range(
+        source,
+        locator_position,
+        _ZIP64_LOCATOR.size,
+        "ZIP64 locator",
+    )
+    (
+        locator_signature,
+        zip64_disk,
+        declared_zip64_offset,
+        disk_count,
+    ) = _ZIP64_LOCATOR.unpack(locator_data)
+    if locator_signature != _ZIP64_LOCATOR_SIGNATURE:
+        raise ValueError("ZIP64 locator signature is invalid")
+    if zip64_disk != 0 or disk_count != 1:
+        raise ValueError("multi-disk ZIP64 archives are unavailable")
+
+    candidate_positions = [declared_zip64_offset]
+    inferred_position = locator_position - _ZIP64_EOCD.size
+    if inferred_position != declared_zip64_offset:
+        candidate_positions.append(inferred_position)
+    zip64_records = []
+    for candidate_position in candidate_positions:
+        if (
+            candidate_position < 0
+            or candidate_position + _ZIP64_EOCD.size > locator_position
+        ):
+            continue
+        data = _read_exact_zip_range(
+            source,
+            candidate_position,
+            _ZIP64_EOCD.size,
+            "ZIP64 EOCD record",
+        )
+        values = _ZIP64_EOCD.unpack(data)
+        if values[0] != _ZIP64_EOCD_SIGNATURE:
+            continue
+        record_size = values[1]
+        if (
+            record_size < _ZIP64_EOCD.size - 12
+            or candidate_position + 12 + record_size != locator_position
+        ):
+            continue
+        zip64_records.append((candidate_position, values))
+    if len(zip64_records) != 1:
+        raise ValueError("ZIP64 EOCD record position or length is invalid")
+
+    zip64_position, values = zip64_records[0]
+    (
+        _,
+        _,
+        _,
+        _,
+        zip64_disk_number,
+        zip64_directory_disk,
+        zip64_entries_on_disk,
+        zip64_total_entries,
+        zip64_directory_size,
+        zip64_directory_offset,
+    ) = values
+    if zip64_disk_number != 0 or zip64_directory_disk != 0:
+        raise ValueError("multi-disk ZIP64 archives are unavailable")
+    if zip64_entries_on_disk != zip64_total_entries:
+        raise ValueError("ZIP64 entry counts are inconsistent")
+
+    classic_pairs = (
+        (disk_number, _ZIP16_SENTINEL, zip64_disk_number),
+        (
+            central_directory_disk,
+            _ZIP16_SENTINEL,
+            zip64_directory_disk,
+        ),
+        (entries_on_disk, _ZIP16_SENTINEL, zip64_entries_on_disk),
+        (total_entries, _ZIP16_SENTINEL, zip64_total_entries),
+        (directory_size, _ZIP32_SENTINEL, zip64_directory_size),
+        (directory_offset, _ZIP32_SENTINEL, zip64_directory_offset),
+    )
+    if any(
+        classic_value != sentinel and classic_value != zip64_value
+        for classic_value, sentinel, zip64_value in classic_pairs
+    ):
+        raise ValueError("classic and ZIP64 metadata are inconsistent")
+    if zip64_total_entries > max_entries:
+        raise ValueError(
+            f"raw ZIP entry count {zip64_total_entries} exceeds "
+            f"preflight ceiling {max_entries}"
+        )
+    prefix_adjustment = zip64_position - declared_zip64_offset
+    if prefix_adjustment < 0:
+        raise ValueError("ZIP64 EOCD position is invalid")
+    _validate_zip_central_directory(
+        source,
+        entry_count=zip64_total_entries,
+        directory_size=zip64_directory_size,
+        directory_offset=zip64_directory_offset,
+        record_position=zip64_position,
+        prefix_adjustment=prefix_adjustment,
+    )
+    return zip64_total_entries
+
+
 def _extract_selected_zip(
-    zip_bytes,
+    zip_source,
     out_dir,
     *,
     include_images=False,
@@ -635,13 +862,25 @@ def _extract_selected_zip(
     return_entries=False,
     cardinality=None,
     limit_reasons=None,
+    published_entries=None,
 ):
-    extracted = []
+    extracted = published_entries if published_entries is not None else []
     written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
         allowed.update({"image", "document"})
-    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+    if isinstance(zip_source, (bytes, bytearray, memoryview)):
+        source = io.BytesIO(bytes(zip_source))
+    elif all(hasattr(zip_source, name) for name in ("read", "seek", "tell")):
+        source = zip_source
+    else:
+        raise ValueError("ZIP source is not seekable")
+    _preflight_zip_entry_count(
+        source,
+        max_entries=_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE,
+    )
+    source.seek(0, os.SEEK_SET)
+    with zipfile.ZipFile(source) as zf:
         for info in zf.infolist():
             if written >= _MAX_PAPER_BYTES:
                 break
@@ -681,6 +920,9 @@ def _extract_selected_zip(
             if cardinality is not None:
                 cardinality.record_publication()
             written += len(data)
+            if return_entries:
+                _verify_published_output_file(out_dir, dest)
+                out_dir.verify()
             extracted.append(dest)
     return extracted
 
@@ -694,8 +936,9 @@ def _extract_selected_tar(
     return_entries=False,
     cardinality=None,
     limit_reasons=None,
+    published_entries=None,
 ):
-    extracted = []
+    extracted = published_entries if published_entries is not None else []
     written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
@@ -746,6 +989,9 @@ def _extract_selected_tar(
             if cardinality is not None:
                 cardinality.record_publication()
             written += len(data)
+            if return_entries:
+                _verify_published_output_file(out_dir, dest)
+                out_dir.verify()
             extracted.append(dest)
     return extracted
 
@@ -855,16 +1101,22 @@ def _download_oa_package(
             return []
         try:
             limit_reasons = []
+            extracted = []
+            processing_error = None
             with _open_download_staging(tmp) as archive_fh:
-                extracted = _extract_selected_tar(
-                    archive_fh,
-                    out_dir,
-                    include_images=include_images,
-                    max_member_bytes=max_bytes,
-                    return_entries=True,
-                    cardinality=cardinality,
-                    limit_reasons=limit_reasons,
-                )
+                try:
+                    _extract_selected_tar(
+                        archive_fh,
+                        out_dir,
+                        include_images=include_images,
+                        max_member_bytes=max_bytes,
+                        return_entries=True,
+                        cardinality=cardinality,
+                        limit_reasons=limit_reasons,
+                        published_entries=extracted,
+                    )
+                except (tarfile.TarError, OSError, ValueError) as exc:
+                    processing_error = exc
         except _UnstableRegularFileError as e:
             skipped.append({
                 "name": pkg.get("name"),
@@ -875,6 +1127,14 @@ def _download_oa_package(
             _verify_published_output_file(out_dir, entry)
         out_dir.verify()
         published_outputs.extend(extracted)
+        if processing_error is not None:
+            reason = (
+                f"archive publication unavailable: {processing_error}"
+                if isinstance(processing_error, OSError)
+                else f"archive processing unavailable: {processing_error}"
+            )
+            skipped.append({"name": pkg.get("name"), "reason": reason})
+            return extracted
         skipped.extend(
             {"name": pkg.get("name"), "reason": reason}
             for reason in limit_reasons
@@ -915,16 +1175,22 @@ def _download_supplementary_archive(
             return []
         try:
             limit_reasons = []
+            extracted = []
+            processing_error = None
             with _open_download_staging(tmp_zip) as archive_fh:
-                extracted = _extract_selected_zip(
-                    archive_fh.read(),
-                    out_dir,
-                    include_images=include_images,
-                    max_member_bytes=max_bytes,
-                    return_entries=True,
-                    cardinality=cardinality,
-                    limit_reasons=limit_reasons,
-                )
+                try:
+                    _extract_selected_zip(
+                        archive_fh,
+                        out_dir,
+                        include_images=include_images,
+                        max_member_bytes=max_bytes,
+                        return_entries=True,
+                        cardinality=cardinality,
+                        limit_reasons=limit_reasons,
+                        published_entries=extracted,
+                    )
+                except (zipfile.BadZipFile, OSError, ValueError) as exc:
+                    processing_error = exc
         except _UnstableRegularFileError as e:
             skipped.append({
                 "name": arch.get("name"),
@@ -935,6 +1201,18 @@ def _download_supplementary_archive(
             _verify_published_output_file(out_dir, entry)
         out_dir.verify()
         published_outputs.extend(extracted)
+        if processing_error is not None:
+            reason = (
+                "not a valid zip archive"
+                if isinstance(processing_error, zipfile.BadZipFile)
+                else (
+                    f"archive publication unavailable: {processing_error}"
+                    if isinstance(processing_error, OSError)
+                    else f"archive processing unavailable: {processing_error}"
+                )
+            )
+            skipped.append({"name": arch.get("name"), "reason": reason})
+            return extracted
         skipped.extend(
             {"name": arch.get("name"), "reason": reason}
             for reason in limit_reasons
