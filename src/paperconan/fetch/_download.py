@@ -1,8 +1,9 @@
 """Defensive file download: redirects (urllib default), timeout, size cap,
 content-type sniffing so an HTML error page is never saved as data."""
 from __future__ import annotations
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+import gzip
 import hashlib
 import io
 import json
@@ -38,6 +39,8 @@ _MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
 _MAX_PUBLISHED_FILES_PER_CANDIDATE = 1000
 _MAX_ARCHIVE_MEMBERS_PER_CANDIDATE = 1000
 _MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE = 4096
+_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE = 4096
+_MAX_UNCOMPRESSED_TAR_BYTES_PER_ARCHIVE = 2 * _ARCHIVE_MAX
 _MAX_SOURCE_SIDECAR_BYTES = 8 * 1024 * 1024
 _FILE_COPY_CHUNK_BYTES = 64 * 1024
 _URL_IN_ERROR = re.compile(r"https?://[^\s]+")
@@ -59,6 +62,10 @@ class _UnstableRegularFileError(OSError):
 
 
 class _SourceSidecarLimitError(ValueError):
+    pass
+
+
+class _SourceSidecarPublicationError(ValueError):
     pass
 
 
@@ -118,39 +125,6 @@ class _PinnedOutputDirectory:
             or self._opened.st_ino != current.st_ino
         ):
             raise ValueError("fetch output directory changed during publication")
-
-
-@dataclass
-class _SidecarPublication:
-    output: _PinnedOutputDirectory
-    backup_name: str | None
-    active: bool = True
-
-    def commit(self) -> None:
-        if not self.active:
-            return
-        if self.backup_name is not None:
-            os.unlink(self.backup_name, dir_fd=self.output.fd)
-            self.backup_name = None
-        self.active = False
-
-    def rollback(self) -> None:
-        if not self.active:
-            return
-        if self.backup_name is None:
-            try:
-                os.unlink(SOURCE_SIDECAR, dir_fd=self.output.fd)
-            except FileNotFoundError:
-                pass
-        else:
-            os.replace(
-                self.backup_name,
-                SOURCE_SIDECAR,
-                src_dir_fd=self.output.fd,
-                dst_dir_fd=self.output.fd,
-            )
-            self.backup_name = None
-        self.active = False
 
 
 class _DownloadStagingFile:
@@ -280,6 +254,153 @@ def _open_download_staging(staging: _DownloadStagingFile):
             staging.output.verify()
         except ValueError as exc:
             raise _UnstableRegularFileError(str(exc)) from exc
+
+
+def _read_verified_download_staging(
+    staging: _DownloadStagingFile,
+    *,
+    max_bytes: int,
+) -> bytes:
+    try:
+        staging.output.verify()
+        _verify_staging_file(staging)
+    except ValueError as exc:
+        raise _UnstableRegularFileError(str(exc)) from exc
+    initial = os.fstat(staging.fd)
+    if not stat.S_ISREG(initial.st_mode):
+        raise _UnstableRegularFileError(
+            "download staging entry is not a stable regular file"
+        )
+    if initial.st_size > max_bytes:
+        raise ValueError(
+            "downloaded file exceeds max_bytes after staging verification "
+            f"({max_bytes})"
+        )
+    with _open_download_staging(staging) as source:
+        source.seek(0)
+        data = source.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(
+            "downloaded file exceeds max_bytes after staging verification "
+            f"({max_bytes})"
+        )
+    if len(data) != initial.st_size:
+        raise _UnstableRegularFileError(
+            "downloaded file size changed during bounded staging read"
+        )
+    expected_sha256 = hashlib.sha256(data).hexdigest()
+    try:
+        _verify_staging_file(staging)
+        staging.output.verify()
+    except ValueError as exc:
+        raise _UnstableRegularFileError(str(exc)) from exc
+    final = os.fstat(staging.fd)
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or final.st_size != initial.st_size
+        or (final.st_dev, final.st_ino) != (initial.st_dev, initial.st_ino)
+        or final.st_mtime_ns != initial.st_mtime_ns
+        or final.st_ctime_ns != initial.st_ctime_ns
+    ):
+        raise _UnstableRegularFileError(
+            "downloaded file content changed during bounded staging read"
+        )
+    if _hash_exact_fd(staging.fd, initial.st_size) != expected_sha256:
+        raise _UnstableRegularFileError(
+            "downloaded file content changed during bounded staging read"
+        )
+    try:
+        _verify_staging_file(staging)
+        staging.output.verify()
+    except ValueError as exc:
+        raise _UnstableRegularFileError(str(exc)) from exc
+    return data
+
+
+class _BoundedUncompressedReader:
+    def __init__(
+        self,
+        source,
+        *,
+        max_bytes: int,
+        max_members: int,
+    ):
+        self._source = source
+        self._max_bytes = max(0, int(max_bytes))
+        self._max_members = max(0, int(max_members))
+        self._used_bytes = 0
+        self._raw_members = 0
+        self._scan_buffer = bytearray()
+        self._payload_padding_remaining = 0
+        self._archive_ended = False
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        remaining = self._max_bytes - self._used_bytes
+        requested = remaining + 1 if size is None or size < 0 else size
+        requested = min(max(1, requested), remaining + 1)
+        if not self._archive_ended:
+            parser_boundary = (
+                self._payload_padding_remaining
+                or tarfile.BLOCKSIZE - len(self._scan_buffer)
+            )
+            requested = min(requested, max(1, parser_boundary))
+        data = self._source.read(requested)
+        self._used_bytes += len(data)
+        if self._used_bytes > self._max_bytes:
+            raise ValueError(
+                "decompressed TAR byte ceiling exceeded "
+                f"({self._max_bytes})"
+            )
+        self._scan_raw_tar(data)
+        return data
+
+    def readinto(self, buffer) -> int:
+        data = self.read(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
+    def _scan_raw_tar(self, data: bytes) -> None:
+        if self._archive_ended or not data:
+            return
+        self._scan_buffer.extend(data)
+        block_size = tarfile.BLOCKSIZE
+        while True:
+            if self._payload_padding_remaining:
+                consumed = min(
+                    len(self._scan_buffer),
+                    self._payload_padding_remaining,
+                )
+                del self._scan_buffer[:consumed]
+                self._payload_padding_remaining -= consumed
+                if self._payload_padding_remaining or not self._scan_buffer:
+                    return
+            if len(self._scan_buffer) < block_size:
+                return
+            header = bytes(self._scan_buffer[:block_size])
+            del self._scan_buffer[:block_size]
+            if header == tarfile.NUL * block_size:
+                self._archive_ended = True
+                self._scan_buffer.clear()
+                return
+            self._raw_members += 1
+            if self._raw_members > self._max_members:
+                raise ValueError(
+                    "raw TAR member count exceeds traversal ceiling "
+                    f"({self._max_members})"
+                )
+            raw_info = tarfile.TarInfo.frombuf(
+                header,
+                tarfile.ENCODING,
+                "surrogateescape",
+            )
+            self._payload_padding_remaining = (
+                (raw_info.size + block_size - 1) // block_size
+            ) * block_size
 
 
 @contextmanager
@@ -1140,59 +1261,67 @@ def _extract_selected_tar(
     allowed = {"tabular"}
     if include_images:
         allowed.update({"image", "document"})
-    if hasattr(tar_source, "read"):
-        archive = tarfile.open(fileobj=tar_source, mode="r:gz")
-    else:
-        archive = tarfile.open(tar_source, "r:gz")
-    with archive as tf:
-        for member in tf:
-            if written >= _MAX_PAPER_BYTES:
-                break
-            if not member.isfile():
-                continue
-            name = os.path.basename(member.name)
-            if (
-                not name
-                or asset_type(name) not in allowed
-                or member.size > max_member_bytes
-                or written + member.size > _MAX_PAPER_BYTES
-            ):
-                continue
-            if cardinality is not None:
-                if not cardinality.can_publish():
-                    _append_limit_reason(
-                        limit_reasons,
-                        _published_file_limit_reason(cardinality),
-                    )
-                    break
-                if not cardinality.claim_archive_member():
-                    _append_limit_reason(
-                        limit_reasons,
-                        _archive_member_limit_reason(cardinality),
-                    )
-                    break
-            src = tf.extractfile(member)
-            if src is None:
-                continue
-            data = src.read(max_member_bytes + 1)
-            if len(data) > max_member_bytes:
-                continue
-            dest = _write_collision_safe(
-                out_dir,
-                name,
-                data,
-                _return_entry=return_entries,
+    compressed = (
+        nullcontext(tar_source)
+        if hasattr(tar_source, "read")
+        else open(tar_source, "rb")
+    )
+    with compressed as compressed_source:
+        with gzip.GzipFile(fileobj=compressed_source, mode="rb") as uncompressed:
+            bounded = _BoundedUncompressedReader(
+                uncompressed,
+                max_bytes=_MAX_UNCOMPRESSED_TAR_BYTES_PER_ARCHIVE,
+                max_members=_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE,
             )
-            if return_entries:
-                pending.append(dest)
-            if cardinality is not None:
-                cardinality.record_publication()
-            written += len(data)
-            if return_entries:
-                _verify_published_output_file(out_dir, dest)
-                out_dir.verify()
-                pending.remove(dest)
-            extracted.append(dest)
+            with tarfile.open(fileobj=bounded, mode="r|") as tf:
+                for member in tf:
+                    if written >= _MAX_PAPER_BYTES:
+                        break
+                    if not member.isfile():
+                        continue
+                    name = os.path.basename(member.name)
+                    if (
+                        not name
+                        or asset_type(name) not in allowed
+                        or member.size > max_member_bytes
+                        or written + member.size > _MAX_PAPER_BYTES
+                    ):
+                        continue
+                    if cardinality is not None:
+                        if not cardinality.can_publish():
+                            _append_limit_reason(
+                                limit_reasons,
+                                _published_file_limit_reason(cardinality),
+                            )
+                            break
+                        if not cardinality.claim_archive_member():
+                            _append_limit_reason(
+                                limit_reasons,
+                                _archive_member_limit_reason(cardinality),
+                            )
+                            break
+                    src = tf.extractfile(member)
+                    if src is None:
+                        continue
+                    data = src.read(max_member_bytes + 1)
+                    if len(data) > max_member_bytes:
+                        continue
+                    dest = _write_collision_safe(
+                        out_dir,
+                        name,
+                        data,
+                        _return_entry=return_entries,
+                    )
+                    if return_entries:
+                        pending.append(dest)
+                    if cardinality is not None:
+                        cardinality.record_publication()
+                    written += len(data)
+                    if return_entries:
+                        _verify_published_output_file(out_dir, dest)
+                        out_dir.verify()
+                        pending.remove(dest)
+                    extracted.append(dest)
     return extracted
 
 
@@ -1575,26 +1704,6 @@ def _safe_source_url(url: object) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
-def _safe_failure_context(exc: BaseException) -> str:
-    text = str(exc) or type(exc).__name__
-
-    def redact_url(match: re.Match) -> str:
-        parsed = urllib.parse.urlsplit(match.group(0))
-        hostname = parsed.hostname or ""
-        if ":" in hostname and not hostname.startswith("["):
-            hostname = f"[{hostname}]"
-        try:
-            port = parsed.port
-        except ValueError:
-            port = None
-        netloc = f"{hostname}:{port}" if port is not None else hostname
-        return urllib.parse.urlunsplit(
-            (parsed.scheme, netloc, parsed.path, "", "")
-        )
-
-    return _URL_IN_ERROR.sub(redact_url, text)
-
-
 def _hash_exact_fd(fd: int, size: int) -> str:
     digest = hashlib.sha256()
     os.lseek(fd, 0, os.SEEK_SET)
@@ -1614,142 +1723,6 @@ def _hash_exact_fd(fd: int, size: int) -> str:
     return digest.hexdigest()
 
 
-def _copy_prior_sidecar_backup(output: _PinnedOutputDirectory) -> str:
-    source_fd = backup_fd = -1
-    backup_name = None
-    try:
-        source_fd = os.open(
-            SOURCE_SIDECAR,
-            os.O_RDONLY | os.O_NOFOLLOW,
-            dir_fd=output.fd,
-        )
-        opened = os.fstat(source_fd)
-        current = os.stat(
-            SOURCE_SIDECAR,
-            dir_fd=output.fd,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not stat.S_ISREG(current.st_mode)
-            or opened.st_size > _MAX_SOURCE_SIDECAR_BYTES
-            or opened.st_size != current.st_size
-            or opened.st_dev != current.st_dev
-            or opened.st_ino != current.st_ino
-        ):
-            raise _UnstableRegularFileError(
-                "prior provenance sidecar is not a stable bounded regular file"
-            )
-        for _ in range(128):
-            backup_name = f".paperconan-sidecar-backup-{secrets.token_hex(8)}"
-            try:
-                backup_fd = os.open(
-                    backup_name,
-                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=output.fd,
-                )
-                break
-            except FileExistsError:
-                continue
-        else:
-            raise FileExistsError(
-                "could not retain prior provenance sidecar"
-            )
-        os.lseek(source_fd, 0, os.SEEK_SET)
-        remaining = opened.st_size
-        copied_digest = hashlib.sha256()
-        while remaining:
-            chunk = os.read(
-                source_fd,
-                min(_FILE_COPY_CHUNK_BYTES, remaining),
-            )
-            if not chunk:
-                raise _UnstableRegularFileError(
-                    "prior provenance sidecar changed during backup"
-                )
-            copied_digest.update(chunk)
-            remaining -= len(chunk)
-            pending = memoryview(chunk)
-            while pending:
-                written = os.write(backup_fd, pending)
-                if written <= 0:
-                    raise OSError("provenance sidecar backup write failed")
-                pending = pending[written:]
-        if os.read(source_fd, 1):
-            raise _UnstableRegularFileError(
-                "prior provenance sidecar changed during backup"
-            )
-        os.fsync(backup_fd)
-        final_opened = os.fstat(source_fd)
-        final_current = os.stat(
-            SOURCE_SIDECAR,
-            dir_fd=output.fd,
-            follow_symlinks=False,
-        )
-        backup = os.fstat(backup_fd)
-        if (
-            not stat.S_ISREG(final_opened.st_mode)
-            or not stat.S_ISREG(final_current.st_mode)
-            or not stat.S_ISREG(backup.st_mode)
-            or final_opened.st_size != opened.st_size
-            or final_current.st_size != opened.st_size
-            or backup.st_size != opened.st_size
-            or final_opened.st_dev != opened.st_dev
-            or final_opened.st_ino != opened.st_ino
-            or final_current.st_dev != opened.st_dev
-            or final_current.st_ino != opened.st_ino
-            or final_opened.st_mtime_ns != opened.st_mtime_ns
-            or final_opened.st_ctime_ns != opened.st_ctime_ns
-            or (backup.st_dev, backup.st_ino)
-            == (opened.st_dev, opened.st_ino)
-        ):
-            raise _UnstableRegularFileError(
-                "prior provenance sidecar changed during backup"
-            )
-        copied_sha256 = copied_digest.hexdigest()
-        if (
-            _hash_exact_fd(source_fd, opened.st_size) != copied_sha256
-            or _hash_exact_fd(backup_fd, opened.st_size) != copied_sha256
-        ):
-            raise _UnstableRegularFileError(
-                "prior provenance sidecar changed during backup"
-            )
-        verified_opened = os.fstat(source_fd)
-        verified_current = os.stat(
-            SOURCE_SIDECAR,
-            dir_fd=output.fd,
-            follow_symlinks=False,
-        )
-        if (
-            verified_opened.st_size != opened.st_size
-            or verified_current.st_size != opened.st_size
-            or verified_opened.st_dev != opened.st_dev
-            or verified_opened.st_ino != opened.st_ino
-            or verified_current.st_dev != opened.st_dev
-            or verified_current.st_ino != opened.st_ino
-            or verified_opened.st_mtime_ns != opened.st_mtime_ns
-            or verified_opened.st_ctime_ns != opened.st_ctime_ns
-        ):
-            raise _UnstableRegularFileError(
-                "prior provenance sidecar changed during backup"
-            )
-        output.verify()
-        retained_name = backup_name
-        backup_name = None
-        return retained_name
-    finally:
-        if source_fd >= 0:
-            os.close(source_fd)
-        if backup_fd >= 0:
-            os.close(backup_fd)
-        if backup_name is not None:
-            try:
-                os.unlink(backup_name, dir_fd=output.fd)
-            except FileNotFoundError:
-                pass
-
-
 def _write_source_sidecar(cand, out_dir, downloads=None):
     """Record which paper/dataset these downloads came from, for scan.json provenance."""
     prov = {"doi": cand.get("doi"), "title": cand.get("title"),
@@ -1759,20 +1732,20 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
     if not isinstance(out_dir, _PinnedOutputDirectory):
         try:
             with _pinned_output_directory(out_dir) as output:
-                publication = _write_source_sidecar(
+                _write_source_sidecar(
                     cand,
                     output,
                     downloads=downloads,
                 )
-                if publication is not None:
-                    publication.commit()
-        except (OSError, _SourceSidecarLimitError):
+        except (
+            OSError,
+            _SourceSidecarLimitError,
+            _SourceSidecarPublicationError,
+        ):
             pass
         return
     temp_name = None
-    backup_name = None
     temp_fd = -1
-    publication = None
     try:
         out_dir.verify()
         try:
@@ -1783,8 +1756,6 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
             )
         except FileNotFoundError:
             current = None
-        if current is not None and not stat.S_ISREG(current.st_mode):
-            return None
         encoded = json.dumps(prov, indent=2, default=str).encode("utf-8")
         if len(encoded) > _MAX_SOURCE_SIDECAR_BYTES:
             raise _SourceSidecarLimitError(
@@ -1794,54 +1765,129 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
         temp_name = f".paperconan-sidecar-{secrets.token_hex(8)}"
         temp_fd = os.open(
             temp_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
             dir_fd=out_dir.fd,
         )
-        with os.fdopen(temp_fd, "wb") as fh:
-            temp_fd = -1
+        with os.fdopen(os.dup(temp_fd), "wb") as fh:
             fh.write(encoded)
             fh.flush()
             os.fsync(fh.fileno())
+        private = os.fstat(temp_fd)
+        visible_temp = os.stat(
+            temp_name,
+            dir_fd=out_dir.fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(private.st_mode)
+            or not stat.S_ISREG(visible_temp.st_mode)
+            or private.st_size != len(encoded)
+            or visible_temp.st_size != len(encoded)
+            or (private.st_dev, private.st_ino)
+            != (visible_temp.st_dev, visible_temp.st_ino)
+            or _hash_exact_fd(temp_fd, private.st_size)
+            != hashlib.sha256(encoded).hexdigest()
+        ):
+            raise _UnstableRegularFileError(
+                "new provenance sidecar staging is not a stable regular file"
+            )
         out_dir.verify()
         if current is not None:
-            backup_name = _copy_prior_sidecar_backup(out_dir)
-        os.replace(
-            temp_name,
+            if not stat.S_ISREG(current.st_mode):
+                raise _SourceSidecarPublicationError(
+                    "retained existing provenance sidecar because it is not "
+                    "a regular file"
+                )
+            existing_fd = -1
+            try:
+                existing_fd = os.open(
+                    SOURCE_SIDECAR,
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=out_dir.fd,
+                )
+                opened = os.fstat(existing_fd)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino)
+                    != (current.st_dev, current.st_ino)
+                ):
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because it "
+                        "changed during verification"
+                    )
+                matches = (
+                    opened.st_size == len(encoded)
+                    and _hash_exact_fd(existing_fd, opened.st_size)
+                    == hashlib.sha256(encoded).hexdigest()
+                )
+                final_opened = os.fstat(existing_fd)
+                final_current = os.stat(
+                    SOURCE_SIDECAR,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(final_opened.st_mode)
+                    or not stat.S_ISREG(final_current.st_mode)
+                    or final_opened.st_size != opened.st_size
+                    or final_opened.st_mtime_ns != opened.st_mtime_ns
+                    or final_opened.st_ctime_ns != opened.st_ctime_ns
+                    or (final_opened.st_dev, final_opened.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                    or (final_current.st_dev, final_current.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because it "
+                        "changed during verification"
+                    )
+                if not matches:
+                    raise _SourceSidecarPublicationError(
+                        "retained existing provenance sidecar because it "
+                        "differs from prepared provenance"
+                    )
+                return True
+            finally:
+                if existing_fd >= 0:
+                    os.close(existing_fd)
+        try:
+            os.link(
+                temp_name,
+                SOURCE_SIDECAR,
+                src_dir_fd=out_dir.fd,
+                dst_dir_fd=out_dir.fd,
+            )
+        except FileExistsError as exc:
+            raise _SourceSidecarPublicationError(
+                "retained existing provenance sidecar created during "
+                "publication"
+            ) from exc
+        final_current = os.stat(
             SOURCE_SIDECAR,
-            src_dir_fd=out_dir.fd,
-            dst_dir_fd=out_dir.fd,
+            dir_fd=out_dir.fd,
+            follow_symlinks=False,
         )
-        temp_name = None
-        publication = _SidecarPublication(
-            output=out_dir,
-            backup_name=backup_name,
-        )
-        backup_name = None
+        if (
+            not stat.S_ISREG(final_current.st_mode)
+            or (final_current.st_dev, final_current.st_ino)
+            != (private.st_dev, private.st_ino)
+        ):
+            raise _SourceSidecarPublicationError(
+                "retained uncertain provenance sidecar after publication"
+            )
         out_dir.verify()
-        return publication
-    except _SourceSidecarLimitError:
+        return True
+    except (_SourceSidecarLimitError, _SourceSidecarPublicationError):
         raise
     except (OSError, ValueError):
-        if publication is not None:
-            try:
-                publication.rollback()
-            except (OSError, ValueError) as exc:
-                raise _UnstableRegularFileError(
-                    "provenance sidecar rollback unavailable"
-                ) from exc
-        return None  # provenance is best-effort when no state was replaced
+        return None
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
         if temp_name is not None:
             try:
                 os.unlink(temp_name, dir_fd=out_dir.fd)
-            except FileNotFoundError:
-                pass
-        if backup_name is not None:
-            try:
-                os.unlink(backup_name, dir_fd=out_dir.fd)
             except FileNotFoundError:
                 pass
 
@@ -1930,8 +1976,10 @@ def download_candidate(
                 )
                 if res.get("ok"):
                     try:
-                        with _open_download_staging(staging) as fh:
-                            data = fh.read()
+                        data = _read_verified_download_staging(
+                            staging,
+                            max_bytes=max_bytes,
+                        )
                     except (_UnstableRegularFileError, ValueError) as e:
                         skipped.append({
                             "name": f["name"],
@@ -1961,7 +2009,7 @@ def download_candidate(
                         published.filename,
                         res.get("source_url") or f.get("download_url"),
                         content_type=res.get("content_type"),
-                        size=res.get("size"),
+                        size=published.size,
                     ))
                 else:
                     skipped.append({
@@ -2021,7 +2069,6 @@ def download_candidate(
             (entry.filename, entry.identity): entry
             for entry in published_outputs
         }.values())
-        sidecar_publication = None
 
         def record_boundary_reconciliation(
             boundary: str,
@@ -2047,141 +2094,40 @@ def download_candidate(
                 "reason": reason,
             })
 
-        published_outputs, outcomes, boundary_error = _reconcile_publications(
-            output,
-            published_outputs,
-            attempts=2,
-        )
-        record_boundary_reconciliation(
-            "before",
-            boundary_error,
-            outcomes,
-        )
-        transaction_failed = False
-        republish_required = False
-        for publication_round in range(2):
-            downloads = [
-                by_file[entry.filename]
-                for entry in published_outputs
-                if entry.filename in by_file
-            ]
-            try:
-                next_sidecar_publication = _write_source_sidecar(
-                    cand,
-                    output,
-                    downloads=downloads,
-                )
-            except _SourceSidecarLimitError as exc:
-                skipped.append({
-                    "name": SOURCE_SIDECAR,
-                    "reason": str(exc),
-                })
-                next_sidecar_publication = None
-            if republish_required and next_sidecar_publication is None:
-                skipped.append({
-                    "name": cand.get("cand_id"),
-                    "reason": (
-                        "provenance republish unavailable after stable output "
-                        "set changed; prior sidecar retained for recovery"
-                    ),
-                })
-                transaction_failed = True
-                break
-            sidecar_publication = next_sidecar_publication
-            reconciled, outcomes, boundary_error = _reconcile_publications(
+        for boundary in ("before", "after"):
+            published_outputs, outcomes, boundary_error = _reconcile_publications(
                 output,
                 published_outputs,
                 attempts=2,
             )
             record_boundary_reconciliation(
-                "after",
+                boundary,
                 boundary_error,
                 outcomes,
             )
-            before_keys = [
-                (entry.filename, entry.identity)
-                for entry in published_outputs
-            ]
-            after_keys = [
-                (entry.filename, entry.identity)
-                for entry in reconciled
-            ]
-            published_outputs = reconciled
-            if before_keys == after_keys:
-                break
-            if sidecar_publication is None:
-                skipped.append({
-                    "name": cand.get("cand_id"),
-                    "reason": (
-                        "provenance publication unavailable after stable "
-                        "output set changed"
-                    ),
-                })
-                transaction_failed = True
-                break
-            try:
-                sidecar_publication.rollback()
-            except (OSError, ValueError) as rollback_exc:
-                reason = (
-                    "provenance sidecar rollback unavailable after stable "
-                    f"output set changed: {_safe_failure_context(rollback_exc)}"
-                )
-                if sidecar_publication.backup_name is not None:
-                    reason += (
-                        "; retained recovery backup: "
-                        f"{os.path.basename(sidecar_publication.backup_name)}"
-                    )
-                skipped.append({
-                    "name": cand.get("cand_id"),
-                    "reason": reason,
-                })
-                transaction_failed = True
-                break
-            sidecar_publication = None
-            if publication_round == 1:
-                skipped.append({
-                    "name": cand.get("cand_id"),
-                    "reason": (
-                        "provenance reconciliation did not stabilize after "
-                        "bounded republish"
-                    ),
-                })
-                transaction_failed = True
-                break
-            republish_required = True
-        if transaction_failed:
-            downloaded = []
-        else:
-            try:
-                if sidecar_publication is not None:
-                    sidecar_publication.commit()
-            except (OSError, ValueError) as exc:
-                reason = (
-                    "provenance sidecar commit failed: "
-                    f"{_safe_failure_context(exc)}"
-                )
-                try:
-                    sidecar_publication.rollback()
-                except (OSError, ValueError) as rollback_exc:
-                    reason += (
-                        "; provenance sidecar rollback failed: "
-                        f"{_safe_failure_context(rollback_exc)}"
-                    )
-                    if sidecar_publication.backup_name is not None:
-                        reason += (
-                            "; retained recovery backup: "
-                            f"{os.path.basename(sidecar_publication.backup_name)}"
-                        )
-                skipped.append({
-                    "name": cand.get("cand_id"),
-                    "reason": reason,
-                })
-                downloaded = []
-            else:
-                downloaded = [
-                    entry.display_path(output)
-                    for entry in published_outputs
-                ]
+        downloads = [
+            by_file[entry.filename]
+            for entry in published_outputs
+            if entry.filename in by_file
+        ]
+        try:
+            _write_source_sidecar(
+                cand,
+                output,
+                downloads=downloads,
+            )
+        except (
+            _SourceSidecarLimitError,
+            _SourceSidecarPublicationError,
+        ) as exc:
+            skipped.append({
+                "name": SOURCE_SIDECAR,
+                "reason": str(exc),
+            })
+        downloaded = [
+            entry.display_path(output)
+            for entry in published_outputs
+        ]
         return {
             "cand_id": cand.get("cand_id"),
             "out_dir": output.path,

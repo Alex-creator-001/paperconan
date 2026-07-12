@@ -30,6 +30,10 @@ _DEFAULT_MAX_IMAGE_MB = 100.0
 _DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 
 
+class _EvidencePublicationRecoveryError(RuntimeError):
+    pass
+
+
 class EvidenceBudget:
     def __init__(self, max_bytes: int):
         self.max_bytes = max(0, int(max_bytes))
@@ -294,26 +298,114 @@ def _stage_image(
         raise
 
 
-def _move_evidence_final_to_backup(
+def _sha256_fd(fd: int) -> str:
+    digest = hashlib.sha256()
+    with os.fdopen(os.dup(fd), "rb") as fh:
+        fh.seek(0)
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _existing_evidence_matches_staged(
     evidence_fd: int,
     final_name: str,
-) -> str | None:
-    backup_name, backup_fd = _stage_file(evidence_fd)
-    os.close(backup_fd)
+    staged_fd: int,
+) -> bool:
+    relative_name = f"images/evidence/{final_name}"
     try:
-        os.replace(
+        current = os.stat(
             final_name,
-            backup_name,
+            dir_fd=evidence_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(current.st_mode):
+        raise _EvidencePublicationRecoveryError(
+            "image evidence publication retained existing visible entry "
+            f"because it is not a regular file: {relative_name}"
+        )
+    existing_fd = -1
+    try:
+        existing_fd = os.open(
+            final_name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=evidence_fd,
+        )
+        opened = os.fstat(existing_fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise _EvidencePublicationRecoveryError(
+                "image evidence publication retained existing visible entry "
+                f"because it changed during verification: {relative_name}"
+            )
+        staged = os.fstat(staged_fd)
+        matches = (
+            opened.st_size == staged.st_size
+            and _sha256_fd(existing_fd) == _sha256_fd(staged_fd)
+        )
+        final_opened = os.fstat(existing_fd)
+        final_current = os.stat(
+            final_name,
+            dir_fd=evidence_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(final_opened.st_mode)
+            or not stat.S_ISREG(final_current.st_mode)
+            or final_opened.st_size != opened.st_size
+            or final_opened.st_mtime_ns != opened.st_mtime_ns
+            or final_opened.st_ctime_ns != opened.st_ctime_ns
+            or (final_opened.st_dev, final_opened.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (final_current.st_dev, final_current.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise _EvidencePublicationRecoveryError(
+                "image evidence publication retained existing visible entry "
+                f"because it changed during verification: {relative_name}"
+            )
+        if not matches:
+            raise _EvidencePublicationRecoveryError(
+                "image evidence publication retained existing visible entry "
+                f"because it differs from prepared output: {relative_name}"
+            )
+        return True
+    finally:
+        if existing_fd >= 0:
+            os.close(existing_fd)
+
+
+def _install_or_reuse_evidence(
+    evidence_fd: int,
+    temp_name: str,
+    temp_fd: int,
+    final_name: str,
+) -> bool:
+    if _existing_evidence_matches_staged(
+        evidence_fd,
+        final_name,
+        temp_fd,
+    ):
+        return False
+    try:
+        os.link(
+            temp_name,
+            final_name,
             src_dir_fd=evidence_fd,
             dst_dir_fd=evidence_fd,
         )
-    except FileNotFoundError:
-        _unlink_at(backup_name, evidence_fd)
-        return None
-    except Exception:
-        _unlink_at(backup_name, evidence_fd)
-        raise
-    return backup_name
+    except FileExistsError as exc:
+        raise _EvidencePublicationRecoveryError(
+            "image evidence publication retained existing visible entry "
+            "created during publication: "
+            f"images/evidence/{final_name}"
+        ) from exc
+    return True
 
 
 def _publish_staged_images(
@@ -323,9 +415,7 @@ def _publish_staged_images(
     evidence_fd: int,
     staged: list[tuple[str, int, str]],
 ) -> None:
-    backups: list[str | None] = [None] * len(staged)
-    prepared = [False] * len(staged)
-    publication_succeeded = False
+    installed: list[str] = []
     try:
         _verify_evidence_directories(
             root,
@@ -339,12 +429,6 @@ def _publish_staged_images(
                 temp_name,
                 temp_fd,
             )
-        for index, (_, _, final_name) in enumerate(staged):
-            backups[index] = _move_evidence_final_to_backup(
-                evidence_fd,
-                final_name,
-            )
-            prepared[index] = True
         _verify_evidence_directories(
             root,
             root_fd,
@@ -357,56 +441,46 @@ def _publish_staged_images(
                 temp_name,
                 temp_fd,
             )
-            os.replace(
-                temp_name,
-                final_name,
-                src_dir_fd=evidence_fd,
-                dst_dir_fd=evidence_fd,
-            )
-            _verify_regular_file_entry(
+            was_installed = _install_or_reuse_evidence(
                 evidence_fd,
-                final_name,
+                temp_name,
                 temp_fd,
+                final_name,
             )
+            if was_installed:
+                installed.append(f"images/evidence/{final_name}")
+                _verify_regular_file_entry(
+                    evidence_fd,
+                    final_name,
+                    temp_fd,
+                )
+            else:
+                _existing_evidence_matches_staged(
+                    evidence_fd,
+                    final_name,
+                    temp_fd,
+                )
         _verify_evidence_directories(
             root,
             root_fd,
             images_fd,
             evidence_fd,
         )
-        publication_succeeded = True
     except Exception as publication_error:
-        rollback_error = None
-        for index, (_, _, final_name) in enumerate(staged):
-            if not prepared[index]:
-                continue
-            try:
-                _unlink_at(final_name, evidence_fd)
-            except Exception as exc:
-                rollback_error = rollback_error or exc
-        for index, (_, _, final_name) in enumerate(staged):
-            backup_name = backups[index]
-            if not prepared[index] or backup_name is None:
-                continue
-            try:
-                os.replace(
-                    backup_name,
-                    final_name,
-                    src_dir_fd=evidence_fd,
-                    dst_dir_fd=evidence_fd,
-                )
-                backups[index] = None
-            except Exception as exc:
-                rollback_error = rollback_error or exc
-        if rollback_error is not None:
-            raise RuntimeError(
-                "image evidence publication rollback failed"
-            ) from publication_error
-        raise
-    finally:
-        if publication_succeeded:
-            for backup_name in backups:
-                _unlink_at(backup_name, evidence_fd)
+        context = ["image evidence publication incomplete"]
+        if installed:
+            context.append(
+                "retained uncertain visible entry or entries: "
+                + ", ".join(installed)
+            )
+        context.append(
+            "publication cause: "
+            f"{publication_error.__class__.__name__}: "
+            f"{str(publication_error) or 'no detail'}"
+        )
+        raise _EvidencePublicationRecoveryError(
+            "; ".join(context)
+        ) from publication_error
 
 
 def _max_image_bytes() -> int:

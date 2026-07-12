@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import math
 import mimetypes
@@ -31,7 +30,7 @@ _MAX_IMAGE_ASSETS = int(os.environ.get("PAPERCONAN_MAX_IMAGE_ASSETS", "1000"))
 _PDF_DPI = 200
 
 
-class _AssetPublicationRollbackError(RuntimeError):
+class _AssetPublicationRecoveryError(RuntimeError):
     pass
 
 
@@ -117,7 +116,7 @@ def _secure_dirfd_capability_error() -> str | None:
         if not hasattr(os, name):
             missing.append(f"os.{name}")
     supports_dir_fd = getattr(os, "supports_dir_fd", frozenset())
-    for name in ("open", "mkdir", "rmdir", "stat", "unlink"):
+    for name in ("link", "open", "mkdir", "rmdir", "stat", "unlink"):
         function = getattr(os, name, None)
         if function is None or function not in supports_dir_fd:
             missing.append(f"os.{name}(dir_fd=...)")
@@ -128,12 +127,6 @@ def _secure_dirfd_capability_error() -> str | None:
     )
     if getattr(os, "stat", None) not in supports_follow_symlinks:
         missing.append("os.stat(follow_symlinks=False)")
-    try:
-        replace_parameters = inspect.signature(os.replace).parameters
-    except (AttributeError, TypeError, ValueError):
-        replace_parameters = {}
-    if not {"src_dir_fd", "dst_dir_fd"} <= set(replace_parameters):
-        missing.append("os.replace(src_dir_fd=..., dst_dir_fd=...)")
     if not missing:
         return None
     return ", ".join(missing)
@@ -175,7 +168,7 @@ def _sanitized_exception_context(exc: Exception) -> str:
     return f"{exc.__class__.__name__}: {message}"
 
 
-def _probe_replace_dirfd(directory_fd: int) -> None:
+def _probe_link_dirfd(directory_fd: int) -> None:
     token = secrets.token_hex(8)
     source_name = f".paperconan-dirfd-probe-{token}.src"
     destination_name = f".paperconan-dirfd-probe-{token}.dst"
@@ -189,20 +182,30 @@ def _probe_replace_dirfd(directory_fd: int) -> None:
         )
         os.close(probe_fd)
         probe_fd = None
-        os.replace(
+        os.link(
             source_name,
             destination_name,
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
+        )
+        source = os.stat(
+            source_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
         )
         current = os.stat(
             destination_name,
             dir_fd=directory_fd,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(current.st_mode):
+        if (
+            not stat.S_ISREG(source.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (source.st_dev, source.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
             raise ValueError(
-                "secure image asset publication dir_fd probe was not regular"
+                "secure image asset publication dir_fd link probe was not regular"
             )
     except (AttributeError, NotImplementedError, TypeError) as exc:
         raise _secure_dirfd_runtime_error(exc) from exc
@@ -246,7 +249,7 @@ def _asset_output_directories(output_root: Path):
             "images",
             output_root / "images",
         )
-        _probe_replace_dirfd(images_fd)
+        _probe_link_dirfd(images_fd)
         native_fd = _open_child_directory(
             images_fd,
             "native",
@@ -437,46 +440,106 @@ def _open_stable_source_regular(path: Path):
             os.close(fd)
 
 
-def _entry_exists(directory_fd: int, name: str) -> bool:
+def _existing_asset_matches_staged(
+    directory_fd: int,
+    final_name: str,
+    staged_fd: int,
+    relative_name: str,
+) -> bool:
     try:
-        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        current = os.stat(
+            final_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
         return False
-    return True
-
-
-def _cleanup_incomplete_pair(
-    native_fd: int,
-    native_name: str,
-    preview_fd: int,
-    preview_name: str,
-) -> None:
-    native_exists = _entry_exists(native_fd, native_name)
-    preview_exists = _entry_exists(preview_fd, preview_name)
-    if native_exists != preview_exists:
-        if native_exists:
-            _unlink_at(native_name, native_fd)
-        if preview_exists:
-            _unlink_at(preview_name, preview_fd)
-
-
-def _move_existing_to_backup(directory_fd: int, final_name: str) -> str | None:
-    backup_name, backup_fd = _asset_temp_path(directory_fd, suffix=".backup")
-    os.close(backup_fd)
+    if not stat.S_ISREG(current.st_mode):
+        raise _AssetPublicationRecoveryError(
+            "image asset publication retained existing visible entry because "
+            f"it is not a regular file: {relative_name}"
+        )
+    existing_fd = -1
     try:
-        os.replace(
+        existing_fd = os.open(
             final_name,
-            backup_name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        opened = os.fstat(existing_fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise _AssetPublicationRecoveryError(
+                "image asset publication retained existing visible entry "
+                f"because it changed during verification: {relative_name}"
+            )
+        staged = os.fstat(staged_fd)
+        matches = (
+            opened.st_size == staged.st_size
+            and _sha256_fd(existing_fd) == _sha256_fd(staged_fd)
+        )
+        final_opened = os.fstat(existing_fd)
+        final_current = os.stat(
+            final_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(final_opened.st_mode)
+            or not stat.S_ISREG(final_current.st_mode)
+            or final_opened.st_size != opened.st_size
+            or final_opened.st_mtime_ns != opened.st_mtime_ns
+            or final_opened.st_ctime_ns != opened.st_ctime_ns
+            or (final_opened.st_dev, final_opened.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (final_current.st_dev, final_current.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise _AssetPublicationRecoveryError(
+                "image asset publication retained existing visible entry "
+                f"because it changed during verification: {relative_name}"
+            )
+        if not matches:
+            raise _AssetPublicationRecoveryError(
+                "image asset publication retained existing visible entry "
+                f"because it differs from prepared output: {relative_name}"
+            )
+        return True
+    finally:
+        if existing_fd >= 0:
+            os.close(existing_fd)
+
+
+def _install_or_reuse_asset(
+    directory_fd: int,
+    temp_name: str,
+    temp_fd: int,
+    final_name: str,
+    relative_name: str,
+) -> bool:
+    if _existing_asset_matches_staged(
+        directory_fd,
+        final_name,
+        temp_fd,
+        relative_name,
+    ):
+        return False
+    try:
+        os.link(
+            temp_name,
+            final_name,
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
         )
-    except FileNotFoundError:
-        _unlink_at(backup_name, directory_fd)
-        return None
-    except Exception:
-        _unlink_at(backup_name, directory_fd)
-        raise
-    return backup_name
+    except FileExistsError as exc:
+        raise _AssetPublicationRecoveryError(
+            "image asset publication retained existing visible entry created "
+            f"during publication: {relative_name}"
+        ) from exc
+    return True
 
 
 def _publish_asset_pair(
@@ -513,10 +576,7 @@ def _publish_asset_pair(
             f"images/preview/{preview_name}",
         ),
     ]
-    backups: list[str | None] = [None, None]
-    prepared = [False, False]
-    installed = [False, False]
-    publication_succeeded = False
+    installed: list[str] = []
     try:
         _verify_asset_directories(
             output_root,
@@ -525,9 +585,13 @@ def _publish_asset_pair(
             native_fd,
             preview_fd,
         )
-        for index, (directory_fd, _, _, final_name, _, _) in enumerate(entries):
-            backups[index] = _move_existing_to_backup(directory_fd, final_name)
-            prepared[index] = True
+        for directory_fd, temp_name, temp_fd, _, final_path, _ in entries:
+            _verify_regular_file_entry(
+                directory_fd,
+                temp_name,
+                temp_fd,
+                final_path,
+            )
         _verify_asset_directories(
             output_root,
             root_fd,
@@ -535,7 +599,7 @@ def _publish_asset_pair(
             native_fd,
             preview_fd,
         )
-        for index, entry in enumerate(entries):
+        for entry in entries:
             directory_fd, temp_name, temp_fd, final_name, final_path, _ = entry
             _verify_regular_file_entry(
                 directory_fd,
@@ -543,19 +607,28 @@ def _publish_asset_pair(
                 temp_fd,
                 final_path,
             )
-            os.replace(
-                temp_name,
-                final_name,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-            )
-            installed[index] = True
-            _verify_regular_file_entry(
+            was_installed = _install_or_reuse_asset(
                 directory_fd,
-                final_name,
+                temp_name,
                 temp_fd,
-                final_path,
+                final_name,
+                entry[5],
             )
+            if was_installed:
+                installed.append(entry[5])
+                _verify_regular_file_entry(
+                    directory_fd,
+                    final_name,
+                    temp_fd,
+                    final_path,
+                )
+            else:
+                _existing_asset_matches_staged(
+                    directory_fd,
+                    final_name,
+                    temp_fd,
+                    entry[5],
+                )
         _verify_asset_directories(
             output_root,
             root_fd,
@@ -563,46 +636,20 @@ def _publish_asset_pair(
             native_fd,
             preview_fd,
         )
-        publication_succeeded = True
     except Exception as publication_error:
-        rollback_error = None
-        for index, (directory_fd, _, _, final_name, _, _) in enumerate(entries):
-            if installed[index]:
-                try:
-                    _unlink_at(final_name, directory_fd)
-                except Exception as exc:
-                    rollback_error = rollback_error or exc
-        for index, (directory_fd, _, _, final_name, _, _) in enumerate(entries):
-            backup_name = backups[index]
-            if prepared[index] and backup_name is not None:
-                try:
-                    os.replace(
-                        backup_name,
-                        final_name,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
-                    )
-                    backups[index] = None
-                except Exception as exc:
-                    rollback_error = rollback_error or exc
-        if rollback_error is not None:
-            retained = [
-                f"{relative_name} -> {backup_name}"
-                for backup_name, entry in zip(backups, entries)
-                if backup_name is not None
-                for relative_name in (entry[5].rsplit("/", 1)[0] + "/" + backup_name,)
-            ]
-            retained_text = ", ".join(retained) or "none"
-            raise _AssetPublicationRollbackError(
-                "image asset publication rollback failed; "
-                f"retained recovery backup(s): {retained_text}; "
-                f"rollback cause: {_sanitized_exception_context(rollback_error)}"
-            ) from publication_error
-        raise
-    finally:
-        if publication_succeeded:
-            for index, (directory_fd, _, _, _, _, _) in enumerate(entries):
-                _unlink_at(backups[index], directory_fd)
+        context = ["image asset publication incomplete"]
+        if installed:
+            context.append(
+                "retained uncertain visible entry or entries: "
+                + ", ".join(installed)
+            )
+        context.append(
+            "publication cause: "
+            + _sanitized_exception_context(publication_error)
+        )
+        raise _AssetPublicationRecoveryError(
+            "; ".join(context)
+        ) from publication_error
 
 
 def _record_image(
@@ -740,15 +787,9 @@ def _record_image(
                 existing_size=existing_size,
                 staged_size=staged_size,
             )
-        except _AssetPublicationRollbackError:
+        except _AssetPublicationRecoveryError:
             raise
         except Exception:
-            _cleanup_incomplete_pair(
-                native_fd,
-                native_name,
-                preview_fd,
-                preview_name,
-            )
             raise
     finally:
         if native_temp_fd is not None:

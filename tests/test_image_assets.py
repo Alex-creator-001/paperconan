@@ -827,7 +827,7 @@ def test_exif_orientation_changes_preview_dimensions_only(tmp_path):
         assert preview.size == (20, 40)
 
 
-def test_asset_publication_uses_same_directory_temps_and_atomic_replace(
+def test_asset_publication_uses_same_directory_temps_and_atomic_no_replace(
     tmp_path,
     monkeypatch,
 ):
@@ -835,41 +835,55 @@ def test_asset_publication_uses_same_directory_temps_and_atomic_replace(
     source.mkdir()
     _image(source / "FigA.png")
     output = tmp_path / "audit"
-    replacements = []
-    real_replace = os.replace
+    links = []
+    real_link = os.link
 
-    def observe_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    def observe_link(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
         src_name = Path(src).name
         dst_name = Path(dst).name
-        if (
-            src_name.startswith(".paperconan-image-")
-            and not dst_name.startswith(".paperconan-image-")
-        ):
+        if src_name.startswith(".paperconan-image-"):
+            assert not dst_name.startswith(".paperconan-image-")
             assert src_dir_fd is not None
             assert src_dir_fd == dst_dir_fd
             assert os.stat(src, dir_fd=src_dir_fd, follow_symlinks=False)
-            replacements.append(dst_name)
-        real_replace(
+            links.append(dst_name)
+        real_link(
             src,
             dst,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
 
-    monkeypatch.setattr(_assets.os, "replace", observe_replace)
+    monkeypatch.setattr(_assets.os, "link", observe_link)
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            observe_link if function is real_link else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
 
     assets, errors = _assets.prepare_image_assets(str(source), str(output))
 
     assert errors == []
-    assert len(replacements) == 2
-    assert set(replacements) == {
+    assert len(links) == 2
+    assert set(links) == {
         Path(assets[0]["path"]).name,
         Path(assets[0]["preview_path"]).name,
     }
     assert not list((output / "images").rglob(".paperconan-image-*"))
 
 
-def test_rerun_repairs_stale_native_and_preview_files(tmp_path):
+def test_rerun_retains_stale_native_and_preview_files(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     _image(source / "FigA.png")
@@ -886,14 +900,14 @@ def test_rerun_repairs_stale_native_and_preview_files(tmp_path):
         str(output),
     )
 
-    assert rerun_errors == []
-    assert rerun_assets == assets
-    assert native.read_bytes() == (source / "FigA.png").read_bytes()
-    with PIL.open(preview) as repaired_preview:
-        assert repaired_preview.size == (80, 60)
+    assert rerun_assets == []
+    assert rerun_errors
+    assert "retained existing visible entry" in rerun_errors[0]["error"]
+    assert native.read_bytes() == b"stale-native"
+    assert preview.read_bytes() == b"stale-preview"
 
 
-def test_rerun_replaces_final_asset_symlinks_without_touching_targets(tmp_path):
+def test_rerun_retains_final_asset_symlinks_without_touching_targets(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     _image(source / "FigA.png")
@@ -916,13 +930,15 @@ def test_rerun_replaces_final_asset_symlinks_without_touching_targets(tmp_path):
         str(output),
     )
 
-    assert rerun_errors == []
-    assert rerun_assets == assets
+    assert rerun_assets == []
+    assert rerun_errors
+    assert "retained existing visible entry" in rerun_errors[0]["error"]
     assert native_target.read_bytes() == b"native-sentinel"
     assert preview_target.read_bytes() == b"preview-sentinel"
-    assert not native.is_symlink()
-    assert not preview.is_symlink()
-    assert native.read_bytes() == (source / "FigA.png").read_bytes()
+    assert native.is_symlink()
+    assert preview.is_symlink()
+    assert native.readlink() == native_target
+    assert preview.readlink() == preview_target
 
 
 @pytest.mark.parametrize(
@@ -1109,7 +1125,7 @@ def test_staging_path_swap_does_not_publish_symlink_or_touch_target(
     assert not list((output / "images").rglob("img-*"))
 
 
-def test_final_path_swap_after_replace_is_detected_and_rolled_back(
+def test_final_path_swap_after_link_is_detected_without_deleting_replacement(
     tmp_path,
     monkeypatch,
 ):
@@ -1122,16 +1138,24 @@ def test_final_path_swap_after_replace_is_detected_and_rolled_back(
     native_name = f"{stem}.png"
     outside_target = tmp_path / "outside-target"
     outside_target.write_bytes(b"outside-sentinel")
-    real_replace = os.replace
+    real_link = os.link
     swapped = False
 
-    def replace_then_swap_final(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    def link_then_swap_final(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
         nonlocal swapped
-        real_replace(
+        real_link(
             src,
             dst,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
         if (
             not swapped
@@ -1142,7 +1166,15 @@ def test_final_path_swap_after_replace_is_detected_and_rolled_back(
             os.unlink(dst, dir_fd=dst_dir_fd)
             os.symlink(outside_target, dst, dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(_assets.os, "replace", replace_then_swap_final)
+    monkeypatch.setattr(_assets.os, "link", link_then_swap_final)
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            link_then_swap_final if function is real_link else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
     output = tmp_path / "audit"
 
     assets, errors = _assets.prepare_image_assets(str(source), str(output))
@@ -1150,8 +1182,11 @@ def test_final_path_swap_after_replace_is_detected_and_rolled_back(
     assert assets == []
     assert errors
     assert "changed during asset publication" in errors[0]["error"]
+    assert "retained uncertain visible entry" in errors[0]["error"]
     assert outside_target.read_bytes() == b"outside-sentinel"
-    assert not list((output / "images").rglob("img-*"))
+    final_native = output / "images" / "native" / native_name
+    assert final_native.is_symlink()
+    assert final_native.readlink() == outside_target
 
 
 def test_source_mutation_after_initial_hash_publishes_nothing(
@@ -1349,7 +1384,10 @@ def test_second_temp_allocation_failure_cleans_first_temp(tmp_path, monkeypatch)
     assert not list((output / "images").rglob("img-*"))
 
 
-def test_second_replacement_failure_leaves_no_fresh_pair(tmp_path, monkeypatch):
+def test_second_no_replace_install_failure_retains_first_fresh_asset(
+    tmp_path,
+    monkeypatch,
+):
     source = tmp_path / "source"
     source.mkdir()
     image_path = source / "FigA.png"
@@ -1357,39 +1395,51 @@ def test_second_replacement_failure_leaves_no_fresh_pair(tmp_path, monkeypatch):
     digest = _assets._sha256(image_path)
     stem = _assets._asset_id(digest).replace(":", "-")
     preview_name = f"{stem}.jpg"
-    real_replace = os.replace
+    real_link = os.link
     failed = False
 
-    def fail_preview_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    def fail_preview_link(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
         nonlocal failed
         if not failed and Path(dst).name == preview_name:
             failed = True
-            raise OSError("synthetic preview replace failure")
-        return real_replace(
+            raise OSError("synthetic preview link failure")
+        return real_link(
             src,
             dst,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
 
-    monkeypatch.setattr(_assets.os, "replace", fail_preview_replace)
+    monkeypatch.setattr(_assets.os, "link", fail_preview_link)
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            fail_preview_link if function is real_link else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
     output = tmp_path / "audit"
 
     assets, errors = _assets.prepare_image_assets(str(source), str(output))
 
     assert assets == []
-    assert errors == [{
-        "file": "FigA.png",
-        "error": "synthetic preview replace failure",
-    }]
-    assert not os.path.lexists(output / "images" / "native" / f"{stem}.png")
+    assert errors
+    assert "synthetic preview link failure" in errors[0]["error"]
+    assert "retained uncertain visible entry" in errors[0]["error"]
+    assert os.path.isfile(output / "images" / "native" / f"{stem}.png")
     assert not os.path.lexists(output / "images" / "preview" / preview_name)
 
 
-def test_second_replacement_failure_restores_prior_symlink_pair(
-    tmp_path,
-    monkeypatch,
-):
+def test_rerun_retains_prior_symlink_pair_without_publication(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     _image(source / "FigA.png")
@@ -1406,45 +1456,25 @@ def test_second_replacement_failure_restores_prior_symlink_pair(
     preview.unlink()
     native.symlink_to(native_target)
     preview.symlink_to(preview_target)
-    real_replace = os.replace
-    failed = False
-
-    def fail_preview_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
-        nonlocal failed
-        if not failed and Path(dst).name == preview.name:
-            failed = True
-            raise OSError("synthetic preview replace failure")
-        return real_replace(
-            src,
-            dst,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
-
-    monkeypatch.setattr(_assets.os, "replace", fail_preview_replace)
-
     rerun_assets, rerun_errors = _assets.prepare_image_assets(
         str(source),
         str(output),
     )
 
     assert rerun_assets == []
-    assert rerun_errors == [{
-        "file": "FigA.png",
-        "error": "synthetic preview replace failure",
-    }]
+    assert rerun_errors
+    error = rerun_errors[0]["error"]
+    assert "retained existing visible entry" in error
     assert native.is_symlink()
     assert preview.is_symlink()
     assert native.readlink() == native_target
     assert preview.readlink() == preview_target
     assert native_target.read_bytes() == b"native-sentinel"
     assert preview_target.read_bytes() == b"preview-sentinel"
+    assert not list((output / "images").rglob(".paperconan-image-*.backup"))
 
 
-def test_rollback_restore_failure_preserves_recovery_backup(
-    tmp_path,
-    monkeypatch,
-):
+def test_mismatched_pair_publication_retains_existing_entries(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     _image(source / "FigA.png")
@@ -1458,41 +1488,6 @@ def test_rollback_restore_failure_preserves_recovery_backup(
     native.unlink()
     native.symlink_to(native_target)
     preview.write_bytes(b"preview-sentinel")
-    real_replace = os.replace
-    preview_install_failed = False
-
-    def fail_install_and_native_restore(
-        src,
-        dst,
-        *,
-        src_dir_fd=None,
-        dst_dir_fd=None,
-    ):
-        nonlocal preview_install_failed
-        src_name = Path(src).name
-        dst_name = Path(dst).name
-        if (
-            not preview_install_failed
-            and src_name.endswith(".jpg")
-            and dst_name == preview.name
-        ):
-            preview_install_failed = True
-            raise OSError("synthetic preview install failure")
-        if src_name.endswith(".backup") and dst_name == native.name:
-            raise OSError("synthetic native restore failure")
-        return real_replace(
-            src,
-            dst,
-            src_dir_fd=src_dir_fd,
-            dst_dir_fd=dst_dir_fd,
-        )
-
-    monkeypatch.setattr(
-        _assets.os,
-        "replace",
-        fail_install_and_native_restore,
-    )
-
     rerun_assets, rerun_errors = _assets.prepare_image_assets(
         str(source),
         str(output),
@@ -1501,16 +1496,13 @@ def test_rollback_restore_failure_preserves_recovery_backup(
     assert rerun_assets == []
     assert rerun_errors
     error = rerun_errors[0]["error"]
-    assert "rollback failed" in error
-    assert "synthetic native restore failure" in error
-    backups = list(native.parent.glob(".paperconan-image-*.backup"))
-    assert len(backups) == 1
-    assert f"images/native/{backups[0].name}" in error
-    assert str(tmp_path) not in error
-    assert backups[0].is_symlink()
-    assert backups[0].readlink() == native_target
+    assert "publication incomplete" in error
+    assert "retained existing visible entry" in error
     assert native_target.read_bytes() == b"native-sentinel"
+    assert native.is_symlink()
+    assert native.readlink() == native_target
     assert preview.read_bytes() == b"preview-sentinel"
+    assert not list((output / "images").rglob(".paperconan-image-*.backup"))
 
 
 def test_preview_failure_cleans_preexisting_partial_final_pair(
@@ -1543,8 +1535,266 @@ def test_preview_failure_cleans_preexisting_partial_final_pair(
         "file": "FigA.png",
         "error": "synthetic preview rejection",
     }]
-    assert not os.path.lexists(native)
+    assert native.read_bytes() == b"partial-native"
     assert not os.path.lexists(preview)
+
+
+def test_failed_preview_install_retains_concurrent_native_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+    assert errors == []
+    native = output / assets[0]["path"]
+    preview = output / assets[0]["preview_path"]
+    native.unlink()
+    preview.unlink()
+    concurrent_bytes = b"concurrent native replacement"
+    real_link = os.link
+    native_replaced = False
+
+    def link_native_then_fail_preview(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal native_replaced
+        src_name = Path(src).name
+        dst_name = Path(dst).name
+        if (
+            src_name.startswith(".paperconan-image-")
+            and dst_name == native.name
+        ):
+            real_link(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            os.unlink(dst, dir_fd=dst_dir_fd)
+            replacement_fd = os.open(
+                dst,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(replacement_fd, concurrent_bytes)
+            finally:
+                os.close(replacement_fd)
+            native_replaced = True
+            return
+        if (
+            native_replaced
+            and src_name.startswith(".paperconan-image-")
+            and dst_name == preview.name
+        ):
+            raise OSError("synthetic preview install failure")
+        return real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(_assets.os, "link", link_native_then_fail_preview)
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            link_native_then_fail_preview if function is real_link else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
+
+    rerun_assets, rerun_errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+    )
+
+    assert native_replaced
+    assert rerun_assets == []
+    assert native.read_bytes() == concurrent_bytes
+    assert rerun_errors
+    error = rerun_errors[0]["error"]
+    assert "retained uncertain visible entry" in error
+    assert f"images/native/{native.name}" in error
+    assert not list((output / "images").rglob(".paperconan-image-*.backup"))
+
+
+def test_final_preview_replacement_survives_publication_verification_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+    assert errors == []
+    preview = output / assets[0]["preview_path"]
+    preview.unlink()
+    concurrent_target = tmp_path / "concurrent-preview.jpg"
+    concurrent_target.write_bytes(b"concurrent preview replacement")
+    real_link = os.link
+    preview_replaced = False
+
+    def link_preview_then_replace_with_symlink(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal preview_replaced
+        real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        if (
+            not preview_replaced
+            and Path(src).name.startswith(".paperconan-image-")
+            and Path(dst).name == preview.name
+        ):
+            os.unlink(dst, dir_fd=dst_dir_fd)
+            os.symlink(concurrent_target, dst, dir_fd=dst_dir_fd)
+            preview_replaced = True
+
+    monkeypatch.setattr(
+        _assets.os,
+        "link",
+        link_preview_then_replace_with_symlink,
+    )
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            link_preview_then_replace_with_symlink
+            if function is real_link
+            else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
+
+    rerun_assets, rerun_errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+    )
+
+    assert preview_replaced
+    assert rerun_assets == []
+    assert preview.is_symlink()
+    assert preview.readlink() == concurrent_target
+    assert concurrent_target.read_bytes() == b"concurrent preview replacement"
+    assert rerun_errors
+    assert "retained uncertain visible entry" in rerun_errors[0]["error"]
+    assert f"images/preview/{preview.name}" in rerun_errors[0]["error"]
+
+
+def test_successful_asset_rerun_creates_no_recovery_backups(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+    assert errors == []
+    rerun_assets, rerun_errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+    )
+
+    assert rerun_errors == []
+    assert rerun_assets == assets
+    assert not list((output / "images").rglob(".paperconan-image-*.backup"))
+
+
+def test_asset_publication_does_not_move_concurrent_final_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+    assert errors == []
+    native = output / assets[0]["path"]
+    preview = output / assets[0]["preview_path"]
+    native.unlink()
+    concurrent_bytes = b"concurrent native replacement"
+    real_link = os.link
+    replacement_installed = False
+
+    def create_final_before_link(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal replacement_installed
+        if (
+            not replacement_installed
+            and Path(dst).name == native.name
+        ):
+            replacement_fd = os.open(
+                dst,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(replacement_fd, concurrent_bytes)
+            finally:
+                os.close(replacement_fd)
+            replacement_installed = True
+        return real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(
+        _assets.os,
+        "link",
+        create_final_before_link,
+    )
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            create_final_before_link if function is real_link else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
+
+    rerun_assets, rerun_errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+    )
+
+    assert replacement_installed
+    assert rerun_assets == []
+    assert rerun_errors
+    assert "retained existing visible entry" in rerun_errors[0]["error"]
+    assert native.read_bytes() == concurrent_bytes
+    assert preview.is_file()
 
 
 def test_secure_dirfd_capability_unavailable_is_explicit(

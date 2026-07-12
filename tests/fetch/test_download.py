@@ -667,7 +667,7 @@ def test_provenance_sidecar_does_not_follow_or_replace_final_symlink(
 
 
 @pytest.mark.parametrize("existing_sidecar", [False, True])
-def test_final_output_replacement_rolls_back_provenance_sidecar(
+def test_final_output_replacement_is_reconciled_before_sidecar_publication(
     monkeypatch,
     tmp_path,
     existing_sidecar,
@@ -684,6 +684,7 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
     payload = b"a,b\n1,2\n"
     replacement = b"x,y\n9,8\n"
     sidecar_writes = 0
+    reconciliation_calls = 0
 
     def fake_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
@@ -697,49 +698,64 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
         }
 
     real_write_source_sidecar = _download._write_source_sidecar
+    real_reconcile = _download._reconcile_publications
 
-    def publish_sidecar_then_replace_output(cand, output, downloads=None):
+    def replace_output_at_second_boundary(*args, **kwargs):
+        nonlocal reconciliation_calls
+        reconciliation_calls += 1
+        if reconciliation_calls == 2:
+            output = args[0]
+            os.unlink("data.csv", dir_fd=output.fd)
+            replacement_fd = os.open(
+                "data.csv",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=output.fd,
+            )
+            try:
+                os.write(replacement_fd, replacement)
+            finally:
+                os.close(replacement_fd)
+        return real_reconcile(*args, **kwargs)
+
+    def track_single_sidecar_publication(cand, output, downloads=None):
         nonlocal sidecar_writes
         sidecar_writes += 1
-        if sidecar_writes == 2:
-            if existing_sidecar:
-                assert sidecar.read_bytes() == previous_bytes
-            else:
-                assert not sidecar.exists()
-        publication = real_write_source_sidecar(
+        assert reconciliation_calls == 2
+        if existing_sidecar:
+            assert sidecar.read_bytes() == previous_bytes
+        else:
+            assert not sidecar.exists()
+        if existing_sidecar:
+            with pytest.raises(_download._SourceSidecarPublicationError):
+                real_write_source_sidecar(
+                    cand,
+                    output,
+                    downloads=downloads,
+                )
+            assert sidecar.read_bytes() == previous_bytes
+            raise _download._SourceSidecarPublicationError(
+                "retained existing provenance sidecar because it differs "
+                "from prepared provenance"
+            )
+        result = real_write_source_sidecar(
             cand,
             output,
             downloads=downloads,
         )
-        published = json.loads(sidecar.read_text(encoding="utf-8"))
-        if sidecar_writes == 2:
-            assert published["downloads"] == []
-            return publication
-        assert published["downloads"] == [{
-            "file": "data.csv",
-            "source_url": "https://example.test/data.csv",
-            "content_type": None,
-            "asset_type": "tabular",
-            "size": len(payload),
-        }]
-        os.unlink("data.csv", dir_fd=output.fd)
-        replacement_fd = os.open(
-            "data.csv",
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=output.fd,
-        )
-        try:
-            os.write(replacement_fd, replacement)
-        finally:
-            os.close(replacement_fd)
-        return publication
+        assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
+        return result
 
     monkeypatch.setattr(_download, "download_file", fake_download)
     monkeypatch.setattr(
         _download,
+        "_reconcile_publications",
+        replace_output_at_second_boundary,
+    )
+    monkeypatch.setattr(
+        _download,
         "_write_source_sidecar",
-        publish_sidecar_then_replace_output,
+        track_single_sidecar_publication,
     )
     candidate = {
         "cand_id": "source:1",
@@ -752,16 +768,27 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
 
     summary = _download.download_candidate(candidate, str(out_dir))
 
-    assert sidecar_writes == 2
+    assert reconciliation_calls == 2
+    assert sidecar_writes == 1
     assert summary["downloaded"] == []
-    assert len(summary["skipped"]) == 1
-    assert "stable regular file" in summary["skipped"][0]["reason"]
-    assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
+    assert len(summary["skipped"]) == (2 if existing_sidecar else 1)
+    assert any(
+        "stable regular file" in item["reason"]
+        for item in summary["skipped"]
+    )
+    if existing_sidecar:
+        assert sidecar.read_bytes() == previous_bytes
+        assert any(
+            "retained existing provenance sidecar" in item["reason"]
+            for item in summary["skipped"]
+        )
+    else:
+        assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
     assert (out_dir / "data.csv").read_bytes() == replacement
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
-def test_sidecar_rollback_uses_immutable_prior_bytes(
+def test_sidecar_no_replace_keeps_prior_descriptor_bytes(
     monkeypatch,
     tmp_path,
 ):
@@ -769,14 +796,9 @@ def test_sidecar_rollback_uses_immutable_prior_bytes(
     out_dir.mkdir()
     sidecar = out_dir / _download.SOURCE_SIDECAR
     previous_bytes = b'{"cand_id":"previous:1","downloads":[]}'
-    mutated_bytes = b"x" * len(previous_bytes)
     sidecar.write_bytes(previous_bytes)
-    old_writer_fd = os.open(sidecar, os.O_RDWR | os.O_NOFOLLOW)
+    old_reader_fd = os.open(sidecar, os.O_RDONLY | os.O_NOFOLLOW)
     payload = b"a,b\n1,2\n"
-    replacement = b"x,y\n9,8\n"
-    old_inode_mutated = False
-    sidecar_writes = 0
-
     def fake_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
@@ -788,47 +810,7 @@ def test_sidecar_rollback_uses_immutable_prior_bytes(
             "source_url": url,
         }
 
-    real_write_source_sidecar = _download._write_source_sidecar
-
-    def publish_then_mutate_old_inode(cand, output, downloads=None):
-        nonlocal old_inode_mutated, sidecar_writes
-        sidecar_writes += 1
-        if sidecar_writes == 2:
-            assert sidecar.read_bytes() == previous_bytes
-        publication = real_write_source_sidecar(
-            cand,
-            output,
-            downloads=downloads,
-        )
-        published = json.loads(sidecar.read_text(encoding="utf-8"))
-        if sidecar_writes == 2:
-            assert published["downloads"] == []
-            return publication
-        assert published["downloads"][0]["file"] == "data.csv"
-        os.lseek(old_writer_fd, 0, os.SEEK_SET)
-        os.write(old_writer_fd, mutated_bytes)
-        os.ftruncate(old_writer_fd, len(mutated_bytes))
-        os.fsync(old_writer_fd)
-        old_inode_mutated = True
-        os.unlink("data.csv", dir_fd=output.fd)
-        replacement_fd = os.open(
-            "data.csv",
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=output.fd,
-        )
-        try:
-            os.write(replacement_fd, replacement)
-        finally:
-            os.close(replacement_fd)
-        return publication
-
     monkeypatch.setattr(_download, "download_file", fake_download)
-    monkeypatch.setattr(
-        _download,
-        "_write_source_sidecar",
-        publish_then_mutate_old_inode,
-    )
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -840,17 +822,18 @@ def test_sidecar_rollback_uses_immutable_prior_bytes(
 
     try:
         summary = _download.download_candidate(candidate, str(out_dir))
-        os.lseek(old_writer_fd, 0, os.SEEK_SET)
-        old_inode_bytes = os.read(old_writer_fd, len(mutated_bytes))
+        os.lseek(old_reader_fd, 0, os.SEEK_SET)
+        old_inode_bytes = os.read(old_reader_fd, len(previous_bytes))
     finally:
-        os.close(old_writer_fd)
+        os.close(old_reader_fd)
 
-    assert old_inode_mutated
-    assert sidecar_writes == 2
-    assert old_inode_bytes == mutated_bytes
-    assert summary["downloaded"] == []
-    assert len(summary["skipped"]) == 1
-    assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
+    assert old_inode_bytes == previous_bytes
+    assert summary["downloaded"] == [str(out_dir / "data.csv")]
+    assert any(
+        "retained existing provenance sidecar" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert sidecar.read_bytes() == previous_bytes
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
@@ -1846,11 +1829,14 @@ def test_final_verification_reconciles_and_coordinates_sidecar(
     candidate, source_url = _publication_candidate(publication_kind)
     _install_archive_payload(monkeypatch, payload)
     final_phase = False
+    active_boundary = None
+    final_boundary_calls = 0
     sidecar_writes = 0
     boundary_attempts = 0
     sidecar_before_writes = []
     real_verify = _download._verify_published_output_file
     real_write_sidecar = _download._write_source_sidecar
+    real_reconcile = _download._reconcile_publications
 
     if publication_kind == "direct":
         real_publish = _download._write_collision_safe
@@ -1882,15 +1868,20 @@ def test_final_verification_reconciles_and_coordinates_sidecar(
 
         monkeypatch.setattr(_download, helper_name, helper_then_arm)
 
+    def track_final_boundary(*args, **kwargs):
+        nonlocal active_boundary, final_boundary_calls
+        if not final_phase:
+            return real_reconcile(*args, **kwargs)
+        final_boundary_calls += 1
+        active_boundary = "before" if final_boundary_calls == 1 else "after"
+        try:
+            return real_reconcile(*args, **kwargs)
+        finally:
+            active_boundary = None
+
     def fail_at_final_boundary(output, entry):
         nonlocal boundary_attempts
-        at_boundary = (
-            final_phase
-            and (
-                (boundary == "before" and sidecar_writes == 0)
-                or (boundary == "after" and sidecar_writes == 1)
-            )
-        )
+        at_boundary = final_phase and active_boundary == boundary
         if at_boundary:
             boundary_attempts += 1
             if failure_mode == "persistent" or boundary_attempts == 1:
@@ -1902,18 +1893,22 @@ def test_final_verification_reconciles_and_coordinates_sidecar(
     def track_sidecar_writes(cand, output, downloads=None):
         nonlocal sidecar_writes
         sidecar_before_writes.append(sidecar_path.read_bytes())
-        publication = real_write_sidecar(
+        sidecar_writes += 1
+        return real_write_sidecar(
             cand,
             output,
             downloads=downloads,
         )
-        sidecar_writes += 1
-        return publication
 
     monkeypatch.setattr(
         _download,
         "_verify_published_output_file",
         fail_at_final_boundary,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_reconcile_publications",
+        track_final_boundary,
     )
     monkeypatch.setattr(
         _download,
@@ -1924,27 +1919,23 @@ def test_final_verification_reconciles_and_coordinates_sidecar(
     summary = _download.download_candidate(candidate, str(out_dir))
 
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    expected_downloads = [] if failure_mode == "persistent" else [{
-        "file": "data.csv",
-        "source_url": source_url,
-        "content_type": None,
-        "asset_type": "tabular",
-        "size": len(data),
-    }]
     expected_paths = (
         []
         if failure_mode == "persistent"
         else [str(out_dir / "data.csv")]
     )
     assert summary["downloaded"] == expected_paths
-    assert sidecar["downloads"] == expected_downloads
+    assert sidecar["downloads"] == [{"file": "old.csv"}]
     assert boundary_attempts == 2
-    if boundary == "after" and failure_mode == "persistent":
-        assert sidecar_before_writes == [previous_bytes, previous_bytes]
-    else:
-        assert sidecar_before_writes == [previous_bytes]
-    assert len(summary["skipped"]) == 1
-    reason = summary["skipped"][0]["reason"]
+    assert final_boundary_calls == 2
+    assert sidecar_writes == 1
+    assert sidecar_before_writes == [previous_bytes]
+    assert len(summary["skipped"]) == 2
+    reason = next(
+        item["reason"]
+        for item in summary["skipped"]
+        if "provenance publication" in item["reason"]
+    )
     assert f"{boundary} provenance publication" in reason
     if failure_mode == "transient":
         assert (
@@ -1956,6 +1947,10 @@ def test_final_verification_reconciles_and_coordinates_sidecar(
             "retained visible output for recovery without reporting it: data.csv"
             in reason
         )
+    assert any(
+        "retained existing provenance sidecar" in item["reason"]
+        for item in summary["skipped"]
+    )
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
     assert not list(out_dir.glob(".paperconan-publish-*"))
 
@@ -2945,17 +2940,15 @@ def test_oversized_generated_sidecar_is_not_published(
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
-def test_sidecar_commit_and_rollback_failures_preserve_recovery_context(
+def test_mismatched_prior_sidecar_is_retained_with_explicit_reason(
     monkeypatch,
     tmp_path,
 ):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     sidecar = out_dir / _download.SOURCE_SIDECAR
-    sidecar.write_bytes(b'{"cand_id":"previous:1","downloads":[]}')
-    retained_backup_names = []
-    real_write_source_sidecar = _download._write_source_sidecar
-
+    previous_bytes = b'{"cand_id":"previous:1","downloads":[]}'
+    sidecar.write_bytes(previous_bytes)
     def fake_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
@@ -2967,31 +2960,7 @@ def test_sidecar_commit_and_rollback_failures_preserve_recovery_context(
             "source_url": url,
         }
 
-    def track_publication(cand, output, downloads=None):
-        publication = real_write_source_sidecar(
-            cand,
-            output,
-            downloads=downloads,
-        )
-        retained_backup_names.append(publication.backup_name)
-        return publication
-
-    def fail_commit(publication):
-        raise OSError(
-            "commit unavailable at "
-            "https://user:secret@example.test/source?token=commit-secret"
-        )
-
-    def fail_rollback(publication):
-        raise OSError(
-            "rollback unavailable at "
-            "https://user:secret@example.test/recovery?token=rollback-secret"
-        )
-
     monkeypatch.setattr(_download, "download_file", fake_download)
-    monkeypatch.setattr(_download, "_write_source_sidecar", track_publication)
-    monkeypatch.setattr(_download._SidecarPublication, "commit", fail_commit)
-    monkeypatch.setattr(_download._SidecarPublication, "rollback", fail_rollback)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -3003,18 +2972,13 @@ def test_sidecar_commit_and_rollback_failures_preserve_recovery_context(
 
     summary = _download.download_candidate(candidate, str(out_dir))
 
-    assert summary["downloaded"] == []
-    assert len(retained_backup_names) == 1
-    backup_name = retained_backup_names[0]
-    assert backup_name
-    assert (out_dir / backup_name).exists()
-    reason = summary["skipped"][-1]["reason"]
-    assert "commit unavailable" in reason
-    assert "rollback unavailable" in reason
-    assert backup_name in reason
-    assert "commit-secret" not in reason
-    assert "rollback-secret" not in reason
-    assert "user:secret" not in reason
+    assert summary["downloaded"] == [str(out_dir / "data.csv")]
+    assert any(
+        "retained existing provenance sidecar" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert sidecar.read_bytes() == previous_bytes
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
 @pytest.mark.parametrize("publication_kind", ["direct", "oa", "supplementary"])
@@ -3033,6 +2997,7 @@ def test_download_candidate_rejects_equal_size_in_place_content_mutation(
         else _archive_bytes(publication_kind, data=original)
     )
     content_mutated = False
+    final_phase = False
 
     def fake_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
@@ -3045,40 +3010,37 @@ def test_download_candidate_rejects_equal_size_in_place_content_mutation(
             "source_url": url,
         }
 
-    real_write_source_sidecar = _download._write_source_sidecar
+    real_verify = _download._verify_published_output_file
 
-    def mutate_content_then_write_sidecar(cand, output, downloads=None):
+    def mutate_content_at_final_boundary(output, entry):
         nonlocal content_mutated
-        entry_fd = os.open(
-            "data.csv",
-            os.O_WRONLY | os.O_NOFOLLOW,
-            dir_fd=output.fd,
-        )
-        try:
-            opened = os.fstat(entry_fd)
-            os.lseek(entry_fd, 0, os.SEEK_SET)
-            os.write(entry_fd, replacement)
-            os.fsync(entry_fd)
-            current = os.fstat(entry_fd)
-        finally:
-            os.close(entry_fd)
-        assert (opened.st_dev, opened.st_ino) == (
-            current.st_dev,
-            current.st_ino,
-        )
-        assert opened.st_size == current.st_size
-        content_mutated = True
-        return real_write_source_sidecar(
-            cand,
-            output,
-            downloads=downloads,
-        )
+        if final_phase and not content_mutated:
+            entry_fd = os.open(
+                "data.csv",
+                os.O_WRONLY | os.O_NOFOLLOW,
+                dir_fd=output.fd,
+            )
+            try:
+                opened = os.fstat(entry_fd)
+                os.lseek(entry_fd, 0, os.SEEK_SET)
+                os.write(entry_fd, replacement)
+                os.fsync(entry_fd)
+                current = os.fstat(entry_fd)
+            finally:
+                os.close(entry_fd)
+            assert (opened.st_dev, opened.st_ino) == (
+                current.st_dev,
+                current.st_ino,
+            )
+            assert opened.st_size == current.st_size
+            content_mutated = True
+        return real_verify(output, entry)
 
     monkeypatch.setattr(_download, "download_file", fake_download)
     monkeypatch.setattr(
         _download,
-        "_write_source_sidecar",
-        mutate_content_then_write_sidecar,
+        "_verify_published_output_file",
+        mutate_content_at_final_boundary,
     )
     candidate = {
         "cand_id": "source:1",
@@ -3086,6 +3048,19 @@ def test_download_candidate_rejects_equal_size_in_place_content_mutation(
         "tabular_files": [],
     }
     if publication_kind == "direct":
+        real_publish = _download._write_collision_safe
+
+        def publish_then_arm(*args, **kwargs):
+            nonlocal final_phase
+            published = real_publish(*args, **kwargs)
+            final_phase = True
+            return published
+
+        monkeypatch.setattr(
+            _download,
+            "_write_collision_safe",
+            publish_then_arm,
+        )
         candidate["tabular_files"] = [{
             "name": "data.csv",
             "download_url": "https://example.test/data.csv",
@@ -3097,8 +3072,19 @@ def test_download_candidate_rejects_equal_size_in_place_content_mutation(
         }
         if publication_kind == "oa":
             candidate["oa_package"] = archive
+            helper_name = "_download_oa_package"
         else:
             candidate["supplementary_archive"] = archive
+            helper_name = "_download_supplementary_archive"
+        real_helper = getattr(_download, helper_name)
+
+        def helper_then_arm(*args, **kwargs):
+            nonlocal final_phase
+            extracted = real_helper(*args, **kwargs)
+            final_phase = True
+            return extracted
+
+        monkeypatch.setattr(_download, helper_name, helper_then_arm)
 
     summary = _download.download_candidate(candidate, str(out_dir))
 
@@ -3107,6 +3093,10 @@ def test_download_candidate_rejects_equal_size_in_place_content_mutation(
     assert summary["downloaded"] == []
     assert len(summary["skipped"]) == 1
     assert "content changed" in summary["skipped"][0]["reason"]
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert sidecar["downloads"] == []
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
@@ -3550,3 +3540,503 @@ def test_archive_download_rejects_staging_path_swapped_to_symlink(
     assert "stable regular file" in summary["skipped"][0]["reason"]
     assert not (out_dir / "outside.csv").exists()
     assert not list(out_dir.glob(".paperconan-archive-*"))
+
+
+def test_direct_download_rejects_same_inode_growth_with_bounded_staging_read(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = b"a,b\n1,2\n"
+    max_bytes = len(payload)
+    read_sizes = []
+    real_open_download_staging = _download._open_download_staging
+
+    class GrowingReader:
+        def __init__(self, source):
+            self._source = source
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return self._source.read(size)
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+    @contextmanager
+    def grow_after_download(staging):
+        with real_open_download_staging(staging) as source:
+            os.lseek(staging.fd, 0, os.SEEK_END)
+            os.write(staging.fd, b"growth")
+            os.fsync(staging.fd)
+            source.seek(0)
+            yield GrowingReader(source)
+
+    monkeypatch.setattr(
+        _download.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _Resp(payload, "text/csv"),
+    )
+    monkeypatch.setattr(
+        _download,
+        "_open_download_staging",
+        grow_after_download,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(out_dir),
+        max_bytes=max_bytes,
+    )
+
+    assert summary["downloaded"] == []
+    assert not (out_dir / "data.csv").exists()
+    assert read_sizes
+    assert all(size > 0 for size in read_sizes)
+    assert any(
+        "downloaded file exceeds max_bytes after staging verification"
+        in item["reason"]
+        for item in summary["skipped"]
+    )
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    if sidecar.exists():
+        assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
+
+
+def test_direct_download_rejects_same_size_staging_mutation_after_read(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = b"a,b\n1,2\n"
+    replacement = b"x,y\n9,8\n"
+    assert len(payload) == len(replacement)
+    real_open_download_staging = _download._open_download_staging
+    mutated = False
+    read_sizes = []
+
+    class MutatingReader:
+        def __init__(self, source, staging):
+            self._source = source
+            self._staging = staging
+
+        def read(self, size=-1):
+            nonlocal mutated
+            read_sizes.append(size)
+            data = self._source.read(size)
+            if data and not mutated:
+                os.lseek(self._staging.fd, 0, os.SEEK_SET)
+                os.write(self._staging.fd, replacement)
+                os.ftruncate(self._staging.fd, len(replacement))
+                os.fsync(self._staging.fd)
+                mutated = True
+            return data
+
+        def __getattr__(self, name):
+            return getattr(self._source, name)
+
+    @contextmanager
+    def mutate_after_read(staging):
+        with real_open_download_staging(staging) as source:
+            yield MutatingReader(source, staging)
+
+    monkeypatch.setattr(
+        _download.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _Resp(payload, "text/csv"),
+    )
+    monkeypatch.setattr(
+        _download,
+        "_open_download_staging",
+        mutate_after_read,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert mutated
+    assert summary["downloaded"] == []
+    assert not (out_dir / "data.csv").exists()
+    assert read_sizes
+    assert all(size > 0 for size in read_sizes)
+    assert any(
+        "downloaded file content changed during bounded staging read"
+        in item["reason"]
+        for item in summary["skipped"]
+    )
+
+
+def _tar_with_members(members, *, tar_format=tarfile.PAX_FORMAT):
+    payload = io.BytesIO()
+    with tarfile.open(
+        fileobj=payload,
+        mode="w:gz",
+        format=tar_format,
+    ) as archive:
+        for kind, name, body in members:
+            info = tarfile.TarInfo(name)
+            if kind == "dir":
+                info.type = tarfile.DIRTYPE
+                info.size = 0
+                archive.addfile(info)
+            else:
+                info.size = len(body)
+                archive.addfile(info, io.BytesIO(body))
+    return payload.getvalue()
+
+
+def test_oa_tar_raw_member_ceiling_counts_ineligible_directories(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _tar_with_members([
+        ("dir", f"nested/{index:04d}/", b"")
+        for index in range(2000)
+    ])
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(
+        _download,
+        "_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE",
+        1000,
+        raising=False,
+    )
+    candidate, _ = _archive_candidate("oa")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert summary["downloaded"] == []
+    assert any(
+        "raw TAR member count exceeds traversal ceiling (1000)"
+        in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+def test_oa_tar_rejects_decompressed_stream_above_archive_ceiling(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _tar_with_members([
+        ("file", "nested/ignored.bin", b"\0" * (64 * 1024)),
+        ("file", "nested/data.csv", b"a,b\n1,2\n"),
+    ])
+    assert len(payload) < 4096
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(
+        _download,
+        "_MAX_UNCOMPRESSED_TAR_BYTES_PER_ARCHIVE",
+        4096,
+        raising=False,
+    )
+    candidate, _ = _archive_candidate("oa")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert summary["downloaded"] == []
+    assert any(
+        "decompressed TAR byte ceiling exceeded (4096)"
+        in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not (out_dir / "data.csv").exists()
+
+
+@pytest.mark.parametrize(
+    "tar_format",
+    [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT],
+    ids=["gnu", "pax"],
+)
+def test_oa_tar_streaming_accepts_valid_gnu_and_pax_archives(
+    monkeypatch,
+    tmp_path,
+    tar_format,
+):
+    out_dir = tmp_path / "out"
+    payload = _tar_with_members(
+        [("file", "nested/" + "long-" * 24 + "data.csv", b"a,b\n1,2\n")],
+        tar_format=tar_format,
+    )
+    _install_archive_payload(monkeypatch, payload)
+    real_tar_open = tarfile.open
+    extraction_modes = []
+
+    def track_streaming_open(*args, **kwargs):
+        mode = kwargs.get("mode")
+        if mode in {"r:gz", "r|"}:
+            extraction_modes.append(mode)
+        return real_tar_open(*args, **kwargs)
+
+    monkeypatch.setattr(_download.tarfile, "open", track_streaming_open)
+    candidate, _ = _archive_candidate("oa")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert [Path(path).name for path in summary["downloaded"]] == [
+        "long-" * 24 + "data.csv"
+    ]
+    assert (out_dir / ("long-" * 24 + "data.csv")).read_bytes() == b"a,b\n1,2\n"
+    assert extraction_modes == ["r|"]
+
+
+@pytest.mark.parametrize(
+    "tar_format",
+    [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT],
+    ids=["gnu-longname", "pax-path"],
+)
+def test_tar_raw_ceiling_counts_hidden_name_metadata_headers(
+    monkeypatch,
+    tmp_path,
+    tar_format,
+):
+    payload = _tar_with_members(
+        [("file", "nested/" + "long-" * 24 + "data.csv", b"a,b\n1,2\n")],
+        tar_format=tar_format,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE",
+        1,
+    )
+
+    with _download._pinned_output_directory(str(tmp_path / "out")) as output:
+        with pytest.raises(
+            ValueError,
+            match=r"raw TAR member count exceeds traversal ceiling \(1\)",
+        ):
+            _download._extract_selected_tar(
+                io.BytesIO(payload),
+                output,
+                return_entries=True,
+            )
+
+
+def test_tar_raw_ceiling_resets_per_archive_and_eligible_ceiling_is_shared(
+    monkeypatch,
+    tmp_path,
+):
+    first = _tar_with_members([
+        ("file", "first.csv", b"1\n"),
+        ("dir", "one/", b""),
+        ("dir", "two/", b""),
+    ])
+    second = _tar_with_members([
+        ("dir", "three/", b""),
+        ("file", "second.csv", b"2\n"),
+    ])
+    third = _tar_with_members([
+        ("file", "third.csv", b"3\n"),
+    ])
+    monkeypatch.setattr(
+        _download,
+        "_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE",
+        2,
+        raising=False,
+    )
+    cardinality = _download._CandidateCardinality(
+        max_published_files=10,
+        max_archive_members=2,
+    )
+    reasons = []
+    out_dir = tmp_path / "out"
+
+    with _download._pinned_output_directory(str(out_dir)) as output:
+        with pytest.raises(
+            ValueError,
+            match=r"raw TAR member count exceeds traversal ceiling \(2\)",
+        ):
+            _download._extract_selected_tar(
+                io.BytesIO(first),
+                output,
+                return_entries=True,
+                cardinality=cardinality,
+                limit_reasons=reasons,
+            )
+        second_entries = _download._extract_selected_tar(
+            io.BytesIO(second),
+            output,
+            return_entries=True,
+            cardinality=cardinality,
+            limit_reasons=reasons,
+        )
+        third_entries = _download._extract_selected_tar(
+            io.BytesIO(third),
+            output,
+            return_entries=True,
+            cardinality=cardinality,
+            limit_reasons=reasons,
+        )
+
+    assert [entry.filename for entry in second_entries] == ["second.csv"]
+    assert third_entries == []
+    assert cardinality.archive_members == 2
+    assert reasons == [
+        "archive member cardinality ceiling reached "
+        "(2); remaining eligible members were skipped"
+    ]
+    assert (out_dir / "first.csv").read_bytes() == b"1\n"
+    assert (out_dir / "second.csv").read_bytes() == b"2\n"
+    assert not (out_dir / "third.csv").exists()
+
+
+def test_sidecar_is_published_once_after_both_output_reconciliation_boundaries(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    payload = b"a,b\n1,2\n"
+    reconcile_calls = 0
+    sidecar_writes = 0
+    real_reconcile = _download._reconcile_publications
+    real_write_sidecar = _download._write_source_sidecar
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    def track_reconciliation(*args, **kwargs):
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        assert not sidecar.exists()
+        return real_reconcile(*args, **kwargs)
+
+    def track_final_publication(cand, output, downloads=None):
+        nonlocal sidecar_writes
+        sidecar_writes += 1
+        assert reconcile_calls == 2
+        return real_write_sidecar(cand, output, downloads=downloads)
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_reconcile_publications",
+        track_reconciliation,
+    )
+    monkeypatch.setattr(
+        _download,
+        "_write_source_sidecar",
+        track_final_publication,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert summary["downloaded"] == [str(out_dir / "data.csv")]
+    assert reconcile_calls == 2
+    assert sidecar_writes == 1
+    assert not sidecar.is_symlink()
+    published = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert published["downloads"][0]["file"] == "data.csv"
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))
+
+
+def test_sidecar_publication_retains_concurrent_no_replace_creation(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    concurrent_bytes = b'{"cand_id":"concurrent:1","downloads":[]}'
+    payload = b"a,b\n1,2\n"
+    real_link = os.link
+    replacement_installed = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    def create_sidecar_before_link(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal replacement_installed
+        if (
+            not replacement_installed
+            and Path(dst).name == _download.SOURCE_SIDECAR
+        ):
+            replacement_fd = os.open(
+                dst,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(replacement_fd, concurrent_bytes)
+            finally:
+                os.close(replacement_fd)
+            replacement_installed = True
+        return real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download.os, "link", create_sidecar_before_link)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert replacement_installed
+    assert summary["downloaded"] == [str(out_dir / "data.csv")]
+    assert any(
+        "retained existing provenance sidecar" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert sidecar.read_bytes() == concurrent_bytes
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))

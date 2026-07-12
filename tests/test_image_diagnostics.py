@@ -1512,7 +1512,7 @@ def test_native_evidence_rejects_evidence_parent_swap_before_staging(
     assert list(displaced.iterdir()) == []
 
 
-def test_native_evidence_atomically_replaces_final_symlinks_and_reruns(tmp_path):
+def test_native_evidence_retains_final_symlinks_and_exact_reruns(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     _two_panel(source / "Fig1.png")
@@ -1532,44 +1532,53 @@ def test_native_evidence_atomically_replaces_final_symlinks_and_reruns(tmp_path)
     final_crop.symlink_to(outside_crop)
     final_preview.symlink_to(outside_preview)
 
+    with pytest.raises(RuntimeError) as exc_info:
+        write_native_pair_evidence(
+            str(out / assets[0]["path"]),
+            (10, 10, 150, 130),
+            (160, 10, 300, 130),
+            str(out),
+            evidence_id,
+        )
+
+    assert "retained existing visible entry" in str(exc_info.value)
+    assert outside_crop.read_bytes() == crop_sentinel
+    assert outside_preview.read_bytes() == preview_sentinel
+    assert final_crop.is_symlink()
+    assert final_preview.is_symlink()
+    assert final_crop.readlink() == outside_crop
+    assert final_preview.readlink() == outside_preview
+
+    rerun_id = "image-pair-exact-rerun"
     evidence = write_native_pair_evidence(
         str(out / assets[0]["path"]),
         (10, 10, 150, 130),
         (160, 10, 300, 130),
         str(out),
-        evidence_id,
+        rerun_id,
     )
-
-    assert outside_crop.read_bytes() == crop_sentinel
-    assert outside_preview.read_bytes() == preview_sentinel
-    assert not final_crop.is_symlink()
-    assert not final_preview.is_symlink()
-    final_crop.write_bytes(b"stale crop")
-    final_preview.write_bytes(b"stale preview")
 
     rerun = write_native_pair_evidence(
         str(out / assets[0]["path"]),
         (10, 10, 150, 130),
         (160, 10, 300, 130),
         str(out),
-        evidence_id,
+        rerun_id,
     )
 
     assert rerun == evidence
-    with Image.open(final_crop) as crop:
+    with Image.open(out / evidence["crop_a_path"]) as crop:
         assert crop.size == (140, 120)
-    with Image.open(final_preview) as preview:
+    with Image.open(out / evidence["preview_path"]) as preview:
         assert preview.width <= 1600
     assert not any(path.name.startswith(".") for path in evidence_dir.iterdir())
 
 
 @pytest.mark.parametrize("failure_step", [2, 3])
-@pytest.mark.parametrize("rerun", [False, True])
-def test_native_evidence_publication_failure_rolls_back_complete_set(
+def test_native_evidence_publication_failure_retains_visible_partial_set(
     tmp_path,
     monkeypatch,
     failure_step,
-    rerun,
 ):
     source = tmp_path / "source"
     source.mkdir()
@@ -1578,32 +1587,17 @@ def test_native_evidence_publication_failure_rolls_back_complete_set(
     assets, errors = prepare_image_assets(str(source), str(out))
     assert errors == []
     native = out / assets[0]["path"]
-    evidence_id = f"image-pair-rollback-{failure_step}-{int(rerun)}"
+    evidence_id = f"image-pair-partial-{failure_step}"
     final_names = [
         f"{evidence_id}-a.png",
         f"{evidence_id}-b.png",
         f"{evidence_id}-preview.jpg",
     ]
     evidence_dir = out / "images" / "evidence"
-    prior_bytes = None
-    if rerun:
-        write_native_pair_evidence(
-            str(native),
-            (10, 10, 150, 130),
-            (160, 10, 300, 130),
-            str(out),
-            evidence_id,
-        )
-        prior_bytes = {
-            name: (evidence_dir / name).read_bytes()
-            for name in final_names
-        }
-        Image.new("RGB", (310, 140), (20, 180, 70)).save(native)
-
     budget = ImageArtifactBudget(1024 * 1024 * 1024)
     budget.initialize_from_root(out)
     used_before = budget.used_bytes
-    real_replace = os.replace
+    real_link = os.link
     install_calls = 0
     failed = False
 
@@ -1613,6 +1607,7 @@ def test_native_evidence_publication_failure_rolls_back_complete_set(
         *,
         src_dir_fd=None,
         dst_dir_fd=None,
+        follow_symlinks=True,
     ):
         nonlocal install_calls, failed
         if (
@@ -1626,19 +1621,20 @@ def test_native_evidence_publication_failure_rolls_back_complete_set(
                 raise OSError(
                     f"synthetic evidence install {failure_step} failure"
                 )
-        return real_replace(
+        return real_link(
             src,
             dst,
             src_dir_fd=src_dir_fd,
             dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
         )
 
-    monkeypatch.setattr(_evidence.os, "replace", fail_selected_install)
+    monkeypatch.setattr(_evidence.os, "link", fail_selected_install)
 
     with pytest.raises(
-        OSError,
+        RuntimeError,
         match=f"synthetic evidence install {failure_step} failure",
-    ):
+    ) as exc_info:
         write_native_pair_evidence(
             str(native),
             (10, 10, 150, 130),
@@ -1650,20 +1646,205 @@ def test_native_evidence_publication_failure_rolls_back_complete_set(
 
     assert failed
     assert budget.used_bytes == used_before
-    if prior_bytes is None:
-        assert not any(
-            os.path.lexists(evidence_dir / name)
-            for name in final_names
-        )
-    else:
-        assert {
-            name: (evidence_dir / name).read_bytes()
-            for name in final_names
-        } == prior_bytes
-    assert not any(
-        path.name.startswith(".paperconan-evidence-")
+    installed_count = failure_step - 1
+    assert [
+        os.path.lexists(evidence_dir / name)
+        for name in final_names
+    ] == [
+        index < installed_count
+        for index in range(len(final_names))
+    ]
+    error = str(exc_info.value)
+    assert "publication incomplete" in error
+    for name in final_names[:installed_count]:
+        assert f"images/evidence/{name}" in error
+    hidden_entries = [
+        path
         for path in evidence_dir.iterdir()
+        if path.name.startswith(".paperconan-evidence-")
+    ]
+    assert hidden_entries == []
+
+
+def test_evidence_publication_retains_concurrent_final_without_backups(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    evidence_id = "image-pair-concurrent-final"
+    write_native_pair_evidence(
+        str(native),
+        (10, 10, 150, 130),
+        (160, 10, 300, 130),
+        str(out),
+        evidence_id,
     )
+    evidence_dir = out / "images" / "evidence"
+    first_final = evidence_dir / f"{evidence_id}-a.png"
+    second_final = evidence_dir / f"{evidence_id}-b.png"
+    preview_final = evidence_dir / f"{evidence_id}-preview.jpg"
+    first_final.unlink()
+    second_final.unlink()
+    preview_final.unlink()
+    concurrent_target = tmp_path / "concurrent-evidence.png"
+    Image.new("RGB", (7, 5), (10, 20, 30)).save(concurrent_target)
+    target_bytes = concurrent_target.read_bytes()
+    real_link = os.link
+    first_replaced = False
+
+    def link_first_then_fail_second(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal first_replaced
+        src_name = Path(src).name
+        dst_name = Path(dst).name
+        if (
+            src_name.startswith(".paperconan-evidence-")
+            and dst_name == first_final.name
+        ):
+            real_link(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            os.unlink(dst, dir_fd=dst_dir_fd)
+            os.symlink(concurrent_target, dst, dir_fd=dst_dir_fd)
+            first_replaced = True
+            return
+        if (
+            first_replaced
+            and src_name.startswith(".paperconan-evidence-")
+            and dst_name == second_final.name
+        ):
+            raise OSError("synthetic second evidence install failure")
+        return real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(
+        _evidence.os,
+        "link",
+        link_first_then_fail_second,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        write_native_pair_evidence(
+            str(native),
+            (10, 10, 150, 130),
+            (160, 10, 300, 130),
+            str(out),
+            evidence_id,
+        )
+
+    assert first_replaced
+    assert first_final.is_symlink()
+    assert first_final.readlink() == concurrent_target
+    assert concurrent_target.read_bytes() == target_bytes
+    error = str(exc_info.value)
+    assert "retained uncertain visible entry" in error
+    assert f"images/evidence/{first_final.name}" in error
+    hidden_entries = [
+        path
+        for path in evidence_dir.iterdir()
+        if path.name.startswith(".paperconan-evidence-")
+    ]
+    assert hidden_entries == []
+
+
+def test_evidence_publication_does_not_move_concurrent_final_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    evidence_id = "image-pair-concurrent-prepare"
+    evidence = write_native_pair_evidence(
+        str(native),
+        (10, 10, 150, 130),
+        (160, 10, 300, 130),
+        str(out),
+        evidence_id,
+    )
+    first_final = out / evidence["crop_a_path"]
+    second_final = out / evidence["crop_b_path"]
+    first_final.unlink()
+    concurrent_bytes = b"concurrent evidence replacement"
+    real_link = os.link
+    replacement_installed = False
+
+    def create_final_before_link(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal replacement_installed
+        if (
+            not replacement_installed
+            and Path(dst).name == first_final.name
+        ):
+            replacement_fd = os.open(
+                dst,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(replacement_fd, concurrent_bytes)
+            finally:
+                os.close(replacement_fd)
+            replacement_installed = True
+        return real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(
+        _evidence.os,
+        "link",
+        create_final_before_link,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        write_native_pair_evidence(
+            str(native),
+            (10, 10, 150, 130),
+            (160, 10, 300, 130),
+            str(out),
+            evidence_id,
+        )
+
+    assert replacement_installed
+    assert "retained existing visible entry" in str(exc_info.value)
+    assert first_final.read_bytes() == concurrent_bytes
+    assert second_final.is_file()
 
 
 def test_diagnostic_finding_ids_and_order_are_deterministic(tmp_path):
