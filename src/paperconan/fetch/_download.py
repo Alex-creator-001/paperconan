@@ -33,6 +33,8 @@ _ARCHIVE_MAX = 250 * 1024 * 1024    # 250 MB — whole supplementary zip
 # a paper's out_dir reaches this. Default 1.5 GB; raise PAPERCONAN_MAX_PAPER_MB on big disks.
 _MAX_PAPER_MB = float(os.environ.get("PAPERCONAN_MAX_PAPER_MB", "1500"))
 _MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
+_MAX_SOURCE_SIDECAR_BYTES = 8 * 1024 * 1024
+_FILE_COPY_CHUNK_BYTES = 64 * 1024
 
 
 class _UnstableRegularFileError(OSError):
@@ -428,13 +430,19 @@ def _write_collision_safe(
             return None
         try:
             opened = os.fstat(fd)
-            if not stat.S_ISREG(opened.st_mode):
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_size != len(data)
+            ):
                 return None
-            with os.fdopen(fd, "rb") as fh:
-                fd = -1
-                matches = fh.read() == data
-            if not matches:
-                return None
+            offset = 0
+            with os.fdopen(os.dup(fd), "rb") as fh:
+                while offset < len(data):
+                    chunk = fh.read(min(1024 * 1024, len(data) - offset))
+                    if not chunk or chunk != data[offset:offset + len(chunk)]:
+                        return None
+                    offset += len(chunk)
+            final_opened = os.fstat(fd)
             try:
                 current = os.stat(
                     filename,
@@ -445,8 +453,13 @@ def _write_collision_safe(
                 return None
             if (
                 stat.S_ISREG(current.st_mode)
+                and stat.S_ISREG(final_opened.st_mode)
+                and current.st_size == len(data)
+                and final_opened.st_size == len(data)
                 and current.st_dev == opened.st_dev
                 and current.st_ino == opened.st_ino
+                and final_opened.st_dev == opened.st_dev
+                and final_opened.st_ino == opened.st_ino
             ):
                 return current
             return None
@@ -833,6 +846,161 @@ def _safe_source_url(url: object) -> str | None:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
+def _hash_exact_fd(fd: int, size: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(_FILE_COPY_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise _UnstableRegularFileError(
+                "regular file changed during bounded read"
+            )
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise _UnstableRegularFileError(
+            "regular file changed during bounded read"
+        )
+    return digest.hexdigest()
+
+
+def _copy_prior_sidecar_backup(output: _PinnedOutputDirectory) -> str:
+    source_fd = backup_fd = -1
+    backup_name = None
+    try:
+        source_fd = os.open(
+            SOURCE_SIDECAR,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=output.fd,
+        )
+        opened = os.fstat(source_fd)
+        current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_size > _MAX_SOURCE_SIDECAR_BYTES
+            or opened.st_size != current.st_size
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+        ):
+            raise _UnstableRegularFileError(
+                "prior provenance sidecar is not a stable bounded regular file"
+            )
+        for _ in range(128):
+            backup_name = f".paperconan-sidecar-backup-{secrets.token_hex(8)}"
+            try:
+                backup_fd = os.open(
+                    backup_name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=output.fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(
+                "could not retain prior provenance sidecar"
+            )
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        remaining = opened.st_size
+        copied_digest = hashlib.sha256()
+        while remaining:
+            chunk = os.read(
+                source_fd,
+                min(_FILE_COPY_CHUNK_BYTES, remaining),
+            )
+            if not chunk:
+                raise _UnstableRegularFileError(
+                    "prior provenance sidecar changed during backup"
+                )
+            copied_digest.update(chunk)
+            remaining -= len(chunk)
+            pending = memoryview(chunk)
+            while pending:
+                written = os.write(backup_fd, pending)
+                if written <= 0:
+                    raise OSError("provenance sidecar backup write failed")
+                pending = pending[written:]
+        if os.read(source_fd, 1):
+            raise _UnstableRegularFileError(
+                "prior provenance sidecar changed during backup"
+            )
+        os.fsync(backup_fd)
+        final_opened = os.fstat(source_fd)
+        final_current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        backup = os.fstat(backup_fd)
+        if (
+            not stat.S_ISREG(final_opened.st_mode)
+            or not stat.S_ISREG(final_current.st_mode)
+            or not stat.S_ISREG(backup.st_mode)
+            or final_opened.st_size != opened.st_size
+            or final_current.st_size != opened.st_size
+            or backup.st_size != opened.st_size
+            or final_opened.st_dev != opened.st_dev
+            or final_opened.st_ino != opened.st_ino
+            or final_current.st_dev != opened.st_dev
+            or final_current.st_ino != opened.st_ino
+            or final_opened.st_mtime_ns != opened.st_mtime_ns
+            or final_opened.st_ctime_ns != opened.st_ctime_ns
+            or (backup.st_dev, backup.st_ino)
+            == (opened.st_dev, opened.st_ino)
+        ):
+            raise _UnstableRegularFileError(
+                "prior provenance sidecar changed during backup"
+            )
+        copied_sha256 = copied_digest.hexdigest()
+        if (
+            _hash_exact_fd(source_fd, opened.st_size) != copied_sha256
+            or _hash_exact_fd(backup_fd, opened.st_size) != copied_sha256
+        ):
+            raise _UnstableRegularFileError(
+                "prior provenance sidecar changed during backup"
+            )
+        verified_opened = os.fstat(source_fd)
+        verified_current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        if (
+            verified_opened.st_size != opened.st_size
+            or verified_current.st_size != opened.st_size
+            or verified_opened.st_dev != opened.st_dev
+            or verified_opened.st_ino != opened.st_ino
+            or verified_current.st_dev != opened.st_dev
+            or verified_current.st_ino != opened.st_ino
+            or verified_opened.st_mtime_ns != opened.st_mtime_ns
+            or verified_opened.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise _UnstableRegularFileError(
+                "prior provenance sidecar changed during backup"
+            )
+        output.verify()
+        retained_name = backup_name
+        backup_name = None
+        return retained_name
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if backup_fd >= 0:
+            os.close(backup_fd)
+        if backup_name is not None:
+            try:
+                os.unlink(backup_name, dir_fd=output.fd)
+            except FileNotFoundError:
+                pass
+
+
 def _write_source_sidecar(cand, out_dir, downloads=None):
     """Record which paper/dataset these downloads came from, for scan.json provenance."""
     prov = {"doi": cand.get("doi"), "title": cand.get("title"),
@@ -882,42 +1050,7 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
             os.fsync(fh.fileno())
         out_dir.verify()
         if current is not None:
-            for _ in range(128):
-                backup_name = f".paperconan-sidecar-backup-{secrets.token_hex(8)}"
-                try:
-                    os.link(
-                        SOURCE_SIDECAR,
-                        backup_name,
-                        src_dir_fd=out_dir.fd,
-                        dst_dir_fd=out_dir.fd,
-                        follow_symlinks=False,
-                    )
-                    break
-                except FileExistsError:
-                    continue
-            else:
-                raise FileExistsError(
-                    "could not retain prior provenance sidecar"
-                )
-            retained = os.stat(
-                backup_name,
-                dir_fd=out_dir.fd,
-                follow_symlinks=False,
-            )
-            current = os.stat(
-                SOURCE_SIDECAR,
-                dir_fd=out_dir.fd,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(retained.st_mode)
-                or not stat.S_ISREG(current.st_mode)
-                or retained.st_dev != current.st_dev
-                or retained.st_ino != current.st_ino
-            ):
-                raise _UnstableRegularFileError(
-                    "provenance sidecar changed during publication"
-                )
+            backup_name = _copy_prior_sidecar_backup(out_dir)
         os.replace(
             temp_name,
             SOURCE_SIDECAR,

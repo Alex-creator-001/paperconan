@@ -753,6 +753,91 @@ def test_final_output_replacement_rolls_back_provenance_sidecar(
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
+def test_sidecar_rollback_uses_immutable_prior_bytes(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    previous_bytes = b'{"cand_id":"previous:1","downloads":[]}'
+    mutated_bytes = b"x" * len(previous_bytes)
+    sidecar.write_bytes(previous_bytes)
+    old_writer_fd = os.open(sidecar, os.O_RDWR | os.O_NOFOLLOW)
+    payload = b"a,b\n1,2\n"
+    replacement = b"x,y\n9,8\n"
+    old_inode_mutated = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    real_write_source_sidecar = _download._write_source_sidecar
+
+    def publish_then_mutate_old_inode(cand, output, downloads=None):
+        nonlocal old_inode_mutated
+        publication = real_write_source_sidecar(
+            cand,
+            output,
+            downloads=downloads,
+        )
+        published = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert published["downloads"][0]["file"] == "data.csv"
+        os.lseek(old_writer_fd, 0, os.SEEK_SET)
+        os.write(old_writer_fd, mutated_bytes)
+        os.ftruncate(old_writer_fd, len(mutated_bytes))
+        os.fsync(old_writer_fd)
+        old_inode_mutated = True
+        os.unlink("data.csv", dir_fd=output.fd)
+        replacement_fd = os.open(
+            "data.csv",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=output.fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+        finally:
+            os.close(replacement_fd)
+        return publication
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_write_source_sidecar",
+        publish_then_mutate_old_inode,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    try:
+        summary = _download.download_candidate(candidate, str(out_dir))
+        os.lseek(old_writer_fd, 0, os.SEEK_SET)
+        old_inode_bytes = os.read(old_writer_fd, len(mutated_bytes))
+    finally:
+        os.close(old_writer_fd)
+
+    assert old_inode_mutated
+    assert old_inode_bytes == mutated_bytes
+    assert summary["downloaded"] == []
+    assert len(summary["skipped"]) == 1
+    assert sidecar.read_bytes() == previous_bytes
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))
+
+
 def test_direct_download_does_not_follow_existing_destination_symlink(
     monkeypatch,
     tmp_path,
@@ -861,6 +946,71 @@ def test_write_collision_safe_preserves_different_candidate_and_digest_files(tmp
     assert digest_path.read_bytes() == b"existing-digest"
     assert published == tmp_path / f"Fig1-{digest}-2.png"
     assert published.read_bytes() == data
+
+
+def test_write_collision_safe_bounds_existing_file_comparison(
+    monkeypatch,
+    tmp_path,
+):
+    data = b"new-image"
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    candidate = tmp_path / "Fig1.png"
+    with candidate.open("wb") as fh:
+        fh.truncate(1024 * 1024 * 1024)
+    digest_path = tmp_path / f"Fig1-{digest}.png"
+    digest_path.write_bytes(data)
+    candidate_identity = (
+        candidate.stat().st_dev,
+        candidate.stat().st_ino,
+    )
+    digest_identity = (
+        digest_path.stat().st_dev,
+        digest_path.stat().st_ino,
+    )
+    candidate_read_sizes = []
+    digest_read_sizes = []
+    real_fdopen = os.fdopen
+
+    class TrackingReader:
+        def __init__(self, fh, read_sizes, *, sparse=False):
+            self._fh = fh
+            self._read_sizes = read_sizes
+            self._sparse = sparse
+
+        def __enter__(self):
+            self._fh.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._fh.__exit__(*args)
+
+        def read(self, size=-1):
+            self._read_sizes.append(size)
+            if self._sparse and size < 0:
+                return b"different"
+            return self._fh.read(size)
+
+    def tracking_fdopen(fd, *args, **kwargs):
+        identity = os.fstat(fd)
+        identity = (identity.st_dev, identity.st_ino)
+        fh = real_fdopen(fd, *args, **kwargs)
+        if identity == candidate_identity:
+            return TrackingReader(fh, candidate_read_sizes, sparse=True)
+        if identity == digest_identity:
+            return TrackingReader(fh, digest_read_sizes)
+        return fh
+
+    monkeypatch.setattr(_download.os, "fdopen", tracking_fdopen)
+
+    published = Path(
+        _download._write_collision_safe(str(tmp_path), "Fig1.png", data)
+    )
+
+    assert candidate.stat().st_size == 1024 * 1024 * 1024
+    assert published == digest_path
+    assert candidate_read_sizes == []
+    assert digest_read_sizes
+    assert all(size > 0 for size in digest_read_sizes)
 
 
 def test_write_collision_safe_does_not_clobber_file_created_during_publish(
