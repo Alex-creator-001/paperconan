@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import UserDict
 import json
 import subprocess
 import sys
@@ -17,6 +18,10 @@ PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
     "+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
+
+
+class _DictionarySubclass(dict):
+    pass
 
 
 def _verdict() -> dict:
@@ -467,8 +472,8 @@ def test_legacy_finding_refs_must_be_list_or_null(value):
     assert str(exc.value) == "verdict finding_refs must be a list or null"
 
 
-@pytest.mark.parametrize("entry", [None, [], "not-a-mapping"])
-def test_legacy_finding_ref_entries_must_be_mappings(entry):
+@pytest.mark.parametrize("entry", [None, [], "not-a-dictionary"])
+def test_legacy_finding_ref_entries_must_be_dictionaries(entry):
     with pytest.raises(ValueError) as exc:
         render_adjudicated_report(
             _scan_two_findings(),
@@ -479,7 +484,7 @@ def test_legacy_finding_ref_entries_must_be_mappings(entry):
             },
         )
 
-    assert str(exc.value) == "verdict finding_refs entries must be mappings"
+    assert str(exc.value) == "verdict finding_refs entries must be dictionaries"
 
 
 def test_legacy_finding_refs_limit_is_deterministic():
@@ -511,7 +516,7 @@ def test_legacy_shape_validation_precedes_neutral_text_inspection():
             },
         )
 
-    assert str(exc.value) == "verdict finding_refs entries must be mappings"
+    assert str(exc.value) == "verdict finding_refs entries must be dictionaries"
     assert blocked not in str(exc.value).casefold()
 
 
@@ -614,19 +619,19 @@ def test_multi_finding_non_rendered_selector_metadata_is_ignored():
     assert "Unmatched" in html
 
 
-@pytest.mark.parametrize("entry", [None, [], "not-a-mapping"])
-def test_modern_finding_entries_must_be_mappings(entry):
+@pytest.mark.parametrize("entry", [None, [], "not-a-dictionary"])
+def test_modern_finding_entries_must_be_dictionaries(entry):
     with pytest.raises(ValueError) as exc:
         render_adjudicated_report(
             _scan_two_findings(),
             {"verdict": "NEEDS_HUMAN", "findings": [entry]},
         )
 
-    assert str(exc.value) == "verdict finding entries must be mappings"
+    assert str(exc.value) == "verdict finding entries must be dictionaries"
 
 
-@pytest.mark.parametrize("value", [[], "not-a-mapping", 7])
-def test_modern_finding_ref_must_be_mapping_or_null(value):
+@pytest.mark.parametrize("value", [[], "not-a-dictionary", 7])
+def test_modern_finding_ref_must_be_dictionary_or_null(value):
     with pytest.raises(ValueError) as exc:
         render_adjudicated_report(
             _scan_two_findings(),
@@ -636,7 +641,7 @@ def test_modern_finding_ref_must_be_mapping_or_null(value):
             },
         )
 
-    assert str(exc.value) == "verdict finding_ref must be a mapping or null"
+    assert str(exc.value) == "verdict finding_ref must be a dictionary or null"
 
 
 @pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
@@ -655,8 +660,8 @@ def test_modern_reference_collections_must_be_lists(field, value):
 
 
 @pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
-@pytest.mark.parametrize("entry", [None, [], "not-a-mapping"])
-def test_modern_reference_entries_must_be_mappings(field, entry):
+@pytest.mark.parametrize("entry", [None, [], "not-a-dictionary"])
+def test_modern_reference_entries_must_be_dictionaries(field, entry):
     with pytest.raises(ValueError) as exc:
         render_adjudicated_report(
             _scan_two_findings(),
@@ -666,7 +671,144 @@ def test_modern_reference_entries_must_be_mappings(field, entry):
             },
         )
 
-    assert str(exc.value) == f"verdict {field} entries must be mappings"
+    assert str(exc.value) == f"verdict {field} entries must be dictionaries"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "message"),
+    [
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [UserDict({
+                    "title": "mis" + "conduct",
+                    "report_md": "The signal requires contextual review.",
+                })],
+            },
+            "verdict finding entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "finding_ref": UserDict({"sheet": "mis" + "conduct"}),
+                }],
+            },
+            "verdict finding_ref must be a dictionary or null",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "extra_refs": [UserDict({"sheet": "mis" + "conduct"})],
+                }],
+            },
+            "verdict extra_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "image_refs": [UserDict({
+                        "asset_id": "img:a",
+                        "label": "mis" + "conduct",
+                    })],
+                }],
+            },
+            "verdict image_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [UserDict({"sheet": "mis" + "conduct"})],
+            },
+            "verdict finding_refs entries must be dictionaries",
+        ),
+    ],
+    ids=[
+        "modern-finding",
+        "modern-finding-ref",
+        "modern-extra-ref",
+        "modern-image-ref",
+        "legacy-finding-ref",
+    ],
+)
+def test_non_dictionary_verdict_objects_are_rejected_without_echo(
+    verdict,
+    message,
+):
+    blocked = "mis" + "conduct"
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == message
+    assert blocked not in str(exc.value).casefold()
+
+
+@pytest.mark.parametrize(
+    ("verdict", "message"),
+    [
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [_DictionarySubclass()],
+            },
+            "verdict finding entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "finding_ref": _DictionarySubclass(),
+                }],
+            },
+            "verdict finding_ref must be a dictionary or null",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "extra_refs": [_DictionarySubclass()],
+                }],
+            },
+            "verdict extra_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    "image_refs": [_DictionarySubclass()],
+                }],
+            },
+            "verdict image_refs entries must be dictionaries",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [_DictionarySubclass()],
+            },
+            "verdict finding_refs entries must be dictionaries",
+        ),
+    ],
+    ids=[
+        "modern-finding",
+        "modern-finding-ref",
+        "modern-extra-ref",
+        "modern-image-ref",
+        "legacy-finding-ref",
+    ],
+)
+def test_dictionary_subclasses_are_rejected_at_verdict_ingress(
+    verdict,
+    message,
+):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == message
 
 
 def test_modern_findings_limit_is_deterministic():
@@ -788,8 +930,155 @@ def test_modern_shape_validation_precedes_neutral_text_inspection():
             },
         )
 
-    assert str(exc.value) == "verdict finding entries must be mappings"
+    assert str(exc.value) == "verdict finding entries must be dictionaries"
     assert attacker_text not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        (
+            "paper_conclusion",
+            "verdict paper_conclusion must be a string or null",
+        ),
+        (
+            "review_note",
+            "verdict review_note must be a string or null",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [7, 1.5, False, [], {}, UserDict({"note": "value"})],
+    ids=["integer", "float", "boolean", "list", "dictionary", "user-dictionary"],
+)
+def test_paper_markdown_fields_require_string_or_null(field, message, value):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [],
+        field: value,
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == message
+
+
+@pytest.mark.parametrize(
+    "value",
+    [7, 1.5, False, [], {}, UserDict({"note": "value"})],
+    ids=["integer", "float", "boolean", "list", "dictionary", "user-dictionary"],
+)
+def test_modern_finding_report_md_requires_string_or_null(value):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{"report_md": value}],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == (
+        "verdict finding report_md must be a string or null"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [7, 1.5, False, [], {}, UserDict({"note": "value"})],
+    ids=["integer", "float", "boolean", "list", "dictionary", "user-dictionary"],
+)
+def test_legacy_report_md_requires_string_or_null(value):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "report_md": value,
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert str(exc.value) == "verdict report_md must be a string or null"
+
+
+def test_markdown_schema_validation_precedes_copy_and_neutral_inspection(
+    monkeypatch,
+):
+    blocked = "mis" + "conduct"
+
+    def reject_late_work(*args, **kwargs):
+        raise AssertionError("late report work must not start")
+
+    monkeypatch.setattr(
+        _adjudicated_html.copy,
+        "deepcopy",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_validate_neutral_verdict",
+        reject_late_work,
+    )
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "paper_conclusion": UserDict({"text": blocked}),
+                "findings": [],
+            },
+        )
+
+    assert str(exc.value) == (
+        "verdict paper_conclusion must be a string or null"
+    )
+    assert blocked not in str(exc.value).casefold()
+
+
+def test_markdown_fields_preserve_absent_null_and_string_behavior():
+    for verdict in (
+        {
+            "verdict": "NEEDS_HUMAN",
+            "findings": [{}],
+        },
+        {
+            "verdict": "NEEDS_HUMAN",
+            "paper_conclusion": None,
+            "review_note": None,
+            "findings": [{"report_md": None}],
+        },
+        {
+            "verdict": "NEEDS_HUMAN",
+            "review_note": None,
+            "report_md": None,
+        },
+    ):
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    modern = render_adjudicated_report(
+        _scan_two_findings(),
+        {
+            "verdict": "NEEDS_HUMAN",
+            "paper_conclusion": "Paper-level context.",
+            "review_note": "Review context.",
+            "findings": [{"report_md": "Finding context."}],
+        },
+    )
+    legacy = render_adjudicated_report(
+        _scan_two_findings(),
+        {
+            "verdict": "NEEDS_HUMAN",
+            "review_note": "Legacy review context.",
+            "report_md": "Legacy finding context.",
+        },
+    )
+
+    assert "Paper-level context." in modern
+    assert "Review context." in modern
+    assert "Finding context." in modern
+    assert "Legacy review context." in legacy
+    assert "Legacy finding context." in legacy
 
 
 def test_hero_shows_highest_tier_across_findings():

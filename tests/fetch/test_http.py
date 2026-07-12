@@ -1,6 +1,11 @@
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import threading
+
 import pytest
+
 from paperconan.fetch import _http
 
 
@@ -27,6 +32,43 @@ class _TextResponse(io.BytesIO):
 
     def __exit__(self, *args):
         self.close()
+
+
+class _StubOpener:
+    def __init__(self, response):
+        self.response = response
+
+    def open(self, req, timeout=None):
+        return self.response
+
+
+@contextmanager
+def _serve(routes):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            status, headers, body = routes[self.path]
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def test_get_json_builds_query_and_parses(monkeypatch):
@@ -91,6 +133,11 @@ def test_get_text_allowed_origins_checks_redirect_destination(monkeypatch):
         "urlopen",
         lambda req, timeout=None: response,
     )
+    monkeypatch.setattr(
+        _http.urllib.request,
+        "build_opener",
+        lambda *handlers: _StubOpener(response),
+    )
 
     with pytest.raises(ValueError) as exc:
         _http.get_text(
@@ -100,6 +147,80 @@ def test_get_text_allowed_origins_checks_redirect_destination(monkeypatch):
         )
 
     assert str(exc.value) == "text response origin is not allowed"
+
+
+@pytest.mark.parametrize(
+    "target_url",
+    [
+        lambda target: target.replace("127.0.0.1", "localhost") + "/sink",
+        lambda target: target + "/sink",
+        lambda target: target.replace("http://", "http://user@") + "/sink",
+    ],
+    ids=["disallowed-host", "unexpected-port", "credentials"],
+)
+def test_get_text_rejects_redirect_before_disallowed_target_contact(target_url):
+    with _serve({"/sink": (200, {}, b"unexpected")}) as (
+        target,
+        target_requests,
+    ):
+        location = target_url(target)
+        with _serve({
+            "/start": (302, {"Location": location}, b""),
+        }) as (source, source_requests):
+            with pytest.raises(ValueError) as exc:
+                _http.get_text(
+                    source + "/start",
+                    max_bytes=1024,
+                    allowed_origins={source},
+                )
+
+    assert str(exc.value) == "text response origin is not allowed"
+    assert source_requests == ["/start"]
+    assert target_requests == []
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://127.0.0.1:not-a-port/sink",
+        "http://[::1/sink",
+    ],
+    ids=["invalid-port", "invalid-bracket"],
+)
+def test_get_text_rejects_malformed_redirect_authority_with_fixed_message(
+    location,
+):
+    with _serve({
+        "/start": (
+            302,
+            {"Location": location},
+            b"",
+        ),
+    }) as (source, source_requests):
+        with pytest.raises(ValueError) as exc:
+            _http.get_text(
+                source + "/start",
+                max_bytes=1024,
+                allowed_origins={source},
+            )
+
+    assert str(exc.value) == "text response origin is not allowed"
+    assert source_requests == ["/start"]
+
+
+def test_get_text_allows_relative_redirect_within_allowed_origin():
+    with _serve({
+        "/start": (302, {"Location": "/final"}, b""),
+        "/final": (200, {}, b"<html>ok</html>"),
+    }) as (source, requests):
+        text = _http.get_text(
+            source + "/start",
+            max_bytes=1024,
+            allowed_origins={source},
+        )
+
+    assert text == "<html>ok</html>"
+    assert requests == ["/start", "/final"]
 
 
 def test_get_text_generic_call_remains_backward_compatible(monkeypatch):

@@ -194,8 +194,10 @@ def test_neutral_language_matcher_blocks_expression_families(text: str) -> None:
     [
         "sample_" + "fa" + "ke_download",
         "sample" + "Fa" + "keDownload",
+        "sample_" + "fa" + "ke2_download",
+        "sample_2" + "fa" + "ke_download",
     ],
-    ids=["underscore", "camel-case"],
+    ids=["underscore", "camel-case", "letter-to-digit", "digit-to-letter"],
 )
 def test_neutral_language_matcher_normalizes_identifier_boundaries(text: str) -> None:
     assert contains_blocked_language(text)
@@ -207,6 +209,13 @@ def test_tracked_surface_identifier_and_code_block_text_is_inspected(
     identifier = "fa" + "ke_download"
     source = tmp_path / "sample.py"
     source.write_text(f"def {identifier}():\n    return None\n", encoding="utf-8")
+    assert contains_blocked_language(_python_identifier_text(source))
+
+    numeric_identifier = "fa" + "ke2_download"
+    source.write_text(
+        f"def {numeric_identifier}():\n    return None\n",
+        encoding="utf-8",
+    )
     assert contains_blocked_language(_python_identifier_text(source))
 
     document = tmp_path / "sample.md"
@@ -249,6 +258,13 @@ def test_verdict_reference_ceiling_is_documented() -> None:
     reports = (ROOT / "docs" / "reports.md").read_text(encoding="utf-8")
 
     assert "5,000 raw verdict references" in reports
+
+
+def test_verdict_ingress_schema_contract_is_documented() -> None:
+    reports = (ROOT / "docs" / "reports.md").read_text(encoding="utf-8")
+
+    assert "concrete JSON objects" in reports
+    assert "Markdown-rendered verdict fields must be strings or `null`" in reports
 
 
 def test_skill_routes_adaptive_image_review() -> None:

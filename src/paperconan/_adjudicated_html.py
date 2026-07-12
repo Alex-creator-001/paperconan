@@ -10,7 +10,6 @@ worker, DOI claiming, or private batch assumptions live here.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
 import copy
 import html
 from html.parser import HTMLParser
@@ -136,6 +135,11 @@ def _is_image_verdict_finding(finding: dict[str, Any]) -> bool:
     return finding.get("finding_type") == "image" or bool(finding.get("image_refs"))
 
 
+def _validate_optional_markdown(value: object, message: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise ValueError(message)
+
+
 def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
     if "findings" not in verdict:
         return None
@@ -148,12 +152,12 @@ def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
             f"{_MAX_MODERN_FINDINGS} entries"
         )
     for finding in findings:
-        if not isinstance(finding, Mapping):
-            raise ValueError("verdict finding entries must be mappings")
+        if type(finding) is not dict:
+            raise ValueError("verdict finding entries must be dictionaries")
         finding_ref = finding.get("finding_ref")
-        if finding_ref is not None and not isinstance(finding_ref, Mapping):
+        if finding_ref is not None and type(finding_ref) is not dict:
             raise ValueError(
-                "verdict finding_ref must be a mapping or null"
+                "verdict finding_ref must be a dictionary or null"
             )
         for field in ("extra_refs", "image_refs"):
             if field not in finding:
@@ -166,9 +170,9 @@ def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
                     f"verdict {field} must contain at most "
                     f"{_MAX_MODERN_REFERENCES} entries"
                 )
-            if any(not isinstance(reference, Mapping) for reference in references):
+            if any(type(reference) is not dict for reference in references):
                 raise ValueError(
-                    f"verdict {field} entries must be mappings"
+                    f"verdict {field} entries must be dictionaries"
                 )
             if field == "image_refs":
                 for reference in references:
@@ -187,10 +191,14 @@ def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
                             "verdict image_refs box must contain exactly four "
                             "non-boolean integers"
                         )
+        _validate_optional_markdown(
+            finding.get("report_md"),
+            "verdict finding report_md must be a string or null",
+        )
     return findings
 
 
-def _legacy_finding_refs(verdict: dict[str, Any]) -> list[Mapping[str, Any]]:
+def _legacy_finding_refs(verdict: dict[str, Any]) -> list[dict[str, Any]]:
     references = verdict.get("finding_refs")
     if references is None:
         return []
@@ -201,14 +209,14 @@ def _legacy_finding_refs(verdict: dict[str, Any]) -> list[Mapping[str, Any]]:
             "verdict finding_refs must contain at most "
             f"{_MAX_VERDICT_REFERENCES} entries"
         )
-    if any(not isinstance(reference, Mapping) for reference in references):
-        raise ValueError("verdict finding_refs entries must be mappings")
+    if any(type(reference) is not dict for reference in references):
+        raise ValueError("verdict finding_refs entries must be dictionaries")
     return references
 
 
 def _validate_verdict_reference_limit(
     findings: list[Any] | None,
-    legacy_references: list[Mapping[str, Any]],
+    legacy_references: list[dict[str, Any]],
 ) -> None:
     count = len(legacy_references)
     for finding in findings or []:
@@ -232,7 +240,7 @@ _SELECTOR_REFERENCE_FIELDS = (
 )
 
 
-def _selector_reference_key(reference: Mapping[str, Any]) -> tuple[Any, ...]:
+def _selector_reference_key(reference: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(
         str(value) if (value := reference.get(field)) else None
         for field in _SELECTOR_REFERENCE_FIELDS
@@ -240,7 +248,7 @@ def _selector_reference_key(reference: Mapping[str, Any]) -> tuple[Any, ...]:
 
 
 def _image_reference_key(
-    reference: Mapping[str, Any],
+    reference: dict[str, Any],
     assets: dict[str, dict[str, Any]],
 ) -> tuple[Any, ...]:
     asset_id = str(reference.get("asset_id"))
@@ -258,9 +266,9 @@ def _image_reference_key(
 
 
 def _deduplicate_references(
-    references: list[Mapping[str, Any]],
+    references: list[dict[str, Any]],
     key,
-) -> list[Mapping[str, Any]]:
+) -> list[dict[str, Any]]:
     unique = []
     seen = set()
     for reference in references:
@@ -465,6 +473,19 @@ def _normalized_verdict_copy(
     if source_findings is None:
         legacy_references = _legacy_finding_refs(verdict)
     _validate_verdict_reference_limit(source_findings, legacy_references)
+    _validate_optional_markdown(
+        verdict.get("paper_conclusion"),
+        "verdict paper_conclusion must be a string or null",
+    )
+    _validate_optional_markdown(
+        verdict.get("review_note"),
+        "verdict review_note must be a string or null",
+    )
+    if source_findings is None:
+        _validate_optional_markdown(
+            verdict.get("report_md"),
+            "verdict report_md must be a string or null",
+        )
 
     normalized = copy.deepcopy(verdict)
     findings = (
