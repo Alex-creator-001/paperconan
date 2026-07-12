@@ -12,6 +12,8 @@ from ._evidence import write_native_pair_evidence
 
 _MIN_PANEL_SIDE = 64
 _SIMILARITY_THRESHOLD = 0.92
+_MAX_PANEL_CANDIDATES = 64
+_MAX_PANEL_PAIR_COMPARISONS = 4096
 
 
 def _cv2():
@@ -40,7 +42,9 @@ def _uniform_runs(values: np.ndarray) -> list[tuple[int, int]]:
     return runs
 
 
-def propose_panels(image: np.ndarray) -> list[tuple[int, int, int, int]]:
+def _propose_panels_bounded(
+    image: np.ndarray,
+) -> tuple[list[tuple[int, int, int, int]], bool]:
     cv2 = _cv2()
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     row_std = gray.std(axis=1)
@@ -50,14 +54,28 @@ def propose_panels(image: np.ndarray) -> list[tuple[int, int, int, int]]:
     y_edges = [0] + [int((a + b) / 2) for a, b in row_runs] + [gray.shape[0]]
     x_edges = [0] + [int((a + b) / 2) for a, b in col_runs] + [gray.shape[1]]
     boxes = []
+    omitted = False
     for y0, y1 in zip(y_edges, y_edges[1:]):
         for x0, x1 in zip(x_edges, x_edges[1:]):
             if x1 - x0 < _MIN_PANEL_SIDE or y1 - y0 < _MIN_PANEL_SIDE:
                 continue
             patch = gray[y0:y1, x0:x1]
             if patch.std() >= 8:
+                if len(boxes) >= _MAX_PANEL_CANDIDATES:
+                    omitted = True
+                    break
                 boxes.append((x0, y0, x1, y1))
-    return boxes or [(0, 0, gray.shape[1], gray.shape[0])]
+        if omitted:
+            break
+    return (
+        boxes or [(0, 0, gray.shape[1], gray.shape[0])],
+        omitted,
+    )
+
+
+def propose_panels(image: np.ndarray) -> list[tuple[int, int, int, int]]:
+    boxes, _ = _propose_panels_bounded(image)
+    return boxes
 
 
 def _normalized_gray(image: np.ndarray, size: int = 128) -> np.ndarray:
@@ -125,12 +143,26 @@ def diagnose_image_assets(
                 "error": "unable to decode registered image",
             })
             continue
-        boxes = propose_panels(image)
+        boxes, panels_omitted = _propose_panels_bounded(image)
+        if panels_omitted:
+            errors.append({
+                "file": asset.get("file"),
+                "error": (
+                    "image panel candidates omitted; "
+                    f"limit is {_MAX_PANEL_CANDIDATES}"
+                ),
+            })
+        comparisons = 0
+        pairs_omitted = False
         for left_index in range(len(boxes)):
             for right_index in range(left_index + 1, len(boxes)):
+                if comparisons >= _MAX_PANEL_PAIR_COMPARISONS:
+                    pairs_omitted = True
+                    break
                 box_a, box_b = boxes[left_index], boxes[right_index]
                 a = image[box_a[1]:box_a[3], box_a[0]:box_a[2]]
                 b = image[box_b[1]:box_b[3], box_b[0]:box_b[2]]
+                comparisons += 1
                 score, transform = transform_robust_similarity(a, b)
                 if score < _SIMILARITY_THRESHOLD:
                     continue
@@ -163,6 +195,16 @@ def diagnose_image_assets(
                     "_box_b": box_b,
                     "_file": asset.get("file"),
                 })
+            if pairs_omitted:
+                break
+        if pairs_omitted:
+            errors.append({
+                "file": asset.get("file"),
+                "error": (
+                    "image panel-pair comparisons omitted; "
+                    f"limit is {_MAX_PANEL_PAIR_COMPARISONS}"
+                ),
+            })
     candidates.sort(key=lambda item: (-item["score"], item["finding_id"]))
     max_findings = _max_image_findings()
     if len(candidates) > max_findings:

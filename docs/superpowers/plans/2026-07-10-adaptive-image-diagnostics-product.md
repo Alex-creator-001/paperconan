@@ -2216,7 +2216,10 @@ from paperconan import scan_dir, write_adjudicated_report
 def test_mixed_numeric_and_image_workflow_produces_one_report(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
-    (source / "data.csv").write_text("a,b\n1,2\n2,3\n3,4\n", encoding="utf-8")
+    (source / "data.csv").write_text(
+        "a,b\n1,2\n2,3\n3,4\n4,5\n",
+        encoding="utf-8",
+    )
     Image.new("RGB", (64, 48), (30, 100, 180)).save(source / "Fig1.png")
     audit = tmp_path / "audit"
 
@@ -2394,7 +2397,7 @@ Run:
 ```bash
 tmp_dir="$(mktemp -d)"
 mkdir -p "$tmp_dir/input"
-printf 'a,b\n1,2\n2,3\n3,4\n' > "$tmp_dir/input/data.csv"
+printf 'a,b\n1,2\n2,3\n3,4\n4,5\n' > "$tmp_dir/input/data.csv"
 uv run python - <<'PY' "$tmp_dir/input/Fig1.png"
 from PIL import Image
 import sys

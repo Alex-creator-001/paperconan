@@ -1,11 +1,14 @@
 """Defensive file download: redirects (urllib default), timeout, size cap,
 content-type sniffing so an HTML error page is never saved as data."""
 from __future__ import annotations
+from contextlib import contextmanager
 import hashlib
 import io
 import json
 import os
+import stat
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -30,6 +33,40 @@ _MAX_PAPER_MB = float(os.environ.get("PAPERCONAN_MAX_PAPER_MB", "1500"))
 _MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
 
 
+class _UnstableRegularFileError(OSError):
+    pass
+
+
+@contextmanager
+def _open_stable_regular(path: str):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _UnstableRegularFileError("no-follow file opening is unavailable")
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow)
+    except OSError as exc:
+        raise _UnstableRegularFileError(f"cannot open without following links: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        try:
+            current = os.lstat(path)
+        except OSError as exc:
+            raise _UnstableRegularFileError(f"path entry is unavailable: {exc}") from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+        ):
+            raise _UnstableRegularFileError("opened file does not match the current path entry")
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            yield fh
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _dir_size(path):
     total = 0
     for dp, _, fs in os.walk(path):
@@ -52,6 +89,8 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     last_reason = "unknown error"
     for attempt in range(retries):
+        fd = -1
+        temp_path = None
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 ctype = (resp.info().get("Content-Type") or "").lower()
@@ -62,23 +101,29 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                 if clen and clen.isdigit() and int(clen) > max_bytes:
                     return {"ok": False, "path": dest_path,
                             "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
-                os.makedirs(os.path.dirname(os.path.abspath(dest_path)) or ".", exist_ok=True)
+                dest_dir = os.path.realpath(
+                    os.path.dirname(os.path.abspath(dest_path)) or "."
+                )
+                os.makedirs(dest_dir, exist_ok=True)
+                resolved_dest = os.path.join(dest_dir, os.path.basename(dest_path))
+                fd, temp_path = tempfile.mkstemp(
+                    prefix=".paperconan-download-body-",
+                    dir=dest_dir,
+                )
                 total = 0
-                with open(dest_path, "wb") as fh:
+                with os.fdopen(fd, "wb") as fh:
+                    fd = -1
                     while True:
                         chunk = resp.read(65536)
                         if not chunk:
                             break
                         total += len(chunk)
                         if total > max_bytes:
-                            fh.close()
-                            try:
-                                os.remove(dest_path)
-                            except OSError:
-                                pass
                             return {"ok": False, "path": dest_path,
                                     "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
                         fh.write(chunk)
+                os.replace(temp_path, resolved_dest)
+                temp_path = None
                 return {
                     "ok": True,
                     "path": dest_path,
@@ -96,23 +141,95 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                 return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
         except Exception as e:
             last_reason = f"download error: {e}"
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temp_path is not None:
+                try:
+                    os.remove(temp_path)
+                except FileNotFoundError:
+                    pass
         if attempt < retries - 1:
             time.sleep(backoff * (2 ** attempt))
     return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
 
 
 def _write_collision_safe(out_dir: str, name: str, data: bytes) -> str:
+    def regular_file_matches(path: str) -> bool:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            return False
+        try:
+            fd = os.open(path, os.O_RDONLY | nofollow)
+        except OSError:
+            return False
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                return False
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                matches = fh.read() == data
+            if not matches:
+                return False
+            try:
+                current = os.lstat(path)
+            except FileNotFoundError:
+                return False
+            return (
+                stat.S_ISREG(current.st_mode)
+                and current.st_dev == opened.st_dev
+                and current.st_ino == opened.st_ino
+            )
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    out_dir = os.path.realpath(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
     stem, suffix = os.path.splitext(os.path.basename(name))
-    candidate = os.path.join(out_dir, stem + suffix)
-    if os.path.exists(candidate):
-        with open(candidate, "rb") as fh:
-            if fh.read() == data:
-                return candidate
-        digest = hashlib.sha256(data).hexdigest()[:10]
-        candidate = os.path.join(out_dir, f"{stem}-{digest}{suffix}")
-    with open(candidate, "wb") as fh:
-        fh.write(data)
-    return candidate
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    fd, temp_path = tempfile.mkstemp(prefix=".paperconan-publish-", dir=out_dir)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+        collision_index = 0
+        while True:
+            if collision_index == 0:
+                filename = stem + suffix
+            elif collision_index == 1:
+                filename = f"{stem}-{digest}{suffix}"
+            else:
+                filename = f"{stem}-{digest}-{collision_index}{suffix}"
+            candidate = os.path.join(out_dir, filename)
+            try:
+                os.link(temp_path, candidate, follow_symlinks=False)
+            except FileExistsError:
+                if regular_file_matches(candidate):
+                    return candidate
+                collision_index += 1
+                continue
+            return candidate
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def _archive_staging_path(out_dir: str, suffix: str) -> str:
+    resolved_out = os.path.realpath(out_dir)
+    os.makedirs(resolved_out, exist_ok=True)
+    fd, path = tempfile.mkstemp(
+        prefix=".paperconan-archive-",
+        suffix=suffix,
+        dir=resolved_out,
+    )
+    os.close(fd)
+    return path
 
 
 def _extract_selected_zip(
@@ -152,7 +269,7 @@ def _extract_selected_zip(
 
 
 def _extract_selected_tar(
-    tar_path,
+    tar_source,
     out_dir,
     *,
     include_images=False,
@@ -163,7 +280,11 @@ def _extract_selected_tar(
     allowed = {"tabular"}
     if include_images:
         allowed.update({"image", "document"})
-    with tarfile.open(tar_path, "r:gz") as tf:
+    if hasattr(tar_source, "read"):
+        archive = tarfile.open(fileobj=tar_source, mode="r:gz")
+    else:
+        archive = tarfile.open(tar_source, "r:gz")
+    with archive as tf:
         for member in tf.getmembers():
             if written >= _MAX_PAPER_BYTES:
                 break
@@ -208,18 +329,26 @@ def _download_oa_package(
     include_images=False,
 ):
     """Download the static PMC OA tar.gz, extract selected members, drop the tarball."""
-    tmp = os.path.join(out_dir, pkg.get("name") or "oa_package.tar.gz")
-    res = download_file(pkg["url"], tmp, max_bytes=_ARCHIVE_MAX)
-    if not res.get("ok"):
-        skipped.append({"name": pkg.get("name"), "reason": res.get("skipped_reason")})
-        return []
+    tmp = _archive_staging_path(out_dir, ".tar.gz")
     try:
-        extracted = _extract_selected_tar(
-            tmp,
-            out_dir,
-            include_images=include_images,
-            max_member_bytes=max_bytes,
-        )
+        res = download_file(pkg["url"], tmp, max_bytes=_ARCHIVE_MAX)
+        if not res.get("ok"):
+            skipped.append({"name": pkg.get("name"), "reason": res.get("skipped_reason")})
+            return []
+        try:
+            with _open_stable_regular(tmp) as archive_fh:
+                extracted = _extract_selected_tar(
+                    archive_fh,
+                    out_dir,
+                    include_images=include_images,
+                    max_member_bytes=max_bytes,
+                )
+        except _UnstableRegularFileError as e:
+            skipped.append({
+                "name": pkg.get("name"),
+                "reason": f"downloaded archive is not a stable regular file: {e}",
+            })
+            return []
         downloaded.extend(extracted)
         return extracted
     except (tarfile.TarError, OSError) as e:
@@ -246,19 +375,26 @@ def _download_supplementary_archive(
 
     The archive downloads with the larger ``archive_max`` cap; each extracted member is
     still capped at the per-file ``max_bytes``."""
-    tmp_zip = os.path.join(out_dir, arch.get("name") or "supplementary.zip")
-    res = download_file(arch["url"], tmp_zip, max_bytes=archive_max)
-    if not res.get("ok"):
-        skipped.append({"name": arch.get("name"), "reason": res.get("skipped_reason")})
-        return []
+    tmp_zip = _archive_staging_path(out_dir, ".zip")
     try:
-        with open(tmp_zip, "rb") as fh:
-            extracted = _extract_selected_zip(
-                fh.read(),
-                out_dir,
-                include_images=include_images,
-                max_member_bytes=max_bytes,
-            )
+        res = download_file(arch["url"], tmp_zip, max_bytes=archive_max)
+        if not res.get("ok"):
+            skipped.append({"name": arch.get("name"), "reason": res.get("skipped_reason")})
+            return []
+        try:
+            with _open_stable_regular(tmp_zip) as archive_fh:
+                extracted = _extract_selected_zip(
+                    archive_fh.read(),
+                    out_dir,
+                    include_images=include_images,
+                    max_member_bytes=max_bytes,
+                )
+        except _UnstableRegularFileError as e:
+            skipped.append({
+                "name": arch.get("name"),
+                "reason": f"downloaded archive is not a stable regular file: {e}",
+            })
+            return []
         downloaded.extend(extracted)
         return extracted
     except zipfile.BadZipFile:
@@ -334,6 +470,7 @@ def download_candidate(
         include_images=include_images,
     )
     os.makedirs(out_dir, exist_ok=True)
+    out_dir = os.path.realpath(out_dir)
     downloaded, skipped = [], []
     provenance_files = []
     direct_asset_types = set()
@@ -341,19 +478,41 @@ def download_candidate(
         if _dir_size(out_dir) > _MAX_PAPER_BYTES:   # per-paper budget reached; stop downloading
             skipped.append({"name": f["name"], "reason": "paper data exceeds per-paper cap"})
             continue
-        dest = os.path.join(out_dir, os.path.basename(f["name"]))
-        res = download_file(f["download_url"], dest, max_bytes=max_bytes)
-        if res.get("ok"):
-            downloaded.append(res["path"])
-            direct_asset_types.add(asset_type(f.get("name") or ""))
-            provenance_files.append(_provenance_entry(
-                res["path"],
-                res.get("source_url") or f.get("download_url"),
-                content_type=res.get("content_type"),
-                size=res.get("size"),
-            ))
-        else:
-            skipped.append({"name": f["name"], "reason": res.get("skipped_reason")})
+        suffix = os.path.splitext(os.path.basename(f["name"]))[1]
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".paperconan-download-",
+            suffix=suffix,
+            dir=out_dir,
+        )
+        os.close(fd)
+        try:
+            res = download_file(f["download_url"], temp_path, max_bytes=max_bytes)
+            if res.get("ok"):
+                try:
+                    with _open_stable_regular(temp_path) as fh:
+                        data = fh.read()
+                except _UnstableRegularFileError as e:
+                    skipped.append({
+                        "name": f["name"],
+                        "reason": f"downloaded file is not a stable regular file: {e}",
+                    })
+                    continue
+                published = _write_collision_safe(out_dir, f["name"], data)
+                downloaded.append(published)
+                direct_asset_types.add(asset_type(f.get("name") or ""))
+                provenance_files.append(_provenance_entry(
+                    published,
+                    res.get("source_url") or f.get("download_url"),
+                    content_type=res.get("content_type"),
+                    size=res.get("size"),
+                ))
+            else:
+                skipped.append({"name": f["name"], "reason": res.get("skipped_reason")})
+        finally:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
     pkg = cand.get("oa_package")
     if pkg and pkg.get("url"):
         extracted = _download_oa_package(

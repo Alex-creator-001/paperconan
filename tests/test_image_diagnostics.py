@@ -11,7 +11,8 @@ Image = pytest.importorskip("PIL.Image")
 pytest.importorskip("cv2")
 
 from paperconan.image._assets import prepare_image_assets
-from paperconan.image import _diagnostics
+from paperconan.image import _diagnostics, _evidence
+from paperconan import _html
 from paperconan.image._diagnostics import diagnose_image_assets
 from paperconan.image._evidence import write_native_pair_evidence
 
@@ -27,6 +28,318 @@ def _two_panel(path: Path):
     canvas[10:130, 10:150] = left
     canvas[10:130, 160:300] = right
     Image.fromarray(canvas).save(path)
+
+
+def _diagnostic_asset(root: Path) -> tuple[Path, list[dict]]:
+    out = root / "audit"
+    native = out / "images" / "native" / "Fig1.png"
+    native.parent.mkdir(parents=True)
+    Image.new("RGB", (16, 16), "white").save(native)
+    return out, [{
+        "asset_id": "img:fig1",
+        "file": "Fig1.png",
+        "path": native.relative_to(out).as_posix(),
+    }]
+
+
+def _install_synthetic_panel_grid(monkeypatch, *, rows: int, cols: int):
+    patch_std_calls = 0
+
+    class SyntheticPatch:
+        def std(self):
+            nonlocal patch_std_calls
+            patch_std_calls += 1
+            return 9.0
+
+    class SyntheticGray:
+        shape = (rows * 64, cols * 64)
+
+        def std(self, axis):
+            return np.empty(self.shape[axis], dtype=np.float64)
+
+        def __getitem__(self, key):
+            return SyntheticPatch()
+
+    class SyntheticCv2:
+        COLOR_BGR2GRAY = 0
+        IMREAD_COLOR = 1
+        IMREAD_IGNORE_ORIENTATION = 2
+
+        def cvtColor(self, image, mode):
+            return SyntheticGray()
+
+        def imread(self, path, mode):
+            return np.zeros((*SyntheticGray.shape, 3), dtype=np.uint8)
+
+    run_sets = iter([
+        [(index * 64 - 1, index * 64 + 1) for index in range(1, rows)],
+        [(index * 64 - 1, index * 64 + 1) for index in range(1, cols)],
+    ])
+    monkeypatch.setattr(_diagnostics, "_cv2", lambda: SyntheticCv2())
+    monkeypatch.setattr(_diagnostics, "_uniform_runs", lambda values: next(run_sets))
+    return lambda: patch_std_calls
+
+
+def _raw_pair_preview_item(root: Path, *, size=(10, 10)) -> tuple[dict, list[Path]]:
+    native_dir = root / "images" / "native"
+    native_dir.mkdir(parents=True)
+    paths = [native_dir / "a.png", native_dir / "b.png"]
+    Image.new("RGB", size, (255, 0, 0)).save(paths[0])
+    Image.new("RGB", size, (0, 255, 0)).save(paths[1])
+    assets = [
+        {
+            "asset_id": f"img:{name}",
+            "path": path.relative_to(root).as_posix(),
+        }
+        for name, path in zip(("a", "b"), paths)
+    ]
+    return {
+        "image_assets": assets,
+        "finding": {
+            "regions": [
+                {"asset_id": "img:a", "box": (0, 0, *size)},
+                {"asset_id": "img:b", "box": (0, 0, *size)},
+            ],
+        },
+    }, paths
+
+
+def test_raw_pair_preview_rejects_file_size_before_pillow_decode(
+    tmp_path,
+    monkeypatch,
+):
+    item, _ = _raw_pair_preview_item(tmp_path)
+    budget = _evidence.EvidenceBudget(1024 * 1024)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_MB", "0")
+    pillow_called = False
+    original_open = Image.open
+
+    def track_pillow_open(fp, *args, **kwargs):
+        nonlocal pillow_called
+        pillow_called = True
+        return original_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", track_pillow_open)
+
+    uri = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert not pillow_called
+    assert budget.used_bytes == 0
+
+
+def test_raw_pair_preview_rejects_full_image_pixels_before_crop(
+    tmp_path,
+    monkeypatch,
+):
+    item, _ = _raw_pair_preview_item(tmp_path, size=(11, 10))
+    budget = _evidence.EvidenceBudget(1024 * 1024)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "100")
+    crop_called = False
+    original_crop = Image.Image.crop
+
+    def track_crop(image, box, *args, **kwargs):
+        nonlocal crop_called
+        crop_called = True
+        return original_crop(image, box, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "crop", track_crop)
+
+    uri = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert not crop_called
+    assert budget.used_bytes == 0
+
+
+def test_raw_pair_preview_reuses_crop_area_validation_before_crop(
+    tmp_path,
+    monkeypatch,
+):
+    item, _ = _raw_pair_preview_item(tmp_path, size=(5, 5))
+    budget = _evidence.EvidenceBudget(1024 * 1024)
+    crop_called = False
+    validation_called = False
+    original_crop = Image.Image.crop
+    original_validate = _evidence._validated_crop_box
+
+    def enforce_smaller_crop_cap(box, *, width, height, max_pixels):
+        nonlocal validation_called
+        validation_called = True
+        return original_validate(
+            box,
+            width=width,
+            height=height,
+            max_pixels=24,
+        )
+
+    def track_crop(image, box, *args, **kwargs):
+        nonlocal crop_called
+        crop_called = True
+        return original_crop(image, box, *args, **kwargs)
+
+    monkeypatch.setattr(
+        _html,
+        "_validated_crop_box",
+        enforce_smaller_crop_cap,
+        raising=False,
+    )
+    monkeypatch.setattr(Image.Image, "crop", track_crop)
+
+    uri = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        budget,
+    )
+
+    assert validation_called
+    assert uri is None
+    assert not crop_called
+    assert budget.used_bytes == 0
+
+
+def test_raw_pair_preview_uses_stable_open_file_object(
+    tmp_path,
+    monkeypatch,
+):
+    item, paths = _raw_pair_preview_item(tmp_path)
+    first = paths[0]
+    displaced = tmp_path / "displaced-a.png"
+    budget = _evidence.EvidenceBudget(1024 * 1024)
+    original_open = Image.open
+    opened_from_file_object = False
+    swapped = False
+
+    def swap_during_pillow_open(fp, *args, **kwargs):
+        nonlocal opened_from_file_object, swapped
+        if not swapped:
+            opened_from_file_object = hasattr(fp, "read")
+            first.rename(displaced)
+            Image.new("RGB", (10, 10), (0, 0, 255)).save(first)
+            swapped = True
+        return original_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", swap_during_pillow_open)
+
+    uri = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        budget,
+    )
+
+    assert opened_from_file_object
+    assert uri is not None
+    payload = base64.b64decode(uri.split(",", 1)[1])
+    with original_open(io.BytesIO(payload)) as montage:
+        red, _, blue = montage.getpixel((2, 2))
+    assert red > blue
+    assert budget.used_bytes == len(payload)
+
+
+@pytest.mark.parametrize("swap_kind", ["parent", "final"])
+def test_raw_pair_preview_fails_closed_on_symlink_swap(
+    tmp_path,
+    monkeypatch,
+    swap_kind,
+):
+    item, paths = _raw_pair_preview_item(tmp_path)
+    first = paths[0]
+    native_dir = first.parent
+    outside_dir = tmp_path / "outside-native"
+    outside_dir.mkdir()
+    outside = outside_dir / first.name
+    Image.new("RGB", (10, 10), (0, 0, 255)).save(outside)
+    displaced = tmp_path / f"displaced-{swap_kind}"
+    budget = _evidence.EvidenceBudget(1024 * 1024)
+    original_os_open = _evidence.os.open
+    original_image_open = Image.open
+    outside_identity = (outside.stat().st_dev, outside.stat().st_ino)
+    outside_consumed = False
+    swapped = False
+
+    def swap_before_registered_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        path_text = _evidence.os.fspath(path)
+        should_swap = (
+            swap_kind == "parent"
+            and path_text == "native"
+            and kwargs.get("dir_fd") is not None
+        ) or (
+            swap_kind == "final"
+            and path_text == first.name
+            and kwargs.get("dir_fd") is not None
+        )
+        if not swapped and should_swap:
+            if swap_kind == "parent":
+                native_dir.rename(displaced)
+                native_dir.symlink_to(outside_dir, target_is_directory=True)
+            else:
+                first.rename(displaced)
+                first.symlink_to(outside)
+            swapped = True
+        return original_os_open(path, flags, *args, **kwargs)
+
+    def track_image_open(fp, *args, **kwargs):
+        nonlocal outside_consumed
+        if hasattr(fp, "fileno"):
+            opened = _evidence.os.fstat(fp.fileno())
+            outside_consumed = (
+                opened.st_dev,
+                opened.st_ino,
+            ) == outside_identity
+        return original_image_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(_evidence.os, "open", swap_before_registered_open)
+    monkeypatch.setattr(Image, "open", track_image_open)
+
+    uri = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        budget,
+    )
+
+    assert swapped
+    assert uri is None
+    assert not outside_consumed
+    assert budget.used_bytes == 0
+
+
+def test_raw_pair_preview_rejects_registered_native_symlink_loop(
+    tmp_path,
+    monkeypatch,
+):
+    item, paths = _raw_pair_preview_item(tmp_path)
+    loop_a = paths[0]
+    loop_b = loop_a.with_name("loop-b.png")
+    loop_a.unlink()
+    loop_a.symlink_to(loop_b.name)
+    loop_b.symlink_to(loop_a.name)
+    budget = _evidence.EvidenceBudget(1024 * 1024)
+    original_resolve = Path.resolve
+
+    def resolve_with_legacy_loop_error(path, *args, **kwargs):
+        if path == loop_a:
+            raise RuntimeError("symlink loop")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_with_legacy_loop_error)
+
+    uri = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert budget.used_bytes == 0
 
 
 def test_diagnostics_find_transform_related_panels_and_keep_assets(tmp_path):
@@ -47,6 +360,171 @@ def test_diagnostics_find_transform_related_panels_and_keep_assets(tmp_path):
     assert finding["transform"] == "flip"
     assert finding["score"] >= 0.92
     assert len(finding["regions"]) == 2
+
+
+def test_panel_proposal_stops_after_observing_one_candidate_beyond_cap(
+    monkeypatch,
+):
+    patch_std_calls = _install_synthetic_panel_grid(
+        monkeypatch,
+        rows=5,
+        cols=14,
+    )
+
+    boxes = _diagnostics.propose_panels(
+        np.zeros((1, 1, 3), dtype=np.uint8),
+    )
+
+    assert len(boxes) == 64
+    assert patch_std_calls() == 65
+
+
+def test_diagnostics_report_panel_candidate_omission_per_asset(
+    tmp_path,
+    monkeypatch,
+):
+    out, assets = _diagnostic_asset(tmp_path)
+    patch_std_calls = _install_synthetic_panel_grid(
+        monkeypatch,
+        rows=5,
+        cols=14,
+    )
+    comparisons = 0
+
+    def dissimilar(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return 0.0, "identity"
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "transform_robust_similarity",
+        dissimilar,
+    )
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert comparisons == 2016
+    assert patch_std_calls() == 65
+    assert errors == [{
+        "file": "Fig1.png",
+        "error": "image panel candidates omitted; limit is 64",
+    }]
+
+
+def test_diagnostics_stop_before_comparison_beyond_pair_budget(
+    tmp_path,
+    monkeypatch,
+):
+    out, assets = _diagnostic_asset(tmp_path)
+    boxes = [
+        (0, 0, 4, 4),
+        (4, 0, 8, 4),
+        (8, 0, 12, 4),
+        (12, 0, 16, 4),
+    ]
+    comparisons = 0
+
+    def dissimilar(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return 0.0, "identity"
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "_propose_panels_bounded",
+        lambda image: (boxes, False),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "_MAX_PANEL_PAIR_COMPARISONS",
+        2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "transform_robust_similarity",
+        dissimilar,
+    )
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert comparisons == 2
+    assert errors == [{
+        "file": "Fig1.png",
+        "error": "image panel-pair comparisons omitted; limit is 2",
+    }]
+
+
+def test_zero_finding_cap_keeps_work_bounds_and_resource_errors(
+    tmp_path,
+    monkeypatch,
+):
+    out, assets = _diagnostic_asset(tmp_path)
+    boxes = [
+        (0, 0, 4, 4),
+        (4, 0, 8, 4),
+        (8, 0, 12, 4),
+        (12, 0, 16, 4),
+    ]
+    comparisons = 0
+
+    def similar(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return 1.0, "identity"
+
+    def evidence_must_not_run(*args, **kwargs):
+        raise AssertionError("zero finding cap must not write evidence")
+
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_FINDINGS", "0")
+    monkeypatch.setattr(
+        _diagnostics,
+        "_propose_panels_bounded",
+        lambda image: (boxes, True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "_MAX_PANEL_PAIR_COMPARISONS",
+        2,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "transform_robust_similarity",
+        similar,
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "write_native_pair_evidence",
+        evidence_must_not_run,
+    )
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert comparisons == 2
+    assert errors == [
+        {
+            "file": "Fig1.png",
+            "error": "image panel candidates omitted; limit is 64",
+        },
+        {
+            "file": "Fig1.png",
+            "error": "image panel-pair comparisons omitted; limit is 2",
+        },
+        {
+            "error": (
+                "2 image findings omitted; "
+                "set PAPERCONAN_MAX_IMAGE_FINDINGS to raise"
+            ),
+        },
+    ]
+    assert not (out / "images" / "evidence").exists()
 
 
 def test_cmyk_scan_diagnostics_never_abort_or_remove_assets(tmp_path):
@@ -173,6 +651,233 @@ def test_native_evidence_preserves_cmyk_crop_mode_and_channels(tmp_path):
             assert np.array_equal(np.asarray(crop), np.asarray(expected))
 
 
+@pytest.mark.parametrize(
+    "box",
+    [
+        (0, 0, 10),
+        (0, 0, 10, 10, 20),
+        (False, 0, 10, 10),
+        (0, 0, 10.5, 10),
+        (-1, 0, 10, 10),
+        (10, 0, 10, 10),
+        (11, 0, 10, 10),
+        (0, 10, 10, 10),
+        (0, 11, 10, 10),
+        (0, 0, 311, 10),
+        (0, 0, 10, 141),
+    ],
+    ids=[
+        "too-short",
+        "too-long",
+        "bool",
+        "fractional",
+        "negative",
+        "empty-x",
+        "reversed-x",
+        "empty-y",
+        "reversed-y",
+        "x-out-of-bounds",
+        "y-out-of-bounds",
+    ],
+)
+def test_native_evidence_rejects_invalid_crop_boxes_without_files(tmp_path, box):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, _ = prepare_image_assets(str(source), str(out))
+
+    with pytest.raises(ValueError, match="crop box"):
+        write_native_pair_evidence(
+            str(out / assets[0]["path"]),
+            box,
+            (10, 10, 20, 20),
+            str(out),
+            "image-pair-invalid-box",
+        )
+
+    assert not (out / "images" / "evidence").exists()
+
+
+def test_native_evidence_validates_second_crop_before_writing(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, _ = prepare_image_assets(str(source), str(out))
+
+    with pytest.raises(ValueError, match="crop box"):
+        write_native_pair_evidence(
+            str(out / assets[0]["path"]),
+            (10, 10, 20, 20),
+            (20, 20, True, 30),
+            str(out),
+            "image-pair-invalid-second-box",
+        )
+
+    assert not (out / "images" / "evidence").exists()
+
+
+def test_native_evidence_crop_pixel_cap_is_dynamic_and_writes_nothing_on_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, _ = prepare_image_assets(str(source), str(out))
+    native = out / assets[0]["path"]
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "99")
+
+    with pytest.raises(ValueError, match="PAPERCONAN_MAX_IMAGE_PIXELS"):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 10, 10),
+            (10, 0, 20, 10),
+            str(out),
+            "image-pair-pixel-cap",
+        )
+
+    assert not (out / "images" / "evidence").exists()
+
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "100")
+    evidence = write_native_pair_evidence(
+        str(native),
+        (0, 0, 10, 10),
+        (10, 0, 20, 10),
+        str(out),
+        "image-pair-pixel-cap",
+    )
+    assert (out / evidence["crop_a_path"]).is_file()
+
+
+def test_native_evidence_uses_stable_file_object_when_source_path_is_swapped(
+    tmp_path,
+    monkeypatch,
+):
+    out = tmp_path / "audit"
+    native = out / "images" / "native" / "source.png"
+    native.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(native)
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (8, 8), (0, 0, 255)).save(outside)
+    displaced = tmp_path / "displaced.png"
+    original_open = Image.open
+    opened_from_file_object = False
+    swapped = False
+
+    def swap_during_pillow_open(fp, *args, **kwargs):
+        nonlocal opened_from_file_object, swapped
+        opened_from_file_object = hasattr(fp, "read")
+        if not swapped:
+            native.rename(displaced)
+            native.symlink_to(outside)
+            swapped = True
+        return original_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", swap_during_pillow_open)
+
+    evidence = write_native_pair_evidence(
+        str(native),
+        (0, 0, 4, 4),
+        (4, 4, 8, 8),
+        str(out),
+        "image-pair-stable-source",
+    )
+
+    assert opened_from_file_object
+    with original_open(out / evidence["crop_a_path"]) as crop:
+        assert crop.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_native_evidence_rejects_native_parent_swap(tmp_path, monkeypatch):
+    out = tmp_path / "audit"
+    native_dir = out / "images" / "native"
+    native_dir.mkdir(parents=True)
+    native = native_dir / "source.png"
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(native)
+    outside_dir = tmp_path / "outside-native"
+    outside_dir.mkdir()
+    outside = outside_dir / native.name
+    Image.new("RGB", (8, 8), (0, 0, 255)).save(outside)
+    displaced = tmp_path / "displaced-native"
+    source_path = str(native.resolve())
+    original_os_open = _evidence.os.open
+    original_image_open = Image.open
+    outside_identity = (outside.stat().st_dev, outside.stat().st_ino)
+    outside_consumed = False
+    swapped = False
+
+    def swap_parent_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        path_text = _evidence.os.fspath(path)
+        if not swapped and (
+            path_text == source_path
+            or (path_text == "native" and kwargs.get("dir_fd") is not None)
+        ):
+            native_dir.rename(displaced)
+            native_dir.symlink_to(outside_dir, target_is_directory=True)
+            swapped = True
+        return original_os_open(path, flags, *args, **kwargs)
+
+    def track_image_open(fp, *args, **kwargs):
+        nonlocal outside_consumed
+        if hasattr(fp, "fileno"):
+            opened = _evidence.os.fstat(fp.fileno())
+            outside_consumed = (
+                opened.st_dev,
+                opened.st_ino,
+            ) == outside_identity
+        return original_image_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(_evidence.os, "open", swap_parent_before_open)
+    monkeypatch.setattr(Image, "open", track_image_open)
+
+    with pytest.raises(ValueError, match="artifact root"):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 4, 4),
+            (4, 4, 8, 8),
+            str(out),
+            "image-pair-parent-swap",
+        )
+
+    assert not outside_consumed
+    assert not (out / "images" / "evidence").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["inf", "not-a-number", "9" * 5000],
+    ids=["non-finite", "malformed", "overflow"],
+)
+def test_native_evidence_rejects_invalid_pixel_limits_cleanly(
+    tmp_path,
+    monkeypatch,
+    value,
+):
+    out = tmp_path / "audit"
+    native = out / "images" / "native" / "source.png"
+    native.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "white").save(native)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", value)
+
+    with pytest.raises(
+        ValueError,
+        match="invalid PAPERCONAN_MAX_IMAGE_PIXELS",
+    ):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 4, 4),
+            (4, 4, 8, 8),
+            str(out),
+            "image-pair-invalid-limit",
+        )
+
+    assert not (out / "images" / "evidence").exists()
+
+
 def test_diagnostics_use_native_coordinates_for_exif_oriented_images(tmp_path):
     template = tmp_path / "template.png"
     _two_panel(template)
@@ -250,6 +955,50 @@ def test_native_evidence_rejects_outside_symlink_destination(tmp_path):
         )
 
     assert list(outside.iterdir()) == []
+
+
+def test_native_evidence_rejects_evidence_parent_swap_before_staging(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, _ = prepare_image_assets(str(source), str(out))
+    evidence_dir = out / "images" / "evidence"
+    evidence_dir.mkdir()
+    displaced = tmp_path / "displaced-evidence"
+    outside = tmp_path / "outside-evidence"
+    outside.mkdir()
+    original_open = _evidence.os.open
+    swapped = False
+
+    def swap_before_stage_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if (
+            not swapped
+            and flags & _evidence.os.O_CREAT
+            and flags & _evidence.os.O_EXCL
+        ):
+            evidence_dir.rename(displaced)
+            evidence_dir.symlink_to(outside, target_is_directory=True)
+            swapped = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(_evidence.os, "open", swap_before_stage_open)
+
+    with pytest.raises(ValueError, match="destination|artifact root|changed"):
+        write_native_pair_evidence(
+            str(out / assets[0]["path"]),
+            (10, 10, 150, 130),
+            (160, 10, 300, 130),
+            str(out),
+            "image-pair-parent-swap",
+        )
+
+    assert list(outside.iterdir()) == []
+    assert list(displaced.iterdir()) == []
 
 
 def test_native_evidence_atomically_replaces_final_symlinks_and_reruns(tmp_path):

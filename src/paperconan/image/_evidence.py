@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+import math
 import mimetypes
 import os
 from pathlib import Path
-import tempfile
+import secrets
+import stat
+import sys
 
 
 _SUPPORTED_PREVIEW_MIMES = frozenset({
@@ -16,6 +20,8 @@ _SUPPORTED_PREVIEW_MIMES = frozenset({
     "image/webp",
 })
 _PNG_NATIVE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"})
+_DEFAULT_MAX_IMAGE_MB = 100.0
+_DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 
 
 class EvidenceBudget:
@@ -23,8 +29,11 @@ class EvidenceBudget:
         self.max_bytes = max(0, int(max_bytes))
         self.used_bytes = 0
 
+    def can_consume(self, size: int) -> bool:
+        return size >= 0 and self.used_bytes + size <= self.max_bytes
+
     def consume(self, size: int) -> bool:
-        if size < 0 or self.used_bytes + size > self.max_bytes:
+        if not self.can_consume(size):
             return False
         self.used_bytes += size
         return True
@@ -36,40 +45,399 @@ def _crop_encoding(image) -> tuple[str, str, dict]:
     return ".tif", "TIFF", {"compression": "tiff_deflate"}
 
 
-def _stage_image(image, final_path: Path, image_format: str, **save_kwargs) -> Path:
-    fd, temp_name = tempfile.mkstemp(
-        dir=final_path.parent,
-        prefix=f".{final_path.name}.",
-        suffix=".tmp",
-    )
-    os.close(fd)
-    temp_path = Path(temp_name)
+def _unlink_at(name: str | None, directory_fd: int) -> None:
+    if name is None:
+        return
     try:
-        image.save(temp_path, format=image_format, **save_kwargs)
-    except Exception:
-        temp_path.unlink(missing_ok=True)
-        raise
-    return temp_path
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
 
 
-def _replace_staged_images(staged: list[tuple[Path, Path]]) -> None:
+def _open_output_child_directory(
+    parent_fd: int,
+    name: str,
+    display_path: Path,
+) -> int:
     try:
-        for temp_path, final_path in staged:
-            os.replace(temp_path, final_path)
+        os.mkdir(name, 0o755, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise ValueError(
+            f"image evidence destination cannot create {display_path}"
+        ) from exc
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise ValueError(
+            "secure image evidence destination handling is unavailable"
+        )
+    try:
+        return os.open(
+            name,
+            os.O_RDONLY | directory | nofollow,
+            dir_fd=parent_fd,
+        )
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise ValueError(
+            f"image evidence destination escapes artifact root: {display_path}"
+        ) from exc
+
+
+def _verify_directory_entry(
+    parent_fd: int,
+    name: str,
+    child_fd: int,
+    display_path: Path,
+) -> None:
+    opened = os.fstat(child_fd)
+    try:
+        current = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise ValueError(
+            f"image evidence destination changed during publication: {display_path}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or opened.st_dev != current.st_dev
+        or opened.st_ino != current.st_ino
+    ):
+        raise ValueError(
+            f"image evidence destination changed during publication: {display_path}"
+        )
+
+
+def _verify_evidence_directories(
+    root: Path,
+    root_fd: int,
+    images_fd: int,
+    evidence_fd: int,
+) -> None:
+    images = root / "images"
+    evidence = images / "evidence"
+    _verify_directory_entry(root_fd, "images", images_fd, images)
+    _verify_directory_entry(images_fd, "evidence", evidence_fd, evidence)
+
+
+@contextmanager
+def _evidence_output_directory(root: Path):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise ValueError(
+            "secure image evidence destination handling is unavailable"
+        )
+    root_fd = images_fd = evidence_fd = None
+    try:
+        try:
+            root_fd = os.open(
+                root,
+                os.O_RDONLY | directory | nofollow,
+            )
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise ValueError(
+                "image evidence destination escapes artifact root"
+            ) from exc
+        images_fd = _open_output_child_directory(
+            root_fd,
+            "images",
+            root / "images",
+        )
+        evidence_fd = _open_output_child_directory(
+            images_fd,
+            "evidence",
+            root / "images" / "evidence",
+        )
+        _verify_evidence_directories(
+            root,
+            root_fd,
+            images_fd,
+            evidence_fd,
+        )
+        yield root_fd, images_fd, evidence_fd
     finally:
-        for temp_path, _ in staged:
-            temp_path.unlink(missing_ok=True)
+        for fd in (evidence_fd, images_fd, root_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+def _stage_file(evidence_fd: int) -> tuple[str, int]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError(
+            "secure image evidence destination handling is unavailable"
+        )
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | nofollow
+    for _ in range(128):
+        name = f".paperconan-evidence-{secrets.token_hex(8)}.tmp"
+        try:
+            return name, os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=evidence_fd,
+            )
+        except FileExistsError:
+            continue
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise ValueError(
+                "image evidence destination changed during staging"
+            ) from exc
+    raise ValueError("could not allocate image evidence staging file")
+
+
+def _verify_regular_file_entry(
+    evidence_fd: int,
+    name: str,
+    file_fd: int,
+) -> None:
+    opened = os.fstat(file_fd)
+    try:
+        current = os.stat(
+            name,
+            dir_fd=evidence_fd,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise ValueError(
+            "image evidence staging entry changed during publication"
+        ) from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or opened.st_dev != current.st_dev
+        or opened.st_ino != current.st_ino
+    ):
+        raise ValueError(
+            "image evidence staging entry changed during publication"
+        )
+
+
+def _stage_image(
+    image,
+    evidence_fd: int,
+    image_format: str,
+    **save_kwargs,
+) -> tuple[str, int]:
+    temp_name, temp_fd = _stage_file(evidence_fd)
+    try:
+        os.ftruncate(temp_fd, 0)
+        os.lseek(temp_fd, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(temp_fd), "wb") as fh:
+            image.save(fh, format=image_format, **save_kwargs)
+            fh.flush()
+        _verify_regular_file_entry(
+            evidence_fd,
+            temp_name,
+            temp_fd,
+        )
+        return temp_name, temp_fd
+    except Exception:
+        os.close(temp_fd)
+        _unlink_at(temp_name, evidence_fd)
+        raise
+
+
+def _publish_staged_images(
+    root: Path,
+    root_fd: int,
+    images_fd: int,
+    evidence_fd: int,
+    staged: list[tuple[str, int, str]],
+) -> None:
+    _verify_evidence_directories(
+        root,
+        root_fd,
+        images_fd,
+        evidence_fd,
+    )
+    for temp_name, temp_fd, final_name in staged:
+        _verify_regular_file_entry(
+            evidence_fd,
+            temp_name,
+            temp_fd,
+        )
+        os.replace(
+            temp_name,
+            final_name,
+            src_dir_fd=evidence_fd,
+            dst_dir_fd=evidence_fd,
+        )
+        _verify_regular_file_entry(
+            evidence_fd,
+            final_name,
+            temp_fd,
+        )
+    _verify_evidence_directories(
+        root,
+        root_fd,
+        images_fd,
+        evidence_fd,
+    )
+
+
+def _max_image_bytes() -> int:
+    name = "PAPERCONAN_MAX_IMAGE_MB"
+    raw = os.environ.get(name, str(_DEFAULT_MAX_IMAGE_MB))
+    try:
+        value = float(raw)
+        byte_value = value * 1024 * 1024
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {name} limit") from exc
+    if (
+        not math.isfinite(value)
+        or value < 0
+        or not math.isfinite(byte_value)
+        or byte_value > sys.maxsize
+    ):
+        raise ValueError(f"invalid {name} limit")
+    return int(byte_value)
+
+
+def _max_image_pixels() -> int:
+    name = "PAPERCONAN_MAX_IMAGE_PIXELS"
+    raw = os.environ.get(name, str(_DEFAULT_MAX_IMAGE_PIXELS))
+    try:
+        value = int(raw)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {name} limit") from exc
+    if value < 0 or value > sys.maxsize:
+        raise ValueError(f"invalid {name} limit")
+    return value
+
+
+@contextmanager
+def _open_artifact_regular(root: Path, relative_path: Path):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    parts = relative_path.parts
+    if (
+        nofollow is None
+        or directory is None
+        or relative_path.is_absolute()
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        raise ValueError(
+            "registered evidence path is not a stable regular file "
+            "under artifact root"
+        )
+    directory_fds: list[int] = []
+    file_fd = -1
+    fh = None
+    try:
+        try:
+            parent_fd = os.open(
+                root,
+                os.O_RDONLY | directory | nofollow,
+            )
+            directory_fds.append(parent_fd)
+            for part in parts[:-1]:
+                parent_fd = os.open(
+                    part,
+                    os.O_RDONLY | directory | nofollow,
+                    dir_fd=parent_fd,
+                )
+                directory_fds.append(parent_fd)
+            file_fd = os.open(
+                parts[-1],
+                os.O_RDONLY | nofollow,
+                dir_fd=parent_fd,
+            )
+            if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                raise OSError("registered evidence entry is not a regular file")
+            fh = os.fdopen(file_fd, "rb")
+            file_fd = -1
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise ValueError(
+                "registered evidence path is not a stable regular file "
+                "under artifact root"
+            ) from exc
+        with fh:
+            yield fh
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
+
+
+def _registered_relative_parts(relative_path: object) -> tuple[str, ...] | None:
+    if not isinstance(relative_path, str) or not relative_path:
+        return None
+    if "\x00" in relative_path:
+        return None
+    if (
+        Path(relative_path).is_absolute()
+        or relative_path.startswith(("/", "\\"))
+        or "\\" in relative_path
+        or (len(relative_path) >= 2 and relative_path[1] == ":")
+    ):
+        return None
+    parts = tuple(relative_path.split("/"))
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    return parts
+
+
+def _registered_artifact_location(
+    artifact_dir: str | None,
+    relative_path: object,
+) -> tuple[Path, Path, Path] | None:
+    if not artifact_dir:
+        return None
+    parts = _registered_relative_parts(relative_path)
+    if parts is None:
+        return None
+    root = Path(artifact_dir).resolve()
+    candidate = root.joinpath(*parts).resolve()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return None
+    if not relative.parts:
+        return None
+    return root, candidate, relative
+
+
+def _validated_crop_box(
+    box: object,
+    *,
+    width: int,
+    height: int,
+    max_pixels: int,
+) -> tuple[int, int, int, int]:
+    try:
+        coordinates = tuple(box)
+    except TypeError as exc:
+        raise ValueError("crop box must contain exactly four integers") from exc
+    if len(coordinates) != 4 or any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in coordinates
+    ):
+        raise ValueError("crop box must contain exactly four integers")
+    x0, y0, x1, y1 = coordinates
+    if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+        raise ValueError("crop box must be non-empty and within image bounds")
+    if (x1 - x0) * (y1 - y0) > max_pixels:
+        raise ValueError(
+            "crop box exceeds PAPERCONAN_MAX_IMAGE_PIXELS="
+            f"{max_pixels}"
+        )
+    return coordinates
 
 
 def resolve_registered_path(artifact_dir: str | None, relative_path: object) -> Path | None:
-    if not artifact_dir or not isinstance(relative_path, str) or not relative_path:
+    location = _registered_artifact_location(artifact_dir, relative_path)
+    if location is None:
         return None
-    root = Path(artifact_dir).resolve()
-    candidate = (root / relative_path).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        return None
+    _, candidate, _ = location
     return candidate if candidate.is_file() else None
 
 
@@ -78,19 +446,52 @@ def registered_preview_data_uri(
     artifact_dir: str | None,
     budget: EvidenceBudget,
 ) -> str | None:
-    path = resolve_registered_path(artifact_dir, asset.get("preview_path"))
-    if path is None:
+    location = _registered_artifact_location(
+        artifact_dir,
+        asset.get("preview_path"),
+    )
+    if location is None:
         return None
-    size = path.stat().st_size
-    if not budget.consume(size):
+    root, path, relative = location
+    if not path.is_file():
+        return None
+    try:
+        with _open_artifact_regular(root, relative) as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if size > _max_image_bytes():
+                return None
+            if not budget.can_consume(size):
+                return None
+            try:
+                from PIL import Image
+
+                max_pixels = _max_image_pixels()
+                with Image.open(fh) as image:
+                    width, height = image.size
+                    if (
+                        width <= 0
+                        or height <= 0
+                        or width * height > max_pixels
+                    ):
+                        return None
+                    image.verify()
+            except Exception:
+                return None
+            fh.seek(0)
+            payload = fh.read(size + 1)
+            if len(payload) != size:
+                return None
+            if not budget.consume(size):
+                return None
+            encoded = base64.b64encode(payload).decode("ascii")
+    except (OSError, ValueError):
         return None
     metadata_mime = asset.get("preview_mime")
     mime = str(metadata_mime).strip().lower() if isinstance(metadata_mime, str) else ""
     if mime not in _SUPPORTED_PREVIEW_MIMES:
         guessed = mimetypes.guess_type(path.name)[0] or ""
         mime = guessed if guessed in _SUPPORTED_PREVIEW_MIMES else "image/jpeg"
-    payload = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{payload}"
+    return f"data:{mime};base64,{encoded}"
 
 
 def write_native_pair_evidence(
@@ -112,9 +513,11 @@ def write_native_pair_evidence(
     root = Path(output_root).resolve()
     source = Path(image_path).resolve()
     try:
-        source.relative_to(root)
+        source_relative = source.relative_to(root)
     except ValueError as exc:
         raise ValueError("image evidence source escapes artifact root") from exc
+    if not source_relative.parts:
+        raise ValueError("image evidence source escapes artifact root")
     out_dir = root / "images" / "evidence"
     try:
         out_dir.resolve().relative_to(root)
@@ -122,10 +525,23 @@ def write_native_pair_evidence(
         raise ValueError(
             "image evidence destination escapes artifact root"
         ) from exc
-    out_dir.mkdir(parents=True, exist_ok=True)
-    with Image.open(source) as image:
-        crop_a = image.crop(box_a)
-        crop_b = image.crop(box_b)
+    with _open_artifact_regular(root, source_relative) as source_fh:
+        with Image.open(source_fh) as image:
+            max_pixels = _max_image_pixels()
+            validated_a = _validated_crop_box(
+                box_a,
+                width=image.width,
+                height=image.height,
+                max_pixels=max_pixels,
+            )
+            validated_b = _validated_crop_box(
+                box_b,
+                width=image.width,
+                height=image.height,
+                max_pixels=max_pixels,
+            )
+            crop_a = image.crop(validated_a)
+            crop_b = image.crop(validated_b)
         suffix_a, format_a, save_a = _crop_encoding(crop_a)
         suffix_b, format_b, save_b = _crop_encoding(crop_b)
         crop_a_path = out_dir / f"{evidence_id}-a{suffix_a}"
@@ -144,30 +560,49 @@ def write_native_pair_evidence(
         canvas.paste(preview_a.convert("RGB"), (0, 0))
         canvas.paste(preview_b.convert("RGB"), (preview_a.width + 20, 0))
         preview_path = out_dir / f"{evidence_id}-preview.jpg"
-        staged = []
-        try:
-            staged.append((
-                _stage_image(crop_a, crop_a_path, format_a, **save_a),
-                crop_a_path,
-            ))
-            staged.append((
-                _stage_image(crop_b, crop_b_path, format_b, **save_b),
-                crop_b_path,
-            ))
-            staged.append((
-                _stage_image(
+        with _evidence_output_directory(root) as directory_fds:
+            root_fd, images_fd, evidence_fd = directory_fds
+            staged: list[tuple[str, int, str]] = []
+            try:
+                temp_name, temp_fd = _stage_image(
+                    crop_a,
+                    evidence_fd,
+                    format_a,
+                    **save_a,
+                )
+                staged.append((temp_name, temp_fd, crop_a_path.name))
+                _verify_evidence_directories(
+                    root,
+                    root_fd,
+                    images_fd,
+                    evidence_fd,
+                )
+                temp_name, temp_fd = _stage_image(
+                    crop_b,
+                    evidence_fd,
+                    format_b,
+                    **save_b,
+                )
+                staged.append((temp_name, temp_fd, crop_b_path.name))
+                temp_name, temp_fd = _stage_image(
                     canvas,
-                    preview_path,
+                    evidence_fd,
                     "JPEG",
                     quality=88,
                     optimize=True,
-                ),
-                preview_path,
-            ))
-            _replace_staged_images(staged)
-        finally:
-            for temp_path, _ in staged:
-                temp_path.unlink(missing_ok=True)
+                )
+                staged.append((temp_name, temp_fd, preview_path.name))
+                _publish_staged_images(
+                    root,
+                    root_fd,
+                    images_fd,
+                    evidence_fd,
+                    staged,
+                )
+            finally:
+                for temp_name, temp_fd, _ in staged:
+                    os.close(temp_fd)
+                    _unlink_at(temp_name, evidence_fd)
     return {
         "crop_a_path": _relative_path(crop_a_path, root),
         "crop_b_path": _relative_path(crop_b_path, root),

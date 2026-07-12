@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import base64
+import copy
+import io
 from pathlib import Path
 
 import pytest
 
-from paperconan._adjudicated_html import render_adjudicated_report
+from paperconan._adjudicated_html import (
+    _VisibleTextParser,
+    _normalized_verdict_copy,
+    render_adjudicated_report,
+)
 from paperconan._html import _all_findings, _render_finding_card
+from paperconan.image import _evidence
+from paperconan.image._evidence import (
+    EvidenceBudget,
+    registered_preview_data_uri,
+)
 from paperconan.schema import ImageAsset, ImageFinding, ImageReview
+
+Image = pytest.importorskip("PIL.Image")
 
 
 PNG_1X1 = base64.b64decode(
@@ -191,6 +204,115 @@ def test_completed_coverage_with_missing_assets_becomes_partial(tmp_path):
     assert "completed" not in html
 
 
+def test_public_renderer_missing_image_review_does_not_mutate_verdict(tmp_path):
+    scan = _scan(tmp_path)
+    scan["image_assets"].append({
+        **scan["image_assets"][0],
+        "asset_id": "img:0",
+        "file": "Fig0.png",
+        "sha256": "0" * 64,
+    })
+    verdict = {"verdict": "NEEDS_HUMAN", "findings": []}
+    original = copy.deepcopy(verdict)
+
+    html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
+
+    assert "<strong>partial</strong>" in html
+    assert "deferred=2" in html
+    assert verdict == original
+
+
+@pytest.mark.parametrize(
+    ("supplied", "expected"),
+    [
+        (" NEEDS_HUMAN ", "needs_human"),
+        ("unexpected-model-token", "unresolved"),
+    ],
+    ids=["case-normalized", "unknown"],
+)
+def test_image_finding_review_status_is_normalized(tmp_path, supplied, expected):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Image reference",
+            "image_refs": [{"asset_id": "img:a"}],
+            "review_status": supplied,
+            "report_md": "The registered signal requires contextual review.",
+        }],
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert f'<span class="badge review">{expected}</span>' in html
+    assert f'<span class="badge review">{supplied.strip()}</span>' not in html
+
+
+@pytest.mark.parametrize(
+    ("supplied", "expected"),
+    [
+        (" COMPLETED ", "completed"),
+        ("unexpected-model-token", "partial"),
+    ],
+    ids=["case-normalized", "unknown"],
+)
+def test_image_review_status_is_normalized(tmp_path, supplied, expected):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [],
+        "image_review": {
+            "status": supplied,
+            "reviewed_asset_ids": ["img:a"],
+        },
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert f"<strong>{expected}</strong>" in html
+    assert f"<strong>{supplied.strip()}</strong>" not in html
+
+
+def test_duplicate_coverage_assignments_become_unresolved_and_partial(tmp_path):
+    scan = _scan(tmp_path)
+    scan["image_assets"].append({
+        **scan["image_assets"][0],
+        "asset_id": "img:b",
+        "file": "Fig2.png",
+        "sha256": "b" * 64,
+    })
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [],
+        "image_review": {
+            "status": "completed",
+            "reviewed_asset_ids": ["img:b", "img:a"],
+            "unresolved_asset_ids": ["img:a"],
+            "unreadable_asset_ids": ["img:a"],
+            "deferred_asset_ids": ["img:a", "img:b"],
+        },
+    }
+    original = copy.deepcopy(verdict)
+
+    normalized = _normalized_verdict_copy(scan, verdict)
+
+    assert normalized["image_review"] == {
+        "status": "partial",
+        "reviewed_asset_ids": [],
+        "unresolved_asset_ids": ["img:a", "img:b"],
+        "unreadable_asset_ids": [],
+        "deferred_asset_ids": [],
+    }
+    assert verdict == original
+
+
 def test_image_finding_ref_matches_exact_finding_id(tmp_path):
     verdict = {
         "verdict": "NEEDS_HUMAN",
@@ -304,6 +426,351 @@ def test_report_shares_preview_budget_across_image_findings(tmp_path, monkeypatc
     assert "Second image reference" in html
 
 
+def test_oversized_registered_preview_is_rejected_before_pillow_validation(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    budget = EvidenceBudget(1024)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_MB", "0")
+    pillow_called = False
+    original_open = Image.open
+
+    def track_pillow_open(fp, *args, **kwargs):
+        nonlocal pillow_called
+        pillow_called = True
+        return original_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", track_pillow_open)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert not pillow_called
+    assert budget.used_bytes == 0
+
+
+def test_evidence_budget_can_consume_is_non_mutating():
+    budget = EvidenceBudget(5)
+
+    assert budget.can_consume(5)
+    assert not budget.can_consume(6)
+    assert budget.used_bytes == 0
+
+
+def test_zero_preview_budget_skips_pillow_and_payload_read(tmp_path, monkeypatch):
+    scan = _scan(tmp_path)
+    budget = EvidenceBudget(0)
+    original_fdopen = _evidence.os.fdopen
+    original_image_open = Image.open
+    pillow_called = False
+    payload_read = False
+
+    class TrackingFile:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self._fh.close()
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def read(self, *args, **kwargs):
+            nonlocal payload_read
+            payload_read = True
+            return self._fh.read(*args, **kwargs)
+
+    def track_fdopen(fd, *args, **kwargs):
+        return TrackingFile(original_fdopen(fd, *args, **kwargs))
+
+    def track_pillow_open(fp, *args, **kwargs):
+        nonlocal pillow_called
+        pillow_called = True
+        return original_image_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(_evidence.os, "fdopen", track_fdopen)
+    monkeypatch.setattr(Image, "open", track_pillow_open)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert not pillow_called
+    assert not payload_read
+    assert budget.used_bytes == 0
+
+
+def test_registered_preview_rejects_oversized_dimensions_without_budget(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    Image.new("RGB", (11, 10), "white").save(preview)
+    budget = EvidenceBudget(1024 * 1024)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "100")
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert budget.used_bytes == 0
+
+
+def test_registered_preview_rejects_malformed_data_without_budget(tmp_path):
+    scan = _scan(tmp_path)
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    preview.write_bytes(b"not an image")
+    budget = EvidenceBudget(1024)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert budget.used_bytes == 0
+
+
+def test_registered_preview_reads_payload_from_stable_validated_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(preview)
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (2, 2), (0, 0, 255)).save(outside)
+    displaced = tmp_path / "displaced-preview.png"
+    original_open = Image.open
+    opened_from_file_object = False
+    swapped = False
+
+    def swap_during_header_open(fp, *args, **kwargs):
+        nonlocal opened_from_file_object, swapped
+        opened_from_file_object = hasattr(fp, "read")
+        if opened_from_file_object and not swapped:
+            preview.rename(displaced)
+            preview.symlink_to(outside)
+            swapped = True
+        return original_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", swap_during_header_open)
+    budget = EvidenceBudget(1024 * 1024)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert opened_from_file_object
+    assert uri is not None
+    payload = base64.b64decode(uri.split(",", 1)[1])
+    with original_open(io.BytesIO(payload)) as embedded:
+        assert embedded.getpixel((0, 0)) == (255, 0, 0)
+    assert budget.used_bytes == displaced.stat().st_size
+
+
+def test_registered_preview_short_read_does_not_consume_budget(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    size = preview.stat().st_size
+    original_fdopen = _evidence.os.fdopen
+    short_read_triggered = False
+
+    class ShortReadFile:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self._fh.close()
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def read(self, requested=-1):
+            nonlocal short_read_triggered
+            if requested == size + 1:
+                short_read_triggered = True
+                return self._fh.read(max(0, size - 1))
+            return self._fh.read(requested)
+
+    def short_read_fdopen(fd, *args, **kwargs):
+        return ShortReadFile(original_fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(_evidence.os, "fdopen", short_read_fdopen)
+    budget = EvidenceBudget(1024)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert short_read_triggered
+    assert uri is None
+    assert budget.used_bytes == 0
+
+
+def test_registered_preview_rejects_preview_parent_swap(tmp_path, monkeypatch):
+    scan = _scan(tmp_path)
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(preview)
+    preview_dir = preview.parent
+    outside_dir = tmp_path / "outside-preview"
+    outside_dir.mkdir()
+    outside = outside_dir / preview.name
+    Image.new("RGB", (2, 2), (0, 0, 255)).save(outside)
+    displaced = tmp_path / "displaced-preview-dir"
+    preview_path = str(preview.resolve())
+    original_os_open = _evidence.os.open
+    original_image_open = Image.open
+    outside_identity = (outside.stat().st_dev, outside.stat().st_ino)
+    outside_consumed = False
+    swapped = False
+
+    def swap_parent_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        path_text = _evidence.os.fspath(path)
+        if not swapped and (
+            path_text == preview_path
+            or (path_text == "preview" and kwargs.get("dir_fd") is not None)
+        ):
+            preview_dir.rename(displaced)
+            preview_dir.symlink_to(outside_dir, target_is_directory=True)
+            swapped = True
+        return original_os_open(path, flags, *args, **kwargs)
+
+    def track_image_open(fp, *args, **kwargs):
+        nonlocal outside_consumed
+        if hasattr(fp, "fileno"):
+            opened = _evidence.os.fstat(fp.fileno())
+            outside_consumed = (
+                opened.st_dev,
+                opened.st_ino,
+            ) == outside_identity
+        return original_image_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(_evidence.os, "open", swap_parent_before_open)
+    monkeypatch.setattr(Image, "open", track_image_open)
+    budget = EvidenceBudget(1024 * 1024)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert not outside_consumed
+    assert budget.used_bytes == 0
+
+
+def test_registered_preview_rejects_embedded_nul(tmp_path):
+    scan = _scan(tmp_path)
+    scan["image_assets"][0]["preview_path"] += "\x00outside"
+    budget = EvidenceBudget(1024)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert budget.used_bytes == 0
+
+
+@pytest.mark.parametrize(
+    "path_kind",
+    ["absolute", "empty", "dot", "empty-component", "parent-component"],
+)
+def test_registered_preview_rejects_unsafe_relative_components(
+    tmp_path,
+    path_kind,
+):
+    scan = _scan(tmp_path)
+    preview = scan["image_assets"][0]["preview_path"]
+    scan["image_assets"][0]["preview_path"] = {
+        "absolute": str(tmp_path / preview),
+        "empty": "",
+        "dot": f"images/./preview/{Path(preview).name}",
+        "empty-component": f"images//preview/{Path(preview).name}",
+        "parent-component": f"images/preview/../preview/{Path(preview).name}",
+    }[path_kind]
+    budget = EvidenceBudget(1024 * 1024)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert budget.used_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("PAPERCONAN_MAX_IMAGE_MB", "inf"),
+        ("PAPERCONAN_MAX_IMAGE_MB", "not-a-number"),
+        ("PAPERCONAN_MAX_IMAGE_MB", "1e10000"),
+        ("PAPERCONAN_MAX_IMAGE_PIXELS", "inf"),
+        ("PAPERCONAN_MAX_IMAGE_PIXELS", "not-a-number"),
+        ("PAPERCONAN_MAX_IMAGE_PIXELS", "9" * 5000),
+    ],
+    ids=[
+        "mb-non-finite",
+        "mb-malformed",
+        "mb-overflow",
+        "pixels-non-finite",
+        "pixels-malformed",
+        "pixels-overflow",
+    ],
+)
+def test_registered_preview_rejects_invalid_resource_limits(
+    tmp_path,
+    monkeypatch,
+    name,
+    value,
+):
+    scan = _scan(tmp_path)
+    budget = EvidenceBudget(1024 * 1024)
+    monkeypatch.setenv(name, value)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert budget.used_bytes == 0
+
+
 def test_non_neutral_model_text_is_rejected_without_echo(tmp_path):
     blocked = "mis" + "conduct"
     verdict = {
@@ -317,6 +784,189 @@ def test_non_neutral_model_text_is_rejected_without_echo(tmp_path):
         render_adjudicated_report(_scan(tmp_path), verdict, artifact_dir=str(tmp_path))
     assert blocked not in str(exc.value).lower()
     assert "neutral-language policy" in str(exc.value)
+
+
+def _assert_visible_text_is_rejected(tmp_path, verdict):
+    blocked = "mis" + "conduct"
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan(tmp_path), verdict, artifact_dir=str(tmp_path))
+    assert blocked not in str(exc.value).casefold()
+    assert "neutral-language policy" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "verdict",
+        "paper_conclusion",
+        "review_note",
+        "title",
+        "overall_impact",
+        "finding.title",
+        "finding.report_md",
+        "finding.suspicion_tier",
+        "finding.impact_scope",
+        "finding.review_status",
+        "finding.image_label",
+        "image_review.note",
+    ],
+)
+def test_multi_shape_visible_verdict_fields_are_validated(tmp_path, field):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": "The signal requires contextual review.",
+        "review_note": "Review note.",
+        "title": "Review title",
+        "overall_impact": "supporting",
+        "findings": [{
+            "finding_type": "numeric",
+            "title": "Numeric relation",
+            "report_md": "The signal requires contextual review.",
+            "suspicion_tier": 2,
+            "impact_scope": "supporting",
+            "review_status": "needs_human",
+        }],
+        "image_review": {
+            "status": "completed",
+            "reviewed_asset_ids": ["img:a"],
+            "note": "Coverage note.",
+        },
+    }
+    if field.startswith("finding."):
+        key = field.removeprefix("finding.")
+        if key == "image_label":
+            verdict["findings"][0]["finding_type"] = "image"
+            verdict["findings"][0]["image_refs"] = [{
+                "asset_id": "img:a",
+                "label": blocked,
+            }]
+        else:
+            verdict["findings"][0][key] = blocked
+    elif field == "image_review.note":
+        verdict["image_review"]["note"] = blocked
+    else:
+        verdict[field] = blocked
+
+    _assert_visible_text_is_rejected(tmp_path, verdict)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "verdict",
+        "review_note",
+        "title",
+        "overall_impact",
+        "report_md",
+        "suspicion_tier",
+        "impact_scope",
+        "review_status",
+        "tier_why",
+        "innocent_explanation",
+        "needs_author_data",
+    ],
+)
+def test_legacy_shape_visible_verdict_fields_are_validated(tmp_path, field):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "review_note": "Review note.",
+        "title": "Review title",
+        "overall_impact": "supporting",
+        "report_md": "The signal requires contextual review.",
+        "suspicion_tier": 2,
+        "impact_scope": "supporting",
+        "review_status": "needs_human",
+        "tier_why": "The relation is unresolved.",
+        "innocent_explanation": "A data assembly issue remains possible.",
+        "needs_author_data": "Source values and mapping.",
+    }
+    verdict[field] = blocked
+
+    _assert_visible_text_is_rejected(tmp_path, verdict)
+
+
+@pytest.mark.parametrize("shape", ["multi", "legacy"])
+def test_non_rendered_finding_id_does_not_trigger_visible_text_validation(
+    tmp_path,
+    shape,
+):
+    blocked = "mis" + "conduct"
+    if shape == "multi":
+        verdict = {
+            "verdict": "NEEDS_HUMAN",
+            "findings": [{
+                "title": "Numeric relation",
+                "finding_ref": {"finding_id": blocked},
+                "report_md": "The signal requires contextual review.",
+            }],
+        }
+    else:
+        verdict = {
+            "verdict": "NEEDS_HUMAN",
+            "finding_refs": [{"finding_id": blocked}],
+            "report_md": "The signal requires contextual review.",
+        }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert blocked not in html.casefold()
+
+
+def test_legacy_non_rendered_paper_conclusion_is_ignored(tmp_path):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": f"This {blocked} text is not rendered in legacy shape.",
+        "report_md": "The signal requires contextual review.",
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert blocked not in html.casefold()
+
+
+def test_markdown_delimiters_remain_visible_in_plain_title(tmp_path):
+    blocked = "mis" + "conduct"
+    split = blocked[:3] + "**" + blocked[3:6] + "**" + blocked[6:]
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": split,
+            "report_md": "The signal requires contextual review.",
+        }],
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert split in html
+    assert blocked not in html.casefold()
+
+
+def test_non_neutral_plain_title_is_rejected_without_echo(tmp_path):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": blocked,
+            "report_md": "The signal requires contextual review.",
+        }],
+    }
+
+    _assert_visible_text_is_rejected(tmp_path, verdict)
 
 
 def test_non_neutral_markdown_split_text_is_rejected_without_echo(tmp_path):
@@ -333,3 +983,58 @@ def test_non_neutral_markdown_split_text_is_rejected_without_echo(tmp_path):
         render_adjudicated_report(_scan(tmp_path), verdict, artifact_dir=str(tmp_path))
     assert blocked not in str(exc.value).lower()
     assert "neutral-language policy" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "trusted_html",
+    [
+        "mis<script>hidden</script>conduct",
+        "mis<style>hidden</style>conduct",
+        "mis<!--hidden-->conduct",
+    ],
+    ids=["script", "style", "comment"],
+)
+def test_visible_text_ignores_hidden_html_without_breaking_continuity(trusted_html):
+    parser = _VisibleTextParser()
+
+    parser.feed(trusted_html)
+    parser.close()
+
+    assert parser.text() == "mis" + "conduct"
+
+
+def test_non_neutral_inline_code_split_text_is_rejected_without_echo(tmp_path):
+    blocked = "mis" + "conduct"
+    split = blocked[:3] + "`" + blocked[3:6] + "`" + blocked[6:]
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": "Image reference",
+            "report_md": f"This text makes a {split} conclusion.",
+        }],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan(tmp_path), verdict, artifact_dir=str(tmp_path))
+
+    assert blocked not in str(exc.value).lower()
+    assert "neutral-language policy" in str(exc.value)
+
+
+def test_neutral_text_does_not_join_adjacent_list_items(tmp_path):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": "Image reference",
+            "report_md": f"- {blocked[:3]}\n- {blocked[3:]}",
+        }],
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert "<li>mis</li><li>conduct</li>" in html

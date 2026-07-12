@@ -1,5 +1,11 @@
+import hashlib
 import io
+import json
+import tarfile
+import zipfile
 from pathlib import Path
+
+import pytest
 
 from paperconan.fetch import _download
 
@@ -331,7 +337,6 @@ def test_identical_archive_file_preserves_direct_download_and_provenance(
     monkeypatch,
     tmp_path,
 ):
-    import json
     import zipfile
 
     payload = io.BytesIO()
@@ -390,3 +395,379 @@ def test_identical_archive_file_preserves_direct_download_and_provenance(
         "asset_type": "image",
         "size": 5,
     }]
+
+
+def test_direct_files_with_same_name_publish_distinct_files_and_provenance(
+    monkeypatch,
+    tmp_path,
+):
+    payloads = {
+        "https://example.test/first/Fig1.png": b"first-image",
+        "https://example.test/second/Fig1.png": b"second-image",
+    }
+
+    def fake_download(url, dest, **kwargs):
+        data = payloads[url]
+        Path(dest).write_bytes(data)
+        return {
+            "ok": True,
+            "path": dest,
+            "size": len(data),
+            "content_type": "image/png",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "image_files": [
+            {"name": "Fig1.png", "download_url": url}
+            for url in payloads
+        ],
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(tmp_path),
+        include_images=True,
+    )
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    published = {Path(path).name: Path(path).read_bytes() for path in summary["downloaded"]}
+    second_digest = hashlib.sha256(payloads["https://example.test/second/Fig1.png"]).hexdigest()[:10]
+    expected_sources = {
+        "Fig1.png": "https://example.test/first/Fig1.png",
+        f"Fig1-{second_digest}.png": "https://example.test/second/Fig1.png",
+    }
+    assert len(published) == 2
+    assert set(published.values()) == set(payloads.values())
+    assert {
+        entry["file"]: entry["source_url"]
+        for entry in sidecar["downloads"]
+    } == expected_sources
+
+
+def test_direct_download_does_not_follow_existing_destination_symlink(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"outside")
+    (out_dir / "Fig1.png").symlink_to(sentinel)
+
+    def fake_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"new-image")
+        return {"ok": True, "path": dest, "size": 9, "source_url": url}
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "image_files": [
+            {
+                "name": "Fig1.png",
+                "download_url": "https://example.test/Fig1.png",
+            },
+        ],
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(out_dir),
+        include_images=True,
+    )
+
+    assert sentinel.read_bytes() == b"outside"
+    assert len(summary["downloaded"]) == 1
+    published = Path(summary["downloaded"][0])
+    assert published.parent == out_dir
+    assert published.is_file()
+    assert not published.is_symlink()
+    assert published.read_bytes() == b"new-image"
+
+
+def test_write_collision_safe_does_not_follow_candidate_or_digest_symlinks(tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"outside")
+    data = b"archive-image"
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    candidate = out_dir / "Fig1.png"
+    digest_path = out_dir / f"Fig1-{digest}.png"
+    candidate.symlink_to(sentinel)
+    digest_path.symlink_to(sentinel)
+
+    published = Path(
+        _download._write_collision_safe(str(out_dir), "nested/Fig1.png", data)
+    )
+
+    assert sentinel.read_bytes() == b"outside"
+    assert published == out_dir / f"Fig1-{digest}-2.png"
+    assert published.is_file()
+    assert not published.is_symlink()
+    assert published.read_bytes() == data
+
+
+def test_download_file_replaces_destination_symlink_without_following_it(
+    monkeypatch,
+    tmp_path,
+):
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"outside")
+    dest = tmp_path / "data.csv"
+    dest.symlink_to(sentinel)
+    monkeypatch.setattr(
+        _download.urllib.request,
+        "urlopen",
+        lambda req, timeout=None: _Resp(b"a,b\n1,2\n", "text/csv"),
+    )
+
+    result = _download.download_file(
+        "https://example.test/data.csv",
+        str(dest),
+        retries=1,
+    )
+
+    assert result["ok"] is True
+    assert sentinel.read_bytes() == b"outside"
+    assert dest.is_file()
+    assert not dest.is_symlink()
+    assert dest.read_bytes() == b"a,b\n1,2\n"
+
+
+def test_write_collision_safe_preserves_different_candidate_and_digest_files(tmp_path):
+    data = b"new-image"
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    candidate = tmp_path / "Fig1.png"
+    digest_path = tmp_path / f"Fig1-{digest}.png"
+    candidate.write_bytes(b"existing-candidate")
+    digest_path.write_bytes(b"existing-digest")
+
+    published = Path(
+        _download._write_collision_safe(str(tmp_path), "Fig1.png", data)
+    )
+
+    assert candidate.read_bytes() == b"existing-candidate"
+    assert digest_path.read_bytes() == b"existing-digest"
+    assert published == tmp_path / f"Fig1-{digest}-2.png"
+    assert published.read_bytes() == data
+
+
+def test_write_collision_safe_does_not_clobber_file_created_during_publish(
+    monkeypatch,
+    tmp_path,
+):
+    data = b"new-image"
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    candidate = tmp_path / "Fig1.png"
+    real_link = _download.os.link
+    raced = False
+
+    def racing_link(src, dst, *args, **kwargs):
+        nonlocal raced
+        if not raced and Path(dst) == candidate:
+            raced = True
+            candidate.write_bytes(b"concurrent")
+            raise FileExistsError(dst)
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(_download.os, "link", racing_link)
+
+    published = Path(
+        _download._write_collision_safe(str(tmp_path), "Fig1.png", data)
+    )
+
+    assert raced is True
+    assert candidate.read_bytes() == b"concurrent"
+    assert published == tmp_path / f"Fig1-{digest}.png"
+    assert published.read_bytes() == data
+
+
+def _archive_bytes(kind, member_name="tables/data.csv", data=b"a,b\n1,2\n"):
+    payload = io.BytesIO()
+    if kind == "oa":
+        with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            info = tarfile.TarInfo(member_name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    else:
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(member_name, data)
+    return payload.getvalue()
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+@pytest.mark.parametrize("metadata_kind", ["symlink", "absolute", "parent"])
+def test_archive_download_staging_ignores_unsafe_metadata_paths(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+    metadata_kind,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sentinel = tmp_path / f"{archive_kind}-{metadata_kind}-sentinel"
+    sentinel.write_bytes(b"outside")
+    if metadata_kind == "symlink":
+        metadata_name = f"{archive_kind}.archive"
+        (out_dir / metadata_name).symlink_to(sentinel)
+    elif metadata_kind == "absolute":
+        metadata_name = str(tmp_path / f"{archive_kind}-escaped.archive")
+    else:
+        metadata_name = f"../{archive_kind}-escaped.archive"
+
+    destinations = []
+    payload = _archive_bytes(archive_kind)
+
+    def fake_download(url, dest, **kwargs):
+        destinations.append(dest)
+        Path(dest).write_bytes(payload)
+        return {"ok": True, "path": dest, "size": len(payload)}
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": metadata_name,
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert sentinel.read_bytes() == b"outside"
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert len(destinations) == 1
+    assert Path(destinations[0]).parent.resolve() == out_dir.resolve()
+    assert Path(destinations[0]).name != Path(metadata_name).name
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_failed_archive_download_removes_staging_file(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    destinations = []
+
+    def failed_download(url, dest, **kwargs):
+        destinations.append(dest)
+        return {"ok": False, "path": dest, "skipped_reason": "network unavailable"}
+
+    monkeypatch.setattr(_download, "download_file", failed_download)
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": f"{archive_kind}.archive",
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert len(destinations) == 1
+    assert summary["downloaded"] == []
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+def test_direct_download_rejects_staging_path_swapped_to_symlink(
+    monkeypatch,
+    tmp_path,
+):
+    outside = tmp_path / "outside.csv"
+    outside.write_bytes(b"outside,bytes\n")
+
+    def swapped_download(url, dest, **kwargs):
+        path = Path(dest)
+        path.write_bytes(b"downloaded,bytes\n")
+        path.unlink()
+        path.symlink_to(outside)
+        return {
+            "ok": True,
+            "path": dest,
+            "size": len(b"downloaded,bytes\n"),
+            "content_type": "text/csv",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", swapped_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [
+            {
+                "name": "data.csv",
+                "download_url": "https://example.test/data.csv",
+            },
+        ],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path / "out"))
+
+    assert outside.read_bytes() == b"outside,bytes\n"
+    assert summary["downloaded"] == []
+    assert "stable regular file" in summary["skipped"][0]["reason"]
+    assert not (tmp_path / "out" / "data.csv").exists()
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_download_rejects_staging_path_swapped_to_symlink(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    outside_archive = tmp_path / f"outside-{archive_kind}.archive"
+    outside_archive.write_bytes(
+        _archive_bytes(archive_kind, "outside.csv", b"outside,bytes\n")
+    )
+
+    def swapped_download(url, dest, **kwargs):
+        path = Path(dest)
+        path.write_bytes(_archive_bytes(archive_kind))
+        path.unlink()
+        path.symlink_to(outside_archive)
+        return {"ok": True, "path": dest, "size": path.stat().st_size}
+
+    monkeypatch.setattr(_download, "download_file", swapped_download)
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": f"{archive_kind}.archive",
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+
+    out_dir = tmp_path / "out"
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert outside_archive.exists()
+    assert summary["downloaded"] == []
+    assert "stable regular file" in summary["skipped"][0]["reason"]
+    assert not (out_dir / "outside.csv").exists()
+    assert not list(out_dir.glob(".paperconan-archive-*"))

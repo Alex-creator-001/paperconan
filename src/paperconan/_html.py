@@ -12,8 +12,12 @@ from typing import Any, Iterable
 
 from .image._evidence import (
     EvidenceBudget,
+    _max_image_bytes,
+    _max_image_pixels,
+    _open_artifact_regular,
+    _registered_artifact_location,
+    _validated_crop_box,
     registered_preview_data_uri,
-    resolve_registered_path,
 )
 
 
@@ -201,29 +205,38 @@ def _registered_pair_preview_data_uri(
     for region in regions[:2]:
         asset = assets.get(str(region.get("asset_id")))
         box = region.get("box")
-        if (
-            asset is None
-            or not isinstance(box, (list, tuple))
-            or len(box) != 4
-            or not all(isinstance(value, int) and not isinstance(value, bool)
-                       for value in box)
-        ):
-            return None
-        native = resolve_registered_path(artifact_dir, asset.get("path"))
-        if native is None:
+        if asset is None:
             return None
         try:
-            with Image.open(native) as image:
-                x0, y0, x1, y1 = box
-                if not (
-                    0 <= x0 < x1 <= image.width
-                    and 0 <= y0 < y1 <= image.height
-                ):
+            location = _registered_artifact_location(
+                artifact_dir,
+                asset.get("path"),
+            )
+            if location is None:
+                return None
+            root, _, relative = location
+            with _open_artifact_regular(root, relative) as fh:
+                if os.fstat(fh.fileno()).st_size > _max_image_bytes():
                     return None
-                preview = image.crop((x0, y0, x1, y1))
-                preview.thumbnail((760, 760))
-                previews.append(preview.convert("RGB"))
-        except (OSError, ValueError):
+                with Image.open(fh) as image:
+                    width, height = image.size
+                    max_pixels = _max_image_pixels()
+                    if (
+                        width <= 0
+                        or height <= 0
+                        or width * height > max_pixels
+                    ):
+                        return None
+                    validated_box = _validated_crop_box(
+                        box,
+                        width=width,
+                        height=height,
+                        max_pixels=max_pixels,
+                    )
+                    preview = image.crop(validated_box)
+                    preview.thumbnail((760, 760))
+                    previews.append(preview.convert("RGB"))
+        except Exception:
             return None
 
     height = max(image.height for image in previews)

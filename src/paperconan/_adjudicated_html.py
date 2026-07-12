@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import html
+from html.parser import HTMLParser
 import os
 import re
 from typing import Any
@@ -45,6 +46,88 @@ _REPORT_TERM_HEX = (
     "e980a0e58187",
 )
 _REPORT_TERMS = tuple(bytes.fromhex(value).decode("utf-8") for value in _REPORT_TERM_HEX)
+_VISIBLE_TEXT_SEPARATOR_TAGS = {
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "br",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+}
+
+
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._suppressed_depth = 0
+
+    def _separator(self) -> None:
+        if self.parts and self.parts[-1] != "\n":
+            self.parts.append("\n")
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in {"script", "style"}:
+            self._suppressed_depth += 1
+            return
+        if self._suppressed_depth:
+            return
+        if tag in _VISIBLE_TEXT_SEPARATOR_TAGS:
+            self._separator()
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        if self._suppressed_depth or tag in {"script", "style"}:
+            return
+        if tag in _VISIBLE_TEXT_SEPARATOR_TAGS:
+            self._separator()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"}:
+            if self._suppressed_depth:
+                self._suppressed_depth -= 1
+            return
+        if self._suppressed_depth:
+            return
+        if tag in _VISIBLE_TEXT_SEPARATOR_TAGS:
+            self._separator()
+
+    def handle_data(self, data: str) -> None:
+        if not self._suppressed_depth:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self.parts)
 
 
 def _is_image_verdict_finding(finding: dict[str, Any]) -> bool:
@@ -62,20 +145,34 @@ def _normalize_image_review(review: object, known_asset_ids: set[str]) -> dict[s
     if status not in _IMAGE_REVIEW_STATUSES:
         status = "partial"
     result = {"status": status}
-    assigned: set[str] = set()
-    for key in (
+    keys = (
         "reviewed_asset_ids",
         "unresolved_asset_ids",
         "unreadable_asset_ids",
         "deferred_asset_ids",
-    ):
+    )
+    category_ids = {}
+    for key in keys:
         values = source.get(key) if isinstance(source.get(key), list) else []
-        normalized = sorted({
+        category_ids[key] = {
             str(x) for x in values
-            if str(x) in known_asset_ids and str(x) not in assigned
-        })
-        result[key] = normalized
-        assigned.update(normalized)
+            if str(x) in known_asset_ids
+        }
+    conflicts = {
+        asset_id
+        for asset_id in known_asset_ids
+        if sum(asset_id in category_ids[key] for key in keys) > 1
+    }
+    for key in keys:
+        result[key] = sorted(category_ids[key] - conflicts)
+    result["unresolved_asset_ids"] = sorted(
+        set(result["unresolved_asset_ids"]) | conflicts
+    )
+    assigned = {
+        asset_id
+        for key in keys
+        for asset_id in result[key]
+    }
     missing = sorted(known_asset_ids - assigned)
     if missing:
         result["deferred_asset_ids"] = sorted(
@@ -83,30 +180,93 @@ def _normalize_image_review(review: object, known_asset_ids: set[str]) -> dict[s
         )
         if status == "completed":
             result["status"] = "partial"
+    if conflicts:
+        result["status"] = "partial"
     if source.get("note"):
         result["note"] = str(source["note"])
     return result
 
 
-def _iter_verdict_text(value: object):
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, dict):
-        for nested in value.values():
-            yield from _iter_verdict_text(nested)
-    elif isinstance(value, list):
-        for nested in value:
-            yield from _iter_verdict_text(nested)
+def _iter_verdict_text(verdict: dict[str, Any]):
+    def visible_values(
+        source: dict[str, Any],
+        keys: tuple[str, ...],
+        *,
+        markdown: bool,
+    ):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                yield str(value), markdown
+
+    yield from visible_values(
+        verdict,
+        (
+            "verdict",
+            "title",
+            "overall_impact",
+        ),
+        markdown=False,
+    )
+    yield from visible_values(verdict, ("review_note",), markdown=True)
+    if verdict.get("findings"):
+        yield from visible_values(verdict, ("paper_conclusion",), markdown=True)
+        for finding in verdict["findings"]:
+            if not isinstance(finding, dict):
+                continue
+            yield from visible_values(
+                finding,
+                (
+                    "title",
+                    "suspicion_tier",
+                    "impact_scope",
+                    "review_status",
+                ),
+                markdown=False,
+            )
+            yield from visible_values(finding, ("report_md",), markdown=True)
+            for image_ref in finding.get("image_refs") or []:
+                if isinstance(image_ref, dict):
+                    yield from visible_values(
+                        image_ref,
+                        ("label",),
+                        markdown=False,
+                    )
+    else:
+        yield from visible_values(
+            verdict,
+            (
+                "suspicion_tier",
+                "impact_scope",
+                "review_status",
+                "tier_why",
+                "innocent_explanation",
+                "needs_author_data",
+            ),
+            markdown=False,
+        )
+        yield from visible_values(verdict, ("report_md",), markdown=True)
+    image_review = verdict.get("image_review")
+    if isinstance(image_review, dict):
+        yield from visible_values(
+            image_review,
+            ("status", "note"),
+            markdown=False,
+        )
 
 
 def _rendered_visible_text(value: str) -> str:
-    rendered = _render_md(value)
-    return html.unescape(re.sub(r"<[^>]*>", "", rendered))
+    parser = _VisibleTextParser()
+    parser.feed(_render_md(value))
+    parser.close()
+    return parser.text()
 
 
 def _validate_neutral_verdict(verdict: dict[str, Any]) -> None:
-    values = list(_iter_verdict_text(verdict))
-    text = "\n".join(values + [_rendered_visible_text(value) for value in values]).casefold()
+    text = "\n".join(
+        _rendered_visible_text(value) if markdown else value
+        for value, markdown in _iter_verdict_text(verdict)
+    ).casefold()
     if any(term.casefold() in text for term in _REPORT_TERMS):
         raise ValueError(
             "verdict text violates the neutral-language policy; rewrite it as a "
@@ -127,7 +287,7 @@ def _normalized_verdict_copy(scan: dict[str, Any], verdict: dict[str, Any]) -> d
             finding["review_status"] = _normalize_image_review_status(
                 finding.get("review_status")
             )
-    if "image_review" in normalized:
+    if known or "image_review" in normalized:
         normalized["image_review"] = _normalize_image_review(
             normalized.get("image_review"), known
         )
