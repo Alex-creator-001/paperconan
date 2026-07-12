@@ -22,7 +22,7 @@ def _image(path: Path, size=(80, 60), color=(20, 90, 180)):
     PIL.new("RGB", size, color).save(path)
 
 
-def _fake_pdfium(monkeypatch, page_sizes):
+def _stub_pdfium(monkeypatch, page_sizes):
     events = {
         "rendered": [],
         "pil_closed": [],
@@ -31,7 +31,7 @@ def _fake_pdfium(monkeypatch, page_sizes):
         "document_closed": 0,
     }
 
-    class FakePILImage:
+    class StubPILImage:
         def __init__(self, page_number):
             self.page_number = page_number
             self.image = PIL.new("RGB", (12, 8), (page_number, 20, 30))
@@ -43,17 +43,17 @@ def _fake_pdfium(monkeypatch, page_sizes):
             events["pil_closed"].append(self.page_number)
             self.image.close()
 
-    class FakeBitmap:
+    class StubBitmap:
         def __init__(self, page_number):
             self.page_number = page_number
 
         def to_pil(self):
-            return FakePILImage(self.page_number)
+            return StubPILImage(self.page_number)
 
         def close(self):
             events["bitmap_closed"].append(self.page_number)
 
-    class FakePage:
+    class StubPage:
         def __init__(self, page_number, size):
             self.page_number = page_number
             self.size = size
@@ -63,7 +63,7 @@ def _fake_pdfium(monkeypatch, page_sizes):
 
         def render(self, scale):
             events["rendered"].append(self.page_number)
-            return FakeBitmap(self.page_number)
+            return StubBitmap(self.page_number)
 
         def close(self):
             events["page_closed"].append(self.page_number)
@@ -71,7 +71,7 @@ def _fake_pdfium(monkeypatch, page_sizes):
     class StubDocument:
         def __init__(self, path):
             self.pages = [
-                FakePage(index, size)
+                StubPage(index, size)
                 for index, size in enumerate(page_sizes, 1)
             ]
 
@@ -569,7 +569,7 @@ def test_pdf_asset_limit_stops_later_pages_and_closes_resources(tmp_path, monkey
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    events = _fake_pdfium(monkeypatch, [(72, 72), (72, 72), (72, 72)])
+    events = _stub_pdfium(monkeypatch, [(72, 72), (72, 72), (72, 72)])
     monkeypatch.setattr(_assets, "_MAX_IMAGE_ASSETS", 1)
 
     assets, errors = _assets.prepare_image_assets(str(source), str(tmp_path / "audit"))
@@ -589,7 +589,7 @@ def test_pdf_pixel_limit_is_checked_before_render_and_resources_close(tmp_path, 
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    events = _fake_pdfium(monkeypatch, [(1000, 1000)])
+    events = _stub_pdfium(monkeypatch, [(1000, 1000)])
     monkeypatch.setattr(_assets, "_MAX_IMAGE_PIXELS", 100)
 
     assets, errors = _assets.prepare_image_assets(str(source), str(tmp_path / "audit"))
@@ -609,7 +609,7 @@ def test_pdf_rendered_temp_is_removed_after_each_registration(tmp_path, monkeypa
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    _fake_pdfium(monkeypatch, [(72, 72), (72, 72), (72, 72)])
+    _stub_pdfium(monkeypatch, [(72, 72), (72, 72), (72, 72)])
     output = tmp_path / "audit"
     observed_temp_dirs = []
     observed_temp_files = []
@@ -676,7 +676,7 @@ def test_pdf_staging_does_not_follow_or_delete_images_symlink(
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    _fake_pdfium(monkeypatch, [(72, 72)])
+    _stub_pdfium(monkeypatch, [(72, 72)])
     output = tmp_path / "audit"
     output.mkdir()
     outside = tmp_path / "outside"
@@ -707,7 +707,7 @@ def test_pdf_render_staging_respects_total_image_artifact_budget(
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    events = _fake_pdfium(monkeypatch, [(72, 72)])
+    events = _stub_pdfium(monkeypatch, [(72, 72)])
     output = tmp_path / "audit"
     monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_TOTAL_MB", "0")
 
@@ -729,7 +729,7 @@ def test_pdf_render_staging_is_created_under_pinned_root_fd(
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    _fake_pdfium(monkeypatch, [(72, 72)])
+    _stub_pdfium(monkeypatch, [(72, 72)])
     output = tmp_path / "audit"
     real_mkdir = _assets.os.mkdir
     staging_dir_fds = []
@@ -2162,7 +2162,7 @@ def test_oversized_pdf_is_rejected_before_pdfium_open(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    events = _fake_pdfium(monkeypatch, [])
+    events = _stub_pdfium(monkeypatch, [])
     monkeypatch.setattr(_assets, "_MAX_IMAGE_BYTES", 1)
     output = tmp_path / "audit"
 
@@ -2180,7 +2180,7 @@ def test_pdf_page_attempt_limit_counts_duplicate_pages(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
     (source / "supp.pdf").write_bytes(b"synthetic-pdf")
-    events = _fake_pdfium(
+    events = _stub_pdfium(
         monkeypatch,
         [(72, 72), (72, 72), (72, 72), (72, 72)],
     )

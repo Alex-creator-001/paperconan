@@ -215,7 +215,7 @@ def test_write_adjudicated_report_validation_failure_preserves_existing_output(
         "捏" + "造",
         "作" + "假",
         "fr" + "audster",
-        "de" + "frauder",
+        "de" + "fr" + "auder",
     ],
 )
 def test_adjudicated_report_rejects_blocked_language_families_without_echo(
@@ -438,6 +438,83 @@ def test_finding_refs_with_no_match_falls_back_to_strongest_finding():
     assert "constant_offset" in html
 
 
+def test_legacy_null_finding_refs_preserves_strongest_finding_fallback():
+    html = render_adjudicated_report(
+        _scan_two_findings(),
+        {
+            "verdict": "KEEP",
+            "report_md": "## t",
+            "finding_refs": None,
+        },
+    )
+
+    assert html.count('class="finding-card"') == 1
+    assert "constant_offset" in html
+
+
+@pytest.mark.parametrize("value", ["not-a-list", {}, 7])
+def test_legacy_finding_refs_must_be_list_or_null(value):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": value,
+            },
+        )
+
+    assert str(exc.value) == "verdict finding_refs must be a list or null"
+
+
+@pytest.mark.parametrize("entry", [None, [], "not-a-mapping"])
+def test_legacy_finding_ref_entries_must_be_mappings(entry):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [entry],
+            },
+        )
+
+    assert str(exc.value) == "verdict finding_refs entries must be mappings"
+
+
+def test_legacy_finding_refs_limit_is_deterministic():
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [{} for _ in range(5001)],
+            },
+        )
+
+    assert str(exc.value) == (
+        "verdict finding_refs must contain at most 5000 entries"
+    )
+
+
+def test_legacy_shape_validation_precedes_neutral_text_inspection():
+    blocked = "mis" + "conduct"
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+                "finding_refs": [blocked],
+            },
+        )
+
+    assert str(exc.value) == "verdict finding_refs entries must be mappings"
+    assert blocked not in str(exc.value).casefold()
+
+
 def _multi_finding_verdict() -> dict:
     return {
         "title": "Paper X",
@@ -623,6 +700,80 @@ def test_modern_reference_limit_is_deterministic(field):
     assert str(exc.value) == (
         f"verdict {field} must contain at most 1000 entries"
     )
+
+
+def test_verdict_wide_reference_limit_precedes_matching_and_rendering(
+    monkeypatch,
+):
+    def reject_late_work(*args, **kwargs):
+        raise AssertionError("late report work must not start")
+
+    monkeypatch.setattr(_adjudicated_html, "_match_finding", reject_late_work)
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "registered_preview_data_uri",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html.copy,
+        "deepcopy",
+        reject_late_work,
+    )
+    repeated = [{"asset_id": "img:a"} for _ in range(1000)]
+    findings = [{"image_refs": list(repeated)} for _ in range(5)]
+    findings.append({"finding_ref": {}})
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": findings,
+            },
+        )
+
+    assert str(exc.value) == (
+        "verdict references must contain at most 5000 entries"
+    )
+
+
+def test_repeated_extra_refs_render_once_by_selector_key():
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": "Combined numeric evidence",
+            "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+            "extra_refs": [
+                {
+                    "sheet": "Beta",
+                    "kind": "within_col_value_duplication",
+                    "private_note": "first",
+                },
+                {
+                    "sheet": "Beta",
+                    "kind": "within_col_value_duplication",
+                    "private_note": "second",
+                },
+            ],
+            "report_md": "The selected signals require contextual review.",
+        }],
+    }
+
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert html.count('class="finding-card"') == 2
+    assert html.count("within_col_value_duplication") == 1
+
+
+def test_unique_multi_finding_report_structure_is_unchanged():
+    html = render_adjudicated_report(
+        _scan_two_findings(),
+        _multi_finding_verdict(),
+    )
+
+    assert html.count('class="finding-block"') == 2
+    assert html.count('class="finding-card"') == 2
+    assert "findings-index" in html
 
 
 def test_modern_shape_validation_precedes_neutral_text_inspection():

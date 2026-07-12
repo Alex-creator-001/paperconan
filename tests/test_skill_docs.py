@@ -111,6 +111,36 @@ def _python_product_text(path: Path) -> str:
     return "\n".join([comments_and_docstrings, *runtime_strings])
 
 
+def _python_identifier_text(path: Path) -> str:
+    source = path.read_text(encoding="utf-8")
+    return "\n".join(
+        token.string
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.NAME
+    )
+
+
+def _tracked_surface_text(relative: str, path: Path) -> str | None:
+    if relative in {"README.md", "pyproject.toml"} or relative.startswith(
+        ("docs/", "examples/", "skills/")
+    ):
+        try:
+            return path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return None
+    if relative.endswith(".py") and relative.startswith("src/"):
+        return "\n".join([
+            _python_product_text(path),
+            _python_identifier_text(path),
+        ])
+    if relative.endswith(".py") and relative.startswith("tests/"):
+        return "\n".join([
+            _python_comments_and_docstrings(path),
+            _python_identifier_text(path),
+        ])
+    return None
+
+
 def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
     tracked = subprocess.check_output(
         ["git", "ls-files"],
@@ -120,18 +150,8 @@ def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
     violations = []
     for relative in tracked:
         path = ROOT / relative
-        if relative in {"README.md", "pyproject.toml"} or relative.startswith(
-            ("docs/", "examples/", "skills/")
-        ):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-        elif relative.endswith(".py") and relative.startswith("src/"):
-            text = _python_product_text(path)
-        elif relative.endswith(".py") and relative.startswith("tests/"):
-            text = _python_comments_and_docstrings(path)
-        else:
+        text = _tracked_surface_text(relative, path)
+        if text is None:
             continue
         if contains_blocked_language(text):
             violations.append(relative)
@@ -143,7 +163,7 @@ def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
     [
         "fr" + "aud",
         "fr" + "audulent",
-        "de" + "frauded",
+        "de" + "fr" + "auded",
         "fabri" + "cate",
         "fabri" + "cated",
         "fabri" + "cation",
@@ -162,11 +182,41 @@ def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
         "捏" + "造",
         "作" + "假",
         "fr" + "audster",
-        "de" + "frauder",
+        "de" + "fr" + "auder",
     ],
 )
 def test_neutral_language_matcher_blocks_expression_families(text: str) -> None:
     assert contains_blocked_language(f"prefix {text} suffix")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "sample_" + "fa" + "ke_download",
+        "sample" + "Fa" + "keDownload",
+    ],
+    ids=["underscore", "camel-case"],
+)
+def test_neutral_language_matcher_normalizes_identifier_boundaries(text: str) -> None:
+    assert contains_blocked_language(text)
+
+
+def test_tracked_surface_identifier_and_code_block_text_is_inspected(
+    tmp_path: Path,
+) -> None:
+    identifier = "fa" + "ke_download"
+    source = tmp_path / "sample.py"
+    source.write_text(f"def {identifier}():\n    return None\n", encoding="utf-8")
+    assert contains_blocked_language(_python_identifier_text(source))
+
+    document = tmp_path / "sample.md"
+    document.write_text(
+        f"```python\ndef {identifier}():\n    return None\n```\n",
+        encoding="utf-8",
+    )
+    text = _tracked_surface_text("docs/sample.md", document)
+    assert text is not None
+    assert contains_blocked_language(text)
 
 
 @pytest.mark.parametrize(
@@ -193,6 +243,12 @@ def test_image_budget_lock_scope_is_documented() -> None:
     assert "PaperConan writers" in cli
     assert "external writers that ignore the lock" in cli
     assert "observed external changes" in cli
+
+
+def test_verdict_reference_ceiling_is_documented() -> None:
+    reports = (ROOT / "docs" / "reports.md").read_text(encoding="utf-8")
+
+    assert "5,000 raw verdict references" in reports
 
 
 def test_skill_routes_adaptive_image_review() -> None:

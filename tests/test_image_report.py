@@ -298,6 +298,42 @@ def test_mixed_numeric_and_agent_only_image_findings_share_one_report(tmp_path):
     assert "completed" in html
 
 
+def test_repeated_image_refs_render_once_and_preserve_first_order(tmp_path):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Registered image references",
+            "image_refs": [
+                {
+                    "asset_id": "img:a",
+                    "label": "First label",
+                    "path": "ignored-first",
+                },
+                {
+                    "asset_id": "img:a",
+                    "label": "First label",
+                    "path": "ignored-second",
+                },
+                {
+                    "asset_id": "img:a",
+                    "label": "Second label",
+                },
+            ],
+            "report_md": "The registered images require contextual review.",
+        }],
+    }
+
+    html = render_adjudicated_report(
+        _scan(tmp_path),
+        verdict,
+        artifact_dir=str(tmp_path),
+    )
+
+    assert html.count('class="image-evidence"') == 2
+    assert html.index("First label") < html.index("Second label")
+
+
 def test_agent_only_image_finding_never_falls_back_to_numeric_evidence(tmp_path):
     scan = _scan(tmp_path)
     verdict = {
@@ -489,9 +525,6 @@ def test_registered_native_crop_rejects_missing_or_malformed_digest(
     [
         [0, 0, 9, 4],
         [0, 0, 0, 4],
-        [0, 0, 4],
-        [0, 0, 4, 4.0],
-        [True, 0, 4, 4],
     ],
 )
 def test_invalid_box_never_falls_back_to_full_preview(tmp_path, box):
@@ -511,6 +544,70 @@ def test_invalid_box_never_falls_back_to_full_preview(tmp_path, box):
 
     assert "requested native-pixel region unavailable" in html
     assert "data:image/" not in html
+
+
+@pytest.mark.parametrize(
+    "box",
+    [
+        [0, 0, 4],
+        [0, 0, 4, 4.0],
+        [True, 0, 4, 4],
+        (0, 0, 4, 4),
+    ],
+    ids=["short", "float", "boolean", "non-list"],
+)
+def test_modern_image_region_box_requires_four_non_boolean_integers(
+    tmp_path,
+    box,
+):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Invalid native region",
+            "image_refs": [{"asset_id": "img:a", "box": box}],
+            "report_md": "The requested native region is unavailable.",
+        }],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan(tmp_path),
+            verdict,
+            artifact_dir=str(tmp_path),
+        )
+
+    assert str(exc.value) == (
+        "verdict image_refs box must contain exactly four non-boolean integers"
+    )
+
+
+def test_invalid_region_metadata_is_rejected_before_text_inspection(tmp_path):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "finding_type": "image",
+            "title": "Invalid native region",
+            "image_refs": [{
+                "asset_id": "img:a",
+                "box": [0, 0, 1, blocked],
+            }],
+            "report_md": "The requested native region is unavailable.",
+        }],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan(tmp_path),
+            verdict,
+            artifact_dir=str(tmp_path),
+        )
+
+    assert str(exc.value) == (
+        "verdict image_refs box must contain exactly four non-boolean integers"
+    )
+    assert blocked not in str(exc.value).casefold()
 
 
 def test_boxed_reference_rejects_registered_native_path_escape(tmp_path):

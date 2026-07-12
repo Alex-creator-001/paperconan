@@ -86,10 +86,10 @@ def test_download_candidate_extracts_oa_package(tmp_path, monkeypatch):
         info = tarfile.TarInfo("PMC1/sd.csv"); info.size = len(data)
         tf.addfile(info, io.BytesIO(data))
     # make download_file just copy our local tar into the out_dir
-    def fake_dl(url, dest, **k):
+    def stub_download(url, dest, **k):
         import shutil; shutil.copy(tar_path, dest)
         return {"ok": True, "path": dest, "size": tar_path.stat().st_size}
-    monkeypatch.setattr(dl, "download_file", fake_dl)
+    monkeypatch.setattr(dl, "download_file", stub_download)
     cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
             "oa_package": {"url": "https://ftp.ncbi.nlm.nih.gov/x/PMC1.tar.gz", "name": "PMC1.tar.gz"}}
     res = dl.download_candidate(cand, str(tmp_path / "out"))

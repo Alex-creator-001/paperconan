@@ -158,11 +158,11 @@ def test_fetch_images_passes_additive_option(monkeypatch, tmp_path):
     monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
     captured = {}
 
-    def fake_download(candidate, out_dir, **kwargs):
+    def stub_download(candidate, out_dir, **kwargs):
         captured.update(kwargs)
         return {"downloaded": [str(tmp_path / "Fig1.png")], "skipped": []}
 
-    monkeypatch.setattr(_cli, "download_candidate", fake_download)
+    monkeypatch.setattr(_cli, "download_candidate", stub_download)
     rc = _cli.fetch_main([
         "10.x/paper", "--auto", "--images", "--out", str(tmp_path),
     ])

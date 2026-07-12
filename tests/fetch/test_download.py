@@ -53,9 +53,9 @@ def test_download_file_auth_required_message(monkeypatch, tmp_path):
 
 def test_download_candidate_tabular_only(monkeypatch, tmp_path):
     saved = []
-    def fake_dl(url, dest, **kw):
+    def stub_download(url, dest, **kw):
         open(dest, "wb").write(b"x"); saved.append(dest); return {"ok": True, "path": dest}
-    monkeypatch.setattr(_download, "download_file", fake_dl)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     cand = {"cand_id": "zenodo:1", "tabular_files": [
         {"name": "a.csv", "ext": "csv", "size": 5, "download_url": "https://x/a.csv"}]}
     summary = _download.download_candidate(cand, str(tmp_path))
@@ -90,15 +90,15 @@ def test_download_candidate_extracts_tabular_from_supplementary_zip(monkeypatch,
     import io, os, zipfile
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("nested/dir/table.xlsx", b"PK-fake-xlsx-bytes")
+        z.writestr("nested/dir/table.xlsx", b"PK-stub-xlsx-bytes")
         z.writestr("figure.csv", b"a,b\n1,2\n")
         z.writestr("readme.txt", b"not data")
     zbytes = buf.getvalue()
 
-    def fake_dl(url, dest, **kw):
+    def stub_download(url, dest, **kw):
         open(dest, "wb").write(zbytes)
         return {"ok": True, "path": dest}
-    monkeypatch.setattr(_download, "download_file", fake_dl)
+    monkeypatch.setattr(_download, "download_file", stub_download)
 
     cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "doi": "10.1038/x",
             "title": "T", "tabular_files": [],
@@ -124,11 +124,11 @@ def test_supplementary_archive_downloads_with_larger_cap_than_per_file(monkeypat
         z.writestr("table.csv", b"a,b\n1,2\n")
     zbytes = buf.getvalue()
     calls = []
-    def fake_dl(url, dest, **kw):
+    def stub_download(url, dest, **kw):
         calls.append({"url": url, "max_bytes": kw.get("max_bytes")})
         open(dest, "wb").write(zbytes)
         return {"ok": True, "path": dest}
-    monkeypatch.setattr(_download, "download_file", fake_dl)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     cand = {"cand_id": "europepmc:PMC1", "source": "europepmc", "tabular_files": [],
             "supplementary_archive": {"url": "https://ebi/PMC1/supplementaryFiles",
                                       "name": "PMC1.zip"}}
@@ -202,7 +202,7 @@ def test_download_file_403_message(monkeypatch, tmp_path):
 def test_download_candidate_images_are_additive_and_default_stays_tabular(monkeypatch, tmp_path):
     calls = []
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         open(dest, "wb").write(b"x")
         calls.append(dest)
         return {
@@ -212,7 +212,7 @@ def test_download_candidate_images_are_additive_and_default_stays_tabular(monkey
             "content_type": "application/octet-stream",
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     cand = {
         "cand_id": "source:1",
         "source": "source",
@@ -242,11 +242,11 @@ def test_image_archive_same_basenames_do_not_overwrite(monkeypatch, tmp_path):
         archive.writestr("figures/Fig1.png", b"first-image")
         archive.writestr("supplement/Fig1.png", b"second-image")
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         Path(dest).write_bytes(payload.getvalue())
         return {"ok": True, "path": dest, "size": len(payload.getvalue())}
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "europepmc:PMC1",
         "source": "europepmc",
@@ -271,12 +271,12 @@ def test_image_archive_same_basenames_do_not_overwrite(monkeypatch, tmp_path):
 def test_default_direct_table_download_does_not_also_fetch_archive(monkeypatch, tmp_path):
     calls = []
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         calls.append(url)
         Path(dest).write_bytes(b"table")
         return {"ok": True, "path": dest, "size": 5}
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -303,14 +303,14 @@ def test_image_archive_runs_when_direct_table_download_succeeds(monkeypatch, tmp
     with zipfile.ZipFile(payload, "w") as archive:
         archive.writestr("figures/Fig1.png", b"image")
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         if url.endswith("data.csv"):
             Path(dest).write_bytes(b"table")
             return {"ok": True, "path": dest, "size": 5}
         Path(dest).write_bytes(payload.getvalue())
         return {"ok": True, "path": dest, "size": len(payload.getvalue())}
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -348,7 +348,7 @@ def test_identical_archive_file_preserves_direct_download_and_provenance(
 
     direct_url = "https://example.test/Fig1.png?signature=secret#fragment"
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         if url == direct_url:
             Path(dest).write_bytes(b"image")
             return {
@@ -367,7 +367,7 @@ def test_identical_archive_file_preserves_direct_download_and_provenance(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -409,7 +409,7 @@ def test_direct_files_with_same_name_publish_distinct_files_and_provenance(
         "https://example.test/second/Fig1.png": b"second-image",
     }
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         data = payloads[url]
         Path(dest).write_bytes(data)
         return {
@@ -420,7 +420,7 @@ def test_direct_files_with_same_name_publish_distinct_files_and_provenance(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -460,7 +460,7 @@ def test_direct_download_at_exact_paper_cap_is_published(
 ):
     payload = b"a,b\n1,2\n"
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -472,7 +472,7 @@ def test_direct_download_at_exact_paper_cap_is_published(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload))
     candidate = {
         "cand_id": "source:1",
@@ -496,7 +496,7 @@ def test_direct_exact_cap_rerun_excludes_verified_provenance_sidecar(
 ):
     payload = b"a,b\n1,2\n"
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -508,7 +508,7 @@ def test_direct_exact_cap_rerun_excludes_verified_provenance_sidecar(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload))
     candidate = {
         "cand_id": "source:1",
@@ -544,7 +544,7 @@ def test_direct_download_one_byte_over_projected_paper_cap_is_skipped(
 ):
     payload = b"a,b\n1,2\n"
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -556,7 +556,7 @@ def test_direct_download_one_byte_over_projected_paper_cap_is_skipped(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload) - 1)
     candidate = {
         "cand_id": "source:1",
@@ -589,7 +589,7 @@ def test_direct_exact_content_collision_reuse_is_not_double_counted(
     existing = tmp_path / "data.csv"
     existing.write_bytes(payload)
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -601,7 +601,7 @@ def test_direct_exact_content_collision_reuse_is_not_double_counted(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload))
     candidate = {
         "cand_id": "source:1",
@@ -642,7 +642,7 @@ def test_download_candidate_pins_output_root_across_publications(
         "https://example.test/Fig2.png": b"second-image",
     }
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         data = payloads[url]
         Path(dest).write_bytes(data)
         return {"ok": True, "path": dest, "size": len(data), "source_url": url}
@@ -664,7 +664,7 @@ def test_download_candidate_pins_output_root_across_publications(
             out_dir.symlink_to(outside, target_is_directory=True)
         return result
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_write_collision_safe",
@@ -702,7 +702,7 @@ def test_download_candidate_rejects_root_replacement_after_direct_publication(
     replacement = b"replacement,root\n"
     root_replaced = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -730,7 +730,7 @@ def test_download_candidate_rejects_root_replacement_after_direct_publication(
             root_replaced = True
         return published
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_write_collision_safe",
@@ -813,11 +813,11 @@ def test_provenance_sidecar_does_not_follow_or_replace_final_symlink(
     sidecar = out_dir / _download.SOURCE_SIDECAR
     sidecar.symlink_to(sentinel)
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         Path(dest).write_bytes(b"image")
         return {"ok": True, "path": dest, "size": 5, "source_url": url}
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -861,7 +861,7 @@ def test_final_output_replacement_is_reconciled_before_sidecar_publication(
     sidecar_writes = 0
     reconciliation_calls = 0
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -921,7 +921,7 @@ def test_final_output_replacement_is_reconciled_before_sidecar_publication(
         assert json.loads(sidecar.read_text(encoding="utf-8"))["downloads"] == []
         return result
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_reconcile_publications",
@@ -974,7 +974,7 @@ def test_sidecar_no_replace_keeps_prior_descriptor_bytes(
     sidecar.write_bytes(previous_bytes)
     old_reader_fd = os.open(sidecar, os.O_RDONLY | os.O_NOFOLLOW)
     payload = b"a,b\n1,2\n"
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -985,7 +985,7 @@ def test_sidecar_no_replace_keeps_prior_descriptor_bytes(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -1022,11 +1022,11 @@ def test_direct_download_does_not_follow_existing_destination_symlink(
     sentinel.write_bytes(b"outside")
     (out_dir / "Fig1.png").symlink_to(sentinel)
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         Path(dest).write_bytes(b"new-image")
         return {"ok": True, "path": dest, "size": 9, "source_url": url}
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -1568,7 +1568,7 @@ def test_archive_later_publication_failure_keeps_verified_partial_entry(
     existing.write_bytes(b"pre-existing")
     payload = _two_member_archive_bytes(archive_kind)
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -1589,7 +1589,7 @@ def test_archive_later_publication_failure_keeps_verified_partial_entry(
             raise OSError("later archive member publication unavailable")
         return real_write_collision_safe(*args, **kwargs)
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_write_collision_safe",
@@ -1654,7 +1654,7 @@ def _archive_candidate(archive_kind):
 
 
 def _install_archive_payload(monkeypatch, payload):
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -1665,7 +1665,7 @@ def _install_archive_payload(monkeypatch, payload):
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
 
 
 def _fail_download_staging_unlink(monkeypatch):
@@ -1689,7 +1689,7 @@ def test_direct_cleanup_failure_after_publication_preserves_summary_and_sidecar(
 ):
     data = b"a,b\n1,2\n"
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, data)
@@ -1700,7 +1700,7 @@ def test_direct_cleanup_failure_after_publication_preserves_summary_and_sidecar(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     _fail_download_staging_unlink(monkeypatch)
     candidate = {
         "cand_id": "source:1",
@@ -1736,7 +1736,7 @@ def test_direct_cleanup_failure_preserves_existing_processing_error(
 ):
     data = b"a,b\n1,2\n"
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, data)
@@ -1747,7 +1747,7 @@ def test_direct_cleanup_failure_preserves_existing_processing_error(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_read_verified_download_staging",
@@ -2125,7 +2125,7 @@ def test_published_provenance_strips_credentials_and_preserves_ipv6(
     )
     data = b"a,b\n1,2\n"
     if publication_kind == "direct":
-        def fake_download(url, destination, **kwargs):
+        def stub_download(url, destination, **kwargs):
             os.ftruncate(destination.fd, 0)
             os.lseek(destination.fd, 0, os.SEEK_SET)
             os.write(destination.fd, data)
@@ -2136,7 +2136,7 @@ def test_published_provenance_strips_credentials_and_preserves_ipv6(
                 "source_url": url,
             }
 
-        monkeypatch.setattr(_download, "download_file", fake_download)
+        monkeypatch.setattr(_download, "download_file", stub_download)
         candidate = {
             "cand_id": "source:1",
             "source": "source",
@@ -2603,7 +2603,7 @@ def test_excessive_zip_entries_are_rejected_before_zipfile_construction(
     payload = _zero_byte_archive_bytes("supplementary", "entry", 3)
     zipfile_init_called = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -2619,7 +2619,7 @@ def test_excessive_zip_entries_are_rejected_before_zipfile_construction(
         zipfile_init_called = True
         raise AssertionError("ZipFile was constructed before ZIP preflight")
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE",
@@ -2676,7 +2676,7 @@ def test_supplementary_zip_path_never_uses_unbounded_staged_read(
         with real_open_download_staging(staging) as source:
             yield BoundedReader(source)
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -2687,7 +2687,7 @@ def test_supplementary_zip_path_never_uses_unbounded_staged_read(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_open_download_staging",
@@ -2724,7 +2724,7 @@ def test_supplementary_zip_uses_snapshot_after_original_staging_mutation(
     staging = None
     real_preflight = _download._preflight_zip_entry_count
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         nonlocal staging
         staging = destination
         os.ftruncate(destination.fd, 0)
@@ -2745,7 +2745,7 @@ def test_supplementary_zip_uses_snapshot_after_original_staging_mutation(
         os.fsync(staging.fd)
         return count
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_preflight_zip_entry_count",
@@ -2831,7 +2831,7 @@ def test_zip_snapshot_copy_uses_positive_bounded_io(
         with real_open_download_staging(staging) as source:
             yield TrackingReader(source)
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         with os.fdopen(os.dup(destination.fd), "wb") as target:
             target.write(payload)
             target.flush()
@@ -2846,7 +2846,7 @@ def test_zip_snapshot_copy_uses_positive_bounded_io(
         write_sizes.append(len(data))
         return real_write(fd, data)
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_open_download_staging",
@@ -3126,7 +3126,7 @@ def test_malformed_zip_metadata_is_rejected_before_zipfile_construction(
     out_dir = tmp_path / "out"
     zipfile_init_called = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -3142,7 +3142,7 @@ def test_malformed_zip_metadata_is_rejected_before_zipfile_construction(
         zipfile_init_called = True
         raise AssertionError("ZipFile constructed for invalid ZIP metadata")
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(zipfile.ZipFile, "__init__", fail_zipfile_init)
     candidate = {
         "cand_id": "source:1",
@@ -3331,7 +3331,7 @@ def test_tar_member_ceiling_streams_without_materializing_member_list(
     payload = _zero_byte_archive_bytes("oa", "oa", 4)
     download_calls = []
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         download_calls.append(url)
         if url != "https://example.test/oa":
             raise AssertionError("shared archive member ceiling was not enforced")
@@ -3348,7 +3348,7 @@ def test_tar_member_ceiling_streams_without_materializing_member_list(
     def fail_getmembers(archive):
         raise AssertionError("tar member list was materialized")
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(tarfile.TarFile, "getmembers", fail_getmembers)
     monkeypatch.setattr(_download, "_MAX_PUBLISHED_FILES_PER_CANDIDATE", 10)
     monkeypatch.setattr(_download, "_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE", 2)
@@ -3400,7 +3400,7 @@ def test_zero_byte_archive_member_ceiling_is_shared_across_tar_and_zip(
         ),
     }
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         payload = payloads[url]
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
@@ -3412,7 +3412,7 @@ def test_zero_byte_archive_member_ceiling_is_shared_across_tar_and_zip(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, "_MAX_PUBLISHED_FILES_PER_CANDIDATE", 10)
     monkeypatch.setattr(_download, "_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE", 3)
     candidate = {
@@ -3474,7 +3474,7 @@ def test_published_file_ceiling_spans_direct_and_all_archive_sources(
         ),
     }
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         payload = payloads.get(url, b"")
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
@@ -3486,7 +3486,7 @@ def test_published_file_ceiling_spans_direct_and_all_archive_sources(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, "_MAX_PUBLISHED_FILES_PER_CANDIDATE", 3)
     monkeypatch.setattr(_download, "_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE", 10)
     candidate = {
@@ -3543,7 +3543,7 @@ def test_oversized_generated_sidecar_is_not_published(
     if existing_sidecar:
         sidecar.write_bytes(previous_bytes)
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, b"")
@@ -3554,7 +3554,7 @@ def test_oversized_generated_sidecar_is_not_published(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, "_MAX_SOURCE_SIDECAR_BYTES", 32)
     candidate = {
         "cand_id": "source:1",
@@ -3589,7 +3589,7 @@ def test_mismatched_prior_sidecar_is_retained_with_explicit_reason(
     sidecar = out_dir / _download.SOURCE_SIDECAR
     previous_bytes = b'{"cand_id":"previous:1","downloads":[]}'
     sidecar.write_bytes(previous_bytes)
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, b"")
@@ -3600,7 +3600,7 @@ def test_mismatched_prior_sidecar_is_retained_with_explicit_reason(
             "source_url": url,
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "source:1",
         "source": "source",
@@ -3639,7 +3639,7 @@ def test_download_candidate_rejects_equal_size_in_place_content_mutation(
     content_mutated = False
     final_phase = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -3676,7 +3676,7 @@ def test_download_candidate_rejects_equal_size_in_place_content_mutation(
             content_mutated = True
         return real_verify(output, entry)
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_verify_published_output_file",
@@ -3805,7 +3805,7 @@ def test_archive_result_rejects_post_extraction_output_root_replacement(
     extraction_complete = False
     root_replaced = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -3839,7 +3839,7 @@ def test_archive_result_rejects_post_extraction_output_root_replacement(
             (out_dir / "data.csv").write_bytes(b"replacement,root\n")
             root_replaced = True
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, extract_name, track_extraction)
     monkeypatch.setattr(
         _download._PinnedOutputDirectory,
@@ -3882,7 +3882,7 @@ def test_download_candidate_rejects_root_replacement_after_archive_helper(
     replacement = b"replacement,root\n"
     root_replaced = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -3909,7 +3909,7 @@ def test_download_candidate_rejects_root_replacement_after_archive_helper(
         root_replaced = True
         return extracted
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download, helper_name, helper_then_replace_root)
     archive = {
         "url": f"https://example.test/{archive_kind}",
@@ -3944,7 +3944,7 @@ def test_supplementary_archive_skips_replaced_final_entry(
     replacement = b"replacement,entry\n"
     entry_replaced = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -3974,7 +3974,7 @@ def test_supplementary_archive_skips_replaced_final_entry(
             entry_replaced = True
         return real_verify(output, entry)
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_verify_published_output_file",
@@ -4022,12 +4022,12 @@ def test_archive_download_staging_ignores_unsafe_metadata_paths(
     destinations = []
     payload = _archive_bytes(archive_kind)
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         destinations.append(dest)
         Path(dest).write_bytes(payload)
         return {"ok": True, "path": dest, "size": len(payload)}
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     archive = {
         "url": f"https://example.test/{archive_kind}",
         "name": metadata_name,
@@ -4550,7 +4550,7 @@ def test_sidecar_is_published_once_after_both_output_reconciliation_boundaries(
     real_reconcile = _download._reconcile_publications
     real_write_sidecar = _download._write_source_sidecar
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -4573,7 +4573,7 @@ def test_sidecar_is_published_once_after_both_output_reconciliation_boundaries(
         assert reconcile_calls == 2
         return real_write_sidecar(cand, output, downloads=downloads)
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(
         _download,
         "_reconcile_publications",
@@ -4616,7 +4616,7 @@ def test_sidecar_publication_retains_concurrent_no_replace_creation(
     real_link = os.link
     replacement_installed = False
 
-    def fake_download(url, destination, **kwargs):
+    def stub_download(url, destination, **kwargs):
         os.ftruncate(destination.fd, 0)
         os.lseek(destination.fd, 0, os.SEEK_SET)
         os.write(destination.fd, payload)
@@ -4659,7 +4659,7 @@ def test_sidecar_publication_retains_concurrent_no_replace_creation(
             follow_symlinks=follow_symlinks,
         )
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     monkeypatch.setattr(_download.os, "link", create_sidecar_before_link)
     candidate = {
         "cand_id": "source:1",

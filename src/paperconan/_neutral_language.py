@@ -4,6 +4,9 @@ from __future__ import annotations
 import re
 
 
+_IDENTIFIER_CASE_BOUNDARY = re.compile(
+    r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])"
+)
 _BLOCKED_LANGUAGE_PATTERNS = tuple(
     re.compile(pattern, flags=re.IGNORECASE)
     for pattern in (
@@ -21,6 +24,14 @@ _BLOCKED_LANGUAGE_PATTERNS = tuple(
 )
 
 
+def _with_identifier_boundaries(text: str) -> str:
+    return _IDENTIFIER_CASE_BOUNDARY.sub(" ", text).replace("_", " ")
+
+
 def contains_blocked_language(text: str) -> bool:
     """Return whether text contains a blocked expression family."""
-    return any(pattern.search(text) for pattern in _BLOCKED_LANGUAGE_PATTERNS)
+    normalized = _with_identifier_boundaries(text)
+    return any(
+        pattern.search(text) or pattern.search(normalized)
+        for pattern in _BLOCKED_LANGUAGE_PATTERNS
+    )

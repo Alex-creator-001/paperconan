@@ -848,7 +848,7 @@ Append to `tests/fetch/test_download.py`:
 def test_download_candidate_images_are_additive_and_default_stays_tabular(monkeypatch, tmp_path):
     calls = []
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         open(dest, "wb").write(b"x")
         calls.append(dest)
         return {
@@ -858,7 +858,7 @@ def test_download_candidate_images_are_additive_and_default_stays_tabular(monkey
             "content_type": "application/octet-stream",
         }
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     cand = {
         "cand_id": "source:1",
         "source": "source",
@@ -888,11 +888,11 @@ def test_image_archive_same_basenames_do_not_overwrite(monkeypatch, tmp_path):
         archive.writestr("figures/Fig1.png", b"first-image")
         archive.writestr("supplement/Fig1.png", b"second-image")
 
-    def fake_download(url, dest, **kwargs):
+    def stub_download(url, dest, **kwargs):
         Path(dest).write_bytes(payload.getvalue())
         return {"ok": True, "path": dest, "size": len(payload.getvalue())}
 
-    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "download_file", stub_download)
     candidate = {
         "cand_id": "europepmc:PMC1",
         "source": "europepmc",
@@ -1160,10 +1160,10 @@ def test_parse_nature_public_figure_links():
 
 
 def test_search_nature_esm_adds_public_full_figure(monkeypatch):
-    def fake_get_text(url, **kwargs):
+    def stub_get_text(url, **kwargs):
         return FIGURE_HTML if url.endswith("/figures/1") else FIXTURE_HTML
 
-    monkeypatch.setattr(nat._http, "get_text", fake_get_text)
+    monkeypatch.setattr(nat._http, "get_text", stub_get_text)
     candidate = nat.search_nature_esm("10.1038/s41467-022-28338-0")[0]
     assert [f["ext"] for f in candidate["image_files"]] == ["png"]
     assert candidate["image_files"][0]["download_url"].startswith(
@@ -1649,11 +1649,11 @@ def test_fetch_images_passes_additive_option(monkeypatch, tmp_path):
     monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: cands)
     captured = {}
 
-    def fake_download(candidate, out_dir, **kwargs):
+    def stub_download(candidate, out_dir, **kwargs):
         captured.update(kwargs)
         return {"downloaded": [str(tmp_path / "Fig1.png")], "skipped": []}
 
-    monkeypatch.setattr(_cli, "download_candidate", fake_download)
+    monkeypatch.setattr(_cli, "download_candidate", stub_download)
     rc = _cli.fetch_main([
         "10.x/paper", "--auto", "--images", "--out", str(tmp_path),
     ])

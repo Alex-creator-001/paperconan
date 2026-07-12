@@ -46,6 +46,8 @@ _IMAGE_REVIEW_STATUSES = {
 }
 _MAX_MODERN_FINDINGS = 5000
 _MAX_MODERN_REFERENCES = 1000
+# Raw selectors and image cards accepted across one verdict.
+_MAX_VERDICT_REFERENCES = 5000
 _VISIBLE_TEXT_SEPARATOR_TAGS = {
     "address",
     "article",
@@ -168,7 +170,126 @@ def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
                 raise ValueError(
                     f"verdict {field} entries must be mappings"
                 )
+            if field == "image_refs":
+                for reference in references:
+                    if "box" not in reference:
+                        continue
+                    box = reference["box"]
+                    if (
+                        not isinstance(box, list)
+                        or len(box) != 4
+                        or any(
+                            isinstance(value, bool) or not isinstance(value, int)
+                            for value in box
+                        )
+                    ):
+                        raise ValueError(
+                            "verdict image_refs box must contain exactly four "
+                            "non-boolean integers"
+                        )
     return findings
+
+
+def _legacy_finding_refs(verdict: dict[str, Any]) -> list[Mapping[str, Any]]:
+    references = verdict.get("finding_refs")
+    if references is None:
+        return []
+    if not isinstance(references, list):
+        raise ValueError("verdict finding_refs must be a list or null")
+    if len(references) > _MAX_VERDICT_REFERENCES:
+        raise ValueError(
+            "verdict finding_refs must contain at most "
+            f"{_MAX_VERDICT_REFERENCES} entries"
+        )
+    if any(not isinstance(reference, Mapping) for reference in references):
+        raise ValueError("verdict finding_refs entries must be mappings")
+    return references
+
+
+def _validate_verdict_reference_limit(
+    findings: list[Any] | None,
+    legacy_references: list[Mapping[str, Any]],
+) -> None:
+    count = len(legacy_references)
+    for finding in findings or []:
+        count += int(finding.get("finding_ref") is not None)
+        count += len(finding.get("extra_refs") or [])
+        count += len(finding.get("image_refs") or [])
+        if count > _MAX_VERDICT_REFERENCES:
+            raise ValueError(
+                "verdict references must contain at most "
+                f"{_MAX_VERDICT_REFERENCES} entries"
+            )
+
+
+_SELECTOR_REFERENCE_FIELDS = (
+    "file",
+    "sheet",
+    "rows",
+    "kind",
+    "rule",
+    "finding_id",
+)
+
+
+def _selector_reference_key(reference: Mapping[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        str(value) if (value := reference.get(field)) else None
+        for field in _SELECTOR_REFERENCE_FIELDS
+    )
+
+
+def _image_reference_key(
+    reference: Mapping[str, Any],
+    assets: dict[str, dict[str, Any]],
+) -> tuple[Any, ...]:
+    asset_id = str(reference.get("asset_id"))
+    asset = assets.get(asset_id)
+    label = reference.get("label") or (
+        asset.get("file") if asset is not None else None
+    )
+    boxed = "box" in reference
+    return (
+        asset_id,
+        boxed,
+        tuple(reference["box"]) if boxed else None,
+        str(label) if label not in (None, "") else None,
+    )
+
+
+def _deduplicate_references(
+    references: list[Mapping[str, Any]],
+    key,
+) -> list[Mapping[str, Any]]:
+    unique = []
+    seen = set()
+    for reference in references:
+        canonical = key(reference)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        unique.append(reference)
+    return unique
+
+
+def _deduplicate_modern_references(
+    findings: list[Any],
+    scan: dict[str, Any],
+) -> None:
+    assets = _image_asset_map(scan)
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        if "extra_refs" in finding:
+            finding["extra_refs"] = _deduplicate_references(
+                finding["extra_refs"],
+                _selector_reference_key,
+            )
+        if "image_refs" in finding:
+            finding["image_refs"] = _deduplicate_references(
+                finding["image_refs"],
+                lambda reference: _image_reference_key(reference, assets),
+            )
 
 
 def _normalize_image_review_status(value: object) -> str:
@@ -339,8 +460,20 @@ def _normalized_verdict_copy(
     *,
     scan_findings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    source_findings = _modern_findings(verdict)
+    legacy_references = []
+    if source_findings is None:
+        legacy_references = _legacy_finding_refs(verdict)
+    _validate_verdict_reference_limit(source_findings, legacy_references)
+
     normalized = copy.deepcopy(verdict)
-    findings = _modern_findings(normalized)
+    findings = (
+        normalized["findings"]
+        if source_findings is not None
+        else None
+    )
+    if findings is not None:
+        _deduplicate_modern_references(findings, scan)
     known = {
         str(asset.get("asset_id"))
         for asset in scan.get("image_assets", []) or []
@@ -794,7 +927,7 @@ def _normalize_verdict(
         paper = {"paper_conclusion": verdict.get("paper_conclusion"),
                  "review_note": verdict.get("review_note")}
         return paper, list(findings), {}
-    refs = verdict.get("finding_refs") or []
+    refs = _legacy_finding_refs(verdict)
     single = {
         "title": verdict.get("title") or "发现",
         "finding_ref": refs[0] if refs else None,
