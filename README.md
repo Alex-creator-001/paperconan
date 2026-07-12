@@ -185,7 +185,7 @@ PaperConan 本身不调用或配置模型服务。
 
 ## 示例
 
-[`examples/`](examples/) 有完整合成 demo：两份伪造 source data、已生成的 `audit/scan.json` + `report.html`、截图和逐条解读。先看 [examples/README.md](examples/README.md) 和 [examples/report-preview.png](examples/report-preview.png)，或自己跑：
+[`examples/`](examples/) 有完整合成 demo：两份合成 source data、已生成的 `audit/scan.json` + `report.html`、截图和逐条解读。先看 [examples/README.md](examples/README.md) 和 [examples/report-preview.png](examples/report-preview.png)，或自己跑：
 
 ```bash
 cd examples

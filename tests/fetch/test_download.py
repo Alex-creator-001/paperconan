@@ -490,6 +490,54 @@ def test_direct_download_at_exact_paper_cap_is_published(
     assert summary["skipped"] == []
 
 
+def test_direct_exact_cap_rerun_excludes_verified_provenance_sidecar(
+    monkeypatch,
+    tmp_path,
+):
+    payload = b"a,b\n1,2\n"
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "content_type": "text/csv",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload))
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    first = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    first_sidecar = sidecar.read_bytes()
+    second = _download.download_candidate(candidate, str(tmp_path))
+
+    assert first["downloaded"] == second["downloaded"] == [
+        str(tmp_path / "data.csv"),
+    ]
+    assert first["skipped"] == second["skipped"] == []
+    assert (tmp_path / "data.csv").read_bytes() == payload
+    assert sidecar.read_bytes() == first_sidecar
+    assert (tmp_path / "data.csv").stat().st_size == len(payload)
+    assert sum(
+        path.stat().st_size
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    ) > len(payload)
+
+
 def test_direct_download_one_byte_over_projected_paper_cap_is_skipped(
     monkeypatch,
     tmp_path,
@@ -1620,6 +1668,189 @@ def _install_archive_payload(monkeypatch, payload):
     monkeypatch.setattr(_download, "download_file", fake_download)
 
 
+def _fail_download_staging_unlink(monkeypatch):
+    real_unlink = _download.os.unlink
+
+    def fail_staging_unlink(path, *args, **kwargs):
+        name = os.fspath(path)
+        if name.startswith((
+            ".paperconan-download-",
+            ".paperconan-archive-",
+        )):
+            raise OSError("sensitive cleanup detail /private/staging")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(_download.os, "unlink", fail_staging_unlink)
+
+
+def test_direct_cleanup_failure_after_publication_preserves_summary_and_sidecar(
+    monkeypatch,
+    tmp_path,
+):
+    data = b"a,b\n1,2\n"
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, data)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(data),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    _fail_download_staging_unlink(monkeypatch)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert summary["downloaded"] == [str(tmp_path / "data.csv")]
+    assert sidecar["downloads"][0]["file"] == "data.csv"
+    cleanup = [
+        item for item in summary["skipped"]
+        if item["reason"].startswith("download staging cleanup incomplete")
+    ]
+    assert cleanup == [{
+        "name": "data.csv",
+        "reason": "download staging cleanup incomplete: deletion failed",
+    }]
+    assert "/private" not in cleanup[0]["reason"]
+    assert "sensitive cleanup detail" not in cleanup[0]["reason"]
+
+
+def test_direct_cleanup_failure_preserves_existing_processing_error(
+    monkeypatch,
+    tmp_path,
+):
+    data = b"a,b\n1,2\n"
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, data)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(data),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_read_verified_download_staging",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("content verification unavailable")
+        ),
+    )
+    _fail_download_staging_unlink(monkeypatch)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert summary["downloaded"] == []
+    assert sidecar["downloads"] == []
+    assert any(
+        "content verification unavailable" in item["reason"]
+        for item in summary["skipped"]
+    )
+    cleanup = [
+        item for item in summary["skipped"]
+        if item["reason"].startswith("download staging cleanup incomplete")
+    ]
+    assert cleanup == [{
+        "name": "data.csv",
+        "reason": "download staging cleanup incomplete: deletion failed",
+    }]
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_cleanup_failure_after_publication_preserves_summary_and_sidecar(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    payload = _archive_bytes(archive_kind)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    _fail_download_staging_unlink(monkeypatch)
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert summary["downloaded"] == [str(tmp_path / "data.csv")]
+    assert sidecar["downloads"][0]["file"] == "data.csv"
+    cleanup = [
+        item for item in summary["skipped"]
+        if item["reason"].startswith("download staging cleanup incomplete")
+    ]
+    assert cleanup == [{
+        "name": archive["name"],
+        "reason": "download staging cleanup incomplete: deletion failed",
+    }]
+    assert "/private" not in cleanup[0]["reason"]
+    assert "sensitive cleanup detail" not in cleanup[0]["reason"]
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_cleanup_failure_preserves_existing_processing_error(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, b"not-an-archive")
+    _fail_download_staging_unlink(monkeypatch)
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert summary["downloaded"] == []
+    assert sidecar["downloads"] == []
+    cleanup = [
+        item for item in summary["skipped"]
+        if item["reason"].startswith("download staging cleanup incomplete")
+    ]
+    processing = [
+        item for item in summary["skipped"]
+        if item not in cleanup
+    ]
+    assert len(processing) == 1
+    assert processing[0]["name"] == archive["name"]
+    assert cleanup == [{
+        "name": archive["name"],
+        "reason": "download staging cleanup incomplete: deletion failed",
+    }]
+    assert "/private" not in cleanup[0]["reason"]
+    assert "sensitive cleanup detail" not in cleanup[0]["reason"]
+
+
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
 def test_archive_member_at_exact_paper_cap_is_published(
     monkeypatch,
@@ -1637,6 +1868,37 @@ def test_archive_member_at_exact_paper_cap_is_published(
     assert summary["downloaded"] == [str(tmp_path / "data.csv")]
     assert (tmp_path / "data.csv").read_bytes() == data
     assert summary["skipped"] == []
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_exact_cap_rerun_excludes_verified_provenance_sidecar(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    data = b"1234"
+    payload = _archive_bytes(archive_kind, data=data)
+    candidate, _ = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(data))
+
+    first = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = tmp_path / _download.SOURCE_SIDECAR
+    first_sidecar = sidecar.read_bytes()
+    second = _download.download_candidate(candidate, str(tmp_path))
+
+    assert first["downloaded"] == second["downloaded"] == [
+        str(tmp_path / "data.csv"),
+    ]
+    assert first["skipped"] == second["skipped"] == []
+    assert (tmp_path / "data.csv").read_bytes() == data
+    assert sidecar.read_bytes() == first_sidecar
+    assert (tmp_path / "data.csv").stat().st_size == len(data)
+    assert sum(
+        path.stat().st_size
+        for path in tmp_path.iterdir()
+        if path.is_file()
+    ) > len(data)
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])

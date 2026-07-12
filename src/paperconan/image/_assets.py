@@ -1024,6 +1024,13 @@ def _exception_text(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
+def _pdf_renderer_error(exc: Exception) -> str:
+    detail = " ".join(_exception_text(exc).split())
+    if len(detail) > 500:
+        detail = detail[:497] + "..."
+    return f"PDF image rendering unavailable: {detail}"
+
+
 def _pdf_page_render_bound(pixel_width: int, pixel_height: int) -> int:
     raw_bytes = pixel_width * pixel_height * 4
     overhead = pixel_height + max(64 * 1024, raw_bytes // 100)
@@ -1182,7 +1189,7 @@ def prepare_image_assets(
     )
     if candidates or (render_pdf and pdfs):
         preflight_image_dependencies(
-            render_pdf=bool(render_pdf and pdfs),
+            render_pdf=False,
             diagnostics=False,
         )
     output_root.mkdir(parents=True, exist_ok=True)
@@ -1271,7 +1278,21 @@ def prepare_image_assets(
                 raise
             except Exception as exc:
                 errors.append({"file": path.name, "error": str(exc)})
-        if render_pdf:
+        pdf_renderer_available = True
+        if render_pdf and pdfs:
+            try:
+                preflight_image_dependencies(
+                    render_pdf=True,
+                    diagnostics=False,
+                )
+            except ImageDependencyError as exc:
+                pdf_renderer_available = False
+                error = _pdf_renderer_error(exc)
+                errors.extend(
+                    {"file": pdf.name, "error": error}
+                    for pdf in pdfs
+                )
+        if render_pdf and pdf_renderer_available:
             with _pdf_staging_directory(directory_fds[0]) as temp_dir_fd:
                 for pdf in pdfs:
                     try:

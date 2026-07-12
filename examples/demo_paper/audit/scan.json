@@ -1209,7 +1209,7 @@
           ],
           "prefilter": "drop",
           "prefilter_reason": "normalized_or_fold_change",
-          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than a fabricated measurement repeat"
+          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than an unexplained measurement repeat"
         },
         {
           "kind": "within_col_decimal_repetition",

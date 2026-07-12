@@ -162,6 +162,95 @@ def test_standard_report_rejects_in_root_registered_native_symlink(tmp_path):
     assert "data:image/jpeg;base64," not in out.read_text(encoding="utf-8")
 
 
+def test_standard_report_rejects_same_dimension_native_content_replacement(
+    tmp_path,
+):
+    scan = _scan(tmp_path)
+    native = tmp_path / scan["image_assets"][0]["path"]
+    Image.new("RGB", (4, 2), (10, 20, 30)).save(native)
+    scan["image_assets"][0].update(
+        width=4,
+        height=2,
+        sha256=hashlib.sha256(native.read_bytes()).hexdigest(),
+    )
+    scan["image_findings"][0]["regions"] = [
+        {"asset_id": "img:a", "box": [0, 0, 2, 2]},
+        {"asset_id": "img:a", "box": [2, 0, 4, 2]},
+    ]
+    Image.new("RGB", (4, 2), (200, 30, 40)).save(native)
+    out = tmp_path / "report.html"
+
+    write_html_report(scan, str(out))
+
+    assert "data:image/" not in out.read_text(encoding="utf-8")
+
+
+def test_standard_report_requires_every_supplied_region_to_validate(tmp_path):
+    scan = _scan(tmp_path)
+    native = tmp_path / scan["image_assets"][0]["path"]
+    Image.new("RGB", (4, 2), (10, 20, 30)).save(native)
+    scan["image_assets"][0].update(
+        width=4,
+        height=2,
+        sha256=hashlib.sha256(native.read_bytes()).hexdigest(),
+    )
+    scan["image_findings"][0]["regions"] = [
+        {"asset_id": "img:a", "box": [0, 0, 2, 2]},
+        {"asset_id": "img:a", "box": [2, 0, 4, 2]},
+        {"asset_id": "img:a", "box": [0, 0, 5, 2]},
+    ]
+    out = tmp_path / "report.html"
+
+    write_html_report(scan, str(out))
+
+    assert "data:image/" not in out.read_text(encoding="utf-8")
+
+
+def test_standard_report_single_region_uses_digest_bound_native_crop(tmp_path):
+    scan = _scan(tmp_path)
+    native = tmp_path / scan["image_assets"][0]["path"]
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    source = Image.new("RGB", (4, 2), (0, 0, 255))
+    for x in range(2):
+        for y in range(2):
+            source.putpixel((x, y), (255, 0, 0))
+    source.save(native)
+    Image.new("RGB", (4, 2), (0, 255, 0)).save(preview)
+    scan["image_assets"][0].update(
+        width=4,
+        height=2,
+        sha256=hashlib.sha256(native.read_bytes()).hexdigest(),
+    )
+    scan["image_findings"][0]["regions"] = [
+        {"asset_id": "img:a", "box": [0, 0, 2, 2]},
+    ]
+    out = tmp_path / "report.html"
+
+    write_html_report(scan, str(out))
+
+    html = out.read_text(encoding="utf-8")
+    marker = "data:image/jpeg;base64,"
+    encoded = html.split(marker, 1)[1].split('"', 1)[0]
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as crop:
+        red, green, blue = crop.convert("RGB").getpixel((1, 1))
+    assert red > 200
+    assert green < 80
+    assert blue < 80
+    assert "data:image/png;base64," not in html
+
+
+def test_standard_report_without_regions_may_use_registered_full_preview(
+    tmp_path,
+):
+    scan = _scan(tmp_path)
+    scan["image_findings"][0]["regions"] = []
+    out = tmp_path / "report.html"
+
+    write_html_report(scan, str(out))
+
+    assert "data:image/png;base64," in out.read_text(encoding="utf-8")
+
+
 def test_mixed_numeric_and_agent_only_image_findings_share_one_report(tmp_path):
     scan = _scan(tmp_path)
     verdict = {

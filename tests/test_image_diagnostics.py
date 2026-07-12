@@ -95,6 +95,9 @@ def _raw_pair_preview_item(root: Path, *, size=(10, 10)) -> tuple[dict, list[Pat
         {
             "asset_id": f"img:{name}",
             "path": path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "width": size[0],
+            "height": size[1],
         }
         for name, path in zip(("a", "b"), paths)
     ]
@@ -192,10 +195,9 @@ def test_raw_pair_preview_reuses_crop_area_validation_before_crop(
         return original_crop(image, box, *args, **kwargs)
 
     monkeypatch.setattr(
-        _html,
+        _evidence,
         "_validated_crop_box",
         enforce_smaller_crop_cap,
-        raising=False,
     )
     monkeypatch.setattr(Image.Image, "crop", track_crop)
 

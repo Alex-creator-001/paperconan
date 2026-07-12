@@ -10,6 +10,7 @@ worker, DOI claiming, or private batch assumptions live here.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import copy
 import html
 from html.parser import HTMLParser
@@ -19,6 +20,7 @@ import tempfile
 from typing import Any
 
 from ._html import _all_findings, _esc, _render_cross_sheet_examples, _render_evidence_table
+from ._neutral_language import contains_blocked_language
 from .image._budget import report_image_evidence_bytes
 from .image._evidence import (
     EvidenceBudget,
@@ -42,16 +44,8 @@ _IMAGE_FINDING_STATUSES = {"needs_human", "explained", "different", "unresolved"
 _IMAGE_REVIEW_STATUSES = {
     "completed", "partial", "unavailable_no_multimodal", "not_requested",
 }
-_REPORT_TERM_HEX = (
-    "6672617564",
-    "6661627269636174696f6e",
-    "66616b6564",
-    "66616c736966696564",
-    "6d6973636f6e64756374",
-    "6775696c7479",
-    "e980a0e58187",
-)
-_REPORT_TERMS = tuple(bytes.fromhex(value).decode("utf-8") for value in _REPORT_TERM_HEX)
+_MAX_MODERN_FINDINGS = 5000
+_MAX_MODERN_REFERENCES = 1000
 _VISIBLE_TEXT_SEPARATOR_TAGS = {
     "address",
     "article",
@@ -146,6 +140,34 @@ def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
     findings = verdict["findings"]
     if not isinstance(findings, list):
         raise ValueError("verdict findings must be a list")
+    if len(findings) > _MAX_MODERN_FINDINGS:
+        raise ValueError(
+            "verdict findings must contain at most "
+            f"{_MAX_MODERN_FINDINGS} entries"
+        )
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            raise ValueError("verdict finding entries must be mappings")
+        finding_ref = finding.get("finding_ref")
+        if finding_ref is not None and not isinstance(finding_ref, Mapping):
+            raise ValueError(
+                "verdict finding_ref must be a mapping or null"
+            )
+        for field in ("extra_refs", "image_refs"):
+            if field not in finding:
+                continue
+            references = finding[field]
+            if not isinstance(references, list):
+                raise ValueError(f"verdict {field} must be a list")
+            if len(references) > _MAX_MODERN_REFERENCES:
+                raise ValueError(
+                    f"verdict {field} must contain at most "
+                    f"{_MAX_MODERN_REFERENCES} entries"
+                )
+            if any(not isinstance(reference, Mapping) for reference in references):
+                raise ValueError(
+                    f"verdict {field} entries must be mappings"
+                )
     return findings
 
 
@@ -303,7 +325,7 @@ def _validate_neutral_verdict(
         _rendered_visible_text(value) if markdown else value
         for value, markdown in _iter_verdict_text(verdict, scan_findings)
     ).casefold()
-    if any(term.casefold() in text for term in _REPORT_TERMS):
+    if contains_blocked_language(text):
         raise ValueError(
             "verdict text violates the neutral-language policy; rewrite it as a "
             "statistical signal, data inconsistency, unresolved similarity, or "

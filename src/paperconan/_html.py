@@ -12,12 +12,13 @@ from typing import Any, Iterable
 
 from .image._budget import report_image_evidence_bytes
 from .image._evidence import (
+    _BoundedBytesIO,
     EvidenceBudget,
     _base64_encoded_size,
     _max_image_bytes,
     _max_image_pixels,
-    _open_registered_artifact_regular,
-    _validated_crop_box,
+    _max_raw_size_for_base64_budget,
+    registered_native_crop_data_uri,
     registered_preview_data_uri,
 )
 
@@ -199,62 +200,88 @@ def _registered_pair_preview_data_uri(
         if asset.get("asset_id")
     }
     regions = item["finding"].get("regions") or []
-    if len(regions) < 2:
+    if not regions:
         return None
 
-    previews = []
-    for region in regions[:2]:
-        asset = assets.get(str(region.get("asset_id")))
-        box = region.get("box")
-        if asset is None:
-            return None
-        try:
-            with _open_registered_artifact_regular(
-                artifact_dir,
-                asset.get("path"),
-                verify_stable=True,
-            ) as fh:
-                if os.fstat(fh.fileno()).st_size > _max_image_bytes():
-                    return None
-                with Image.open(fh) as image:
-                    width, height = image.size
-                    max_pixels = _max_image_pixels()
-                    if (
-                        width <= 0
-                        or height <= 0
-                        or width * height > max_pixels
-                    ):
-                        return None
-                    validated_box = _validated_crop_box(
-                        box,
-                        width=width,
-                        height=height,
-                        max_pixels=max_pixels,
-                    )
-                    preview = image.crop(validated_box)
-                    preview.thumbnail((760, 760))
-                    previews.append(preview.convert("RGB"))
-        except Exception:
-            return None
-
-    height = max(image.height for image in previews)
-    canvas = Image.new(
-        "RGB",
-        (previews[0].width + previews[1].width + 20, height),
-        "white",
+    remaining_encoded_bytes = max(
+        0,
+        budget.max_bytes - budget.used_bytes,
     )
-    canvas.paste(previews[0], (0, 0))
-    canvas.paste(previews[1], (previews[0].width + 20, 0))
-    output = io.BytesIO()
-    canvas.save(output, format="JPEG", quality=88, optimize=True)
-    payload = output.getvalue()
-    encoded_size = _base64_encoded_size(len(payload))
-    if not budget.can_consume(encoded_size):
+    validation_budget = EvidenceBudget(remaining_encoded_bytes)
+    previews = []
+    canvas = None
+    try:
+        for region in regions:
+            if not isinstance(region, dict):
+                return None
+            asset = assets.get(str(region.get("asset_id")))
+            if asset is None:
+                return None
+            uri = registered_native_crop_data_uri(
+                asset,
+                region.get("box"),
+                artifact_dir,
+                validation_budget,
+            )
+            marker = "data:image/png;base64,"
+            if uri is None or not uri.startswith(marker):
+                return None
+            payload = base64.b64decode(
+                uri[len(marker):],
+                validate=True,
+            )
+            with Image.open(io.BytesIO(payload)) as crop:
+                crop.load()
+                preview = crop.copy()
+            preview.thumbnail((760, 760))
+            converted = preview.convert("RGB")
+            if converted is not preview:
+                preview.close()
+            previews.append(converted)
+
+        gap = 20
+        width = sum(image.width for image in previews)
+        width += gap * max(0, len(previews) - 1)
+        height = max(image.height for image in previews)
+        if (
+            width <= 0
+            or height <= 0
+            or width * height > _max_image_pixels()
+        ):
+            return None
+        canvas = Image.new("RGB", (width, height), "white")
+        offset = 0
+        for preview in previews:
+            canvas.paste(preview, (offset, 0))
+            offset += preview.width + gap
+
+        remaining_encoded_bytes = max(
+            0,
+            budget.max_bytes - budget.used_bytes,
+        )
+        payload_limit = min(
+            _max_image_bytes(),
+            _max_raw_size_for_base64_budget(remaining_encoded_bytes),
+        )
+        if payload_limit <= 0:
+            return None
+        output = _BoundedBytesIO(payload_limit)
+        canvas.save(output, format="JPEG", quality=88, optimize=True)
+        payload = output.getvalue()
+        encoded_size = _base64_encoded_size(len(payload))
+        if not budget.can_consume(encoded_size):
+            return None
+        encoded = base64.b64encode(payload).decode("ascii")
+        if len(encoded) != encoded_size or not budget.consume(encoded_size):
+            return None
+        return f"data:image/jpeg;base64,{encoded}"
+    except Exception:
         return None
-    encoded = base64.b64encode(payload).decode("ascii")
-    if len(encoded) != encoded_size or not budget.consume(len(encoded)):
-        return None
-    return f"data:image/jpeg;base64,{encoded}"
+    finally:
+        if canvas is not None:
+            canvas.close()
+        for preview in previews:
+            preview.close()
 
 
 def _render_finding_card(
@@ -282,12 +309,13 @@ def _render_finding_card(
         )
         preview_uri = None
         if image_budget is not None:
-            preview_uri = _registered_pair_preview_data_uri(
-                item,
-                artifact_dir,
-                image_budget,
-            )
-            if preview_uri is None:
+            if regions:
+                preview_uri = _registered_pair_preview_data_uri(
+                    item,
+                    artifact_dir,
+                    image_budget,
+                )
+            else:
                 for asset in item.get("image_assets", []) or []:
                     preview_uri = registered_preview_data_uri(
                         asset,
@@ -308,6 +336,10 @@ def _render_finding_card(
         else:
             evidence_html = (
                 chips_html
+                + (
+                    '<p class="no-evidence">registered image evidence unavailable</p>'
+                    if regions else ""
+                )
                 or '<p class="no-evidence">no registered image region</p>'
             )
         loc = _esc(file_)

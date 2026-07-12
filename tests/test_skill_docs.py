@@ -8,6 +8,10 @@ import subprocess
 import tokenize
 from pathlib import Path
 
+import pytest
+
+from paperconan._neutral_language import contains_blocked_language
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = ROOT / "skills" / "paperconan"
@@ -95,16 +99,19 @@ def _python_comments_and_docstrings(path: Path) -> str:
     return "\n".join([*comments, *docstrings])
 
 
+def _python_product_text(path: Path) -> str:
+    source = path.read_text(encoding="utf-8")
+    comments_and_docstrings = _python_comments_and_docstrings(path)
+    tree = ast.parse(source, filename=str(path))
+    runtime_strings = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    return "\n".join([comments_and_docstrings, *runtime_strings])
+
+
 def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
-    prohibited = (
-        "fr" + "aud",
-        "fabri" + "cation",
-        "fa" + "ked",
-        "fal" + "sified",
-        "mis" + "conduct",
-        "guil" + "ty",
-        "造" + "假",
-    )
     tracked = subprocess.check_output(
         ["git", "ls-files"],
         cwd=ROOT,
@@ -114,20 +121,70 @@ def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
     for relative in tracked:
         path = ROOT / relative
         if relative in {"README.md", "pyproject.toml"} or relative.startswith(
-            ("docs/", "skills/")
+            ("docs/", "examples/", "skills/")
         ):
             try:
                 text = path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 continue
-        elif relative.endswith(".py") and relative.startswith(("src/", "tests/")):
+        elif relative.endswith(".py") and relative.startswith("src/"):
+            text = _python_product_text(path)
+        elif relative.endswith(".py") and relative.startswith("tests/"):
             text = _python_comments_and_docstrings(path)
         else:
             continue
-        folded = text.casefold()
-        if any(term.casefold() in folded for term in prohibited):
+        if contains_blocked_language(text):
             violations.append(relative)
     assert violations == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "fr" + "aud",
+        "fr" + "audulent",
+        "de" + "frauded",
+        "fabri" + "cate",
+        "fabri" + "cated",
+        "fabri" + "cation",
+        "fa" + "ke",
+        "fa" + "ked",
+        "fa" + "king",
+        "fal" + "sify",
+        "fal" + "sified",
+        "fal" + "sification",
+        "mis" + "conduct",
+        "mis" + "conducted",
+        "guil" + "t",
+        "guil" + "ty",
+        "造" + "假",
+        "伪" + "造",
+        "捏" + "造",
+        "作" + "假",
+        "fr" + "audster",
+        "de" + "frauder",
+    ],
+)
+def test_neutral_language_matcher_blocks_expression_families(text: str) -> None:
+    assert contains_blocked_language(f"prefix {text} suffix")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "statistical signal",
+        "data inconsistency",
+        "request for clarification",
+        "fabric",
+        "microfabrication",
+        "falsifiable hypothesis",
+        "fakeroot package",
+        "misconductance",
+        "guiltless",
+    ],
+)
+def test_neutral_language_matcher_allows_unrelated_words(text: str) -> None:
+    assert not contains_blocked_language(text)
 
 
 def test_image_budget_lock_scope_is_documented() -> None:

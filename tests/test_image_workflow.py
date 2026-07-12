@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 Image = pytest.importorskip("PIL.Image")
 
 from paperconan import scan_dir, write_adjudicated_report
+from paperconan.image import ImageDependencyError
+from paperconan.image import _assets, _dependencies
 
 
 def test_mixed_numeric_and_image_workflow_produces_one_report(tmp_path):
@@ -95,3 +98,66 @@ def test_mixed_numeric_and_image_workflow_produces_one_report(tmp_path):
     assert "data:image/jpeg;base64," in html
     assert html.count('class="finding-block"') == 2
     assert html.count("<!DOCTYPE html>") == 1
+
+
+def test_mixed_scan_retains_raster_when_pdf_renderer_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "data.csv").write_text(
+        "a,b\n1,2\n2,3\n3,4\n4,5\n",
+        encoding="utf-8",
+    )
+    Image.new("RGB", (64, 48), (30, 100, 180)).save(source / "Fig1.png")
+    (source / "supp.pdf").write_bytes(
+        Path("tests/fixtures/supp_table.pdf").read_bytes()
+    )
+
+    def unavailable_pdf_renderer(*, render_pdf, diagnostics):
+        if render_pdf:
+            raise ImageDependencyError("renderer unavailable " + "x" * 2000)
+
+    monkeypatch.setattr(
+        _dependencies,
+        "preflight_image_dependencies",
+        unavailable_pdf_renderer,
+    )
+    monkeypatch.setattr(
+        _assets,
+        "preflight_image_dependencies",
+        unavailable_pdf_renderer,
+    )
+    audit = tmp_path / "audit"
+
+    scan = scan_dir(
+        str(source),
+        str(audit),
+        write_html=False,
+        images=True,
+    )
+
+    assert (audit / "scan.json").exists()
+    assert any(
+        finding["kind"] == "constant_offset"
+        for block in scan["relations_blocks"]
+        for finding in block["relations"]
+    )
+    assert [asset["file"] for asset in scan["image_assets"]] == ["Fig1.png"]
+    pdf_errors = [
+        item
+        for item in scan["scan_errors"]
+        if item.get("file") == "supp.pdf"
+        and str(item.get("error") or "").startswith(
+            "PDF image rendering unavailable:"
+        )
+    ]
+    assert len(pdf_errors) == 1
+    assert len(pdf_errors[0]["error"]) <= 550
+    assert not any(
+        str(item.get("error") or "").startswith(
+            "optional image inventory unavailable:"
+        )
+        for item in scan["scan_errors"]
+    )

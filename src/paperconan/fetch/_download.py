@@ -232,15 +232,26 @@ def _download_staging_file(
 
 def _cleanup_download_staging(
     staging: _DownloadStagingFile | None,
-) -> None:
+) -> str | None:
     if staging is None:
-        return
+        return None
+    failures = []
     try:
         os.unlink(staging.name, dir_fd=staging.output.fd)
     except FileNotFoundError:
         pass
-    finally:
+    except Exception:
+        failures.append("deletion failed")
+    try:
         os.close(staging.fd)
+    except Exception:
+        failures.append("descriptor close failed")
+    if failures:
+        return (
+            "download staging cleanup incomplete: "
+            + ", ".join(failures)
+        )
+    return None
 
 
 @contextmanager
@@ -565,9 +576,24 @@ def _dir_size_fd(directory_fd: int) -> int:
     return total
 
 
+def _excluded_entry_matches(
+    current: os.stat_result,
+    identity: tuple[int, ...],
+) -> bool:
+    if len(identity) == 2:
+        return identity == (current.st_dev, current.st_ino)
+    return identity == (
+        current.st_dev,
+        current.st_ino,
+        current.st_size,
+        current.st_mtime_ns,
+        current.st_ctime_ns,
+    )
+
+
 def _dir_size_fd_excluding_root_entries(
     directory_fd: int,
-    excluded_entries: dict[str, tuple[int, int]],
+    excluded_entries: dict[str, tuple[int, ...]],
 ) -> int:
     total = 0
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -578,9 +604,10 @@ def _dir_size_fd_excluding_root_entries(
             follow_symlinks=False,
         )
         if stat.S_ISREG(current.st_mode):
-            if excluded_entries.get(name) == (
-                current.st_dev,
-                current.st_ino,
+            identity = excluded_entries.get(name)
+            if identity is not None and _excluded_entry_matches(
+                current,
+                identity,
             ):
                 continue
             total += current.st_size
@@ -591,6 +618,84 @@ def _dir_size_fd_excluding_root_entries(
             finally:
                 os.close(child_fd)
     return total
+
+
+def _verified_source_sidecar_identity(
+    output: _PinnedOutputDirectory,
+) -> tuple[int, int, int, int, int] | None:
+    try:
+        output.verify()
+        current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        NotImplementedError,
+        ValueError,
+    ):
+        return None
+    if not stat.S_ISREG(current.st_mode):
+        return None
+    fd = -1
+    try:
+        fd = os.open(
+            SOURCE_SIDECAR,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=output.fd,
+        )
+        opened = os.fstat(fd)
+        final_current = os.stat(
+            SOURCE_SIDECAR,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+        final_opened = os.fstat(fd)
+        output.verify()
+    except (OSError, TypeError, NotImplementedError, ValueError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(final_opened.st_mode)
+        or not stat.S_ISREG(final_current.st_mode)
+        or (opened.st_dev, opened.st_ino)
+        != (current.st_dev, current.st_ino)
+        or (final_opened.st_dev, final_opened.st_ino)
+        != (current.st_dev, current.st_ino)
+        or (final_current.st_dev, final_current.st_ino)
+        != (current.st_dev, current.st_ino)
+        or final_opened.st_size != opened.st_size
+        or final_opened.st_mtime_ns != opened.st_mtime_ns
+        or final_opened.st_ctime_ns != opened.st_ctime_ns
+        or final_current.st_size != opened.st_size
+        or final_current.st_mtime_ns != opened.st_mtime_ns
+        or final_current.st_ctime_ns != opened.st_ctime_ns
+    ):
+        return None
+    return (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
+
+
+def _paper_data_size(output: _PinnedOutputDirectory) -> int:
+    excluded_entries = {}
+    sidecar_identity = _verified_source_sidecar_identity(output)
+    if sidecar_identity is not None:
+        excluded_entries[SOURCE_SIDECAR] = sidecar_identity
+    return _dir_size_fd_excluding_root_entries(
+        output.fd,
+        excluded_entries,
+    )
 
 
 def _dir_size(path):
@@ -809,6 +914,9 @@ def _write_collision_safe(
                 private_state.st_ino,
             ),
         }
+        sidecar_identity = _verified_source_sidecar_identity(out_dir)
+        if sidecar_identity is not None:
+            excluded_entries[SOURCE_SIDECAR] = sidecar_identity
         for staging in transient_files:
             if staging.output.fd != out_dir.fd:
                 raise _UnstableRegularFileError(
@@ -1684,7 +1792,12 @@ def _download_oa_package(
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
         return []
     finally:
-        _cleanup_download_staging(tmp)
+        cleanup_context = _cleanup_download_staging(tmp)
+        if cleanup_context is not None:
+            skipped.append({
+                "name": pkg.get("name"),
+                "reason": cleanup_context,
+            })
 
 
 def _download_supplementary_archive(
@@ -1801,7 +1914,12 @@ def _download_supplementary_archive(
         skipped.append({"name": arch.get("name"), "reason": reason})
         return []
     finally:
-        _cleanup_download_staging(tmp_zip)
+        cleanup_context = _cleanup_download_staging(tmp_zip)
+        if cleanup_context is not None:
+            skipped.append({
+                "name": arch.get("name"),
+                "reason": cleanup_context,
+            })
 
 
 def _safe_source_url(url: object) -> str | None:
@@ -2076,7 +2194,7 @@ def download_candidate(
                     "reason": _published_file_limit_reason(cardinality),
                 })
                 break
-            if _dir_size(output) > _MAX_PAPER_BYTES:
+            if _paper_data_size(output) > _MAX_PAPER_BYTES:
                 skipped.append({
                     "name": f["name"],
                     "reason": "paper data exceeds per-paper cap",
@@ -2152,7 +2270,12 @@ def download_candidate(
                         "reason": res.get("skipped_reason"),
                     })
             finally:
-                _cleanup_download_staging(staging)
+                cleanup_context = _cleanup_download_staging(staging)
+                if cleanup_context is not None:
+                    skipped.append({
+                        "name": f["name"],
+                        "reason": cleanup_context,
+                    })
         pkg = cand.get("oa_package")
         if pkg and pkg.get("url"):
             extracted = _download_oa_package(

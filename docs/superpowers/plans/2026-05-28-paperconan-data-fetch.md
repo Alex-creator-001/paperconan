@@ -54,7 +54,7 @@
 - Modify `src/paperconan/_audit.py` — `main()` dispatches the `fetch` subcommand.
 - Modify `src/paperconan/__init__.py` — bump `__version__` to `0.4.0`.
 - Modify `pyproject.toml` — version `0.4.0`.
-- Create `tests/fetch/__init__.py`, `tests/fetch/conftest.py` (fixture loader + fake HTTP), `tests/fetch/fixtures/*.json`, and one test module per source/unit.
+- Create `tests/fetch/__init__.py`, `tests/fetch/conftest.py` (fixture loader + stub HTTP), `tests/fetch/fixtures/*.json`, and one test module per source/unit.
 - Modify `skills/paperconan/SKILL.md` + `references/` — fetch-then-audit workflow + honesty rules.
 - Modify `README.md` — document `paperconan fetch`.
 
@@ -251,7 +251,7 @@ git commit -m "feat(fetch): stdlib JSON HTTP helpers"
 
 ---
 
-### Task 3: Test fixtures + fake-HTTP conftest
+### Task 3: Test fixtures + stub-HTTP conftest
 
 **Files:**
 - Create: `tests/fetch/conftest.py`
@@ -327,7 +327,7 @@ These fixtures mirror the real API shapes verified on 2026-05-28. `fake_http` le
 ]}}
 ```
 
-- [ ] **Step 2: Create conftest with fixture loader + fake HTTP**
+- [ ] **Step 2: Create conftest with fixture loader + stub HTTP**
 
 ```python
 # tests/fetch/conftest.py
@@ -354,7 +354,7 @@ def make_fake_get_json(routes):
         for sub, obj in routes:
             if sub in url:
                 return obj
-        raise AssertionError(f"no fake route for GET {url}")
+        raise AssertionError(f"no stub route for GET {url}")
     return _fake
 
 
@@ -363,7 +363,7 @@ def make_fake_post_json(routes):
         for sub, obj in routes:
             if sub in url:
                 return obj
-        raise AssertionError(f"no fake route for POST {url}")
+        raise AssertionError(f"no stub route for POST {url}")
     return _fake
 
 
@@ -381,7 +381,7 @@ Expected: PASS (existing tests still pass; no new test yet — this confirms con
 
 ```bash
 git add tests/fetch/conftest.py tests/fetch/fixtures/
-git commit -m "test(fetch): real-shape API fixtures and fake-HTTP harness"
+git commit -m "test(fetch): real-shape API fixtures and stub-HTTP harness"
 ```
 
 ---

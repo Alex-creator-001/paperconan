@@ -1,6 +1,6 @@
 """M2-2: a perfect arithmetic progression that is REUSED — the identical (step, n, first)
 appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plotted across panels
-(magnetic-field / 2-theta / time / dose sweep), not fabricated data. Real measured data is never
+(magnetic-field / 2-theta / time / dose sweep), not a data inconsistency. Real measured data is never
 a perfect progression, so a reused one is an axis and must not flood the high-severity output.
 A ONE-OFF perfect progression keeps its severity (that is the genuinely-suspicious linear-fill)."""
 from paperconan._audit import _demote_reused_progressions, benign_reason

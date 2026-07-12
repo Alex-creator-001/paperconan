@@ -201,6 +201,50 @@ def test_write_adjudicated_report_validation_failure_preserves_existing_output(
     assert out.read_text(encoding="utf-8") == "existing-report"
 
 
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        "fr" + "audulent",
+        "fabri" + "cated",
+        "fa" + "king",
+        "fal" + "sification",
+        "mis" + "conducted",
+        "guil" + "t",
+        "造" + "假",
+        "伪" + "造",
+        "捏" + "造",
+        "作" + "假",
+        "fr" + "audster",
+        "de" + "frauder",
+    ],
+)
+def test_adjudicated_report_rejects_blocked_language_families_without_echo(
+    tmp_path,
+    blocked,
+):
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "findings": [{
+            "title": "Registered signal",
+            "report_md": f"The text makes a {blocked} conclusion.",
+        }],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+            artifact_dir=str(tmp_path),
+        )
+
+    assert blocked.casefold() not in str(exc.value).casefold()
+    assert str(exc.value) == (
+        "verdict text violates the neutral-language policy; rewrite it as a "
+        "statistical signal, data inconsistency, unresolved similarity, or "
+        "request for clarification"
+    )
+
+
 def test_write_adjudicated_report_publication_failure_preserves_existing_output(
     tmp_path,
     monkeypatch,
@@ -491,6 +535,110 @@ def test_multi_finding_non_rendered_selector_metadata_is_ignored():
 
     assert blocked not in html.casefold()
     assert "Unmatched" in html
+
+
+@pytest.mark.parametrize("entry", [None, [], "not-a-mapping"])
+def test_modern_finding_entries_must_be_mappings(entry):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {"verdict": "NEEDS_HUMAN", "findings": [entry]},
+        )
+
+    assert str(exc.value) == "verdict finding entries must be mappings"
+
+
+@pytest.mark.parametrize("value", [[], "not-a-mapping", 7])
+def test_modern_finding_ref_must_be_mapping_or_null(value):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{"finding_ref": value}],
+            },
+        )
+
+    assert str(exc.value) == "verdict finding_ref must be a mapping or null"
+
+
+@pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
+@pytest.mark.parametrize("value", [None, {}, "not-a-list"])
+def test_modern_reference_collections_must_be_lists(field, value):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{field: value}],
+            },
+        )
+
+    assert str(exc.value) == f"verdict {field} must be a list"
+
+
+@pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
+@pytest.mark.parametrize("entry", [None, [], "not-a-mapping"])
+def test_modern_reference_entries_must_be_mappings(field, entry):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{field: [entry]}],
+            },
+        )
+
+    assert str(exc.value) == f"verdict {field} entries must be mappings"
+
+
+def test_modern_findings_limit_is_deterministic():
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{} for _ in range(5001)],
+            },
+        )
+
+    assert str(exc.value) == (
+        "verdict findings must contain at most 5000 entries"
+    )
+
+
+@pytest.mark.parametrize("field", ["extra_refs", "image_refs"])
+def test_modern_reference_limit_is_deterministic(field):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [{
+                    field: [{} for _ in range(1001)],
+                }],
+            },
+        )
+
+    assert str(exc.value) == (
+        f"verdict {field} must contain at most 1000 entries"
+    )
+
+
+def test_modern_shape_validation_precedes_neutral_text_inspection():
+    attacker_text = "fabri" + "cated-input-sentinel"
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            _scan_two_findings(),
+            {
+                "verdict": "NEEDS_HUMAN",
+                "findings": [attacker_text],
+            },
+        )
+
+    assert str(exc.value) == "verdict finding entries must be mappings"
+    assert attacker_text not in str(exc.value)
 
 
 def test_hero_shows_highest_tier_across_findings():

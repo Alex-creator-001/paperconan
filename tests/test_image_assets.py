@@ -13,6 +13,7 @@ PIL = pytest.importorskip("PIL.Image")
 
 from paperconan import scan_dir
 from paperconan import _audit
+from paperconan.image import ImageDependencyError
 from paperconan.image import _assets
 from paperconan.schema import PaperconanInputError
 
@@ -447,6 +448,39 @@ def test_prepare_image_assets_renders_pdf_pages(tmp_path):
     assert pages[0]["parent_file"] == "supp.pdf"
     assert pages[0]["page"] == 1
     assert pages[0]["render_dpi"] == 200
+
+
+def test_prepare_image_assets_retains_raster_when_pdf_renderer_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    (source / "supp.pdf").write_bytes(
+        Path("tests/fixtures/supp_table.pdf").read_bytes()
+    )
+
+    def unavailable_pdf_renderer(*, render_pdf, diagnostics):
+        if render_pdf:
+            raise ImageDependencyError("renderer unavailable " + "x" * 2000)
+
+    monkeypatch.setattr(
+        _assets,
+        "preflight_image_dependencies",
+        unavailable_pdf_renderer,
+    )
+
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(tmp_path / "audit"),
+    )
+
+    assert [asset["file"] for asset in assets] == ["FigA.png"]
+    assert len(errors) == 1
+    assert errors[0]["file"] == "supp.pdf"
+    assert errors[0]["error"].startswith("PDF image rendering unavailable:")
+    assert len(errors[0]["error"]) <= 550
 
 
 def test_pdf_render_uses_stable_open_source_when_path_is_replaced(

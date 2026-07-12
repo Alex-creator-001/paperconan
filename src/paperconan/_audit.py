@@ -1074,7 +1074,7 @@ def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
 def _demote_reused_progressions(report_blocks):
     """A perfect arithmetic progression that is REUSED — the identical (step, n, first)
     appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plotted across
-    panels (magnetic-field / 2-theta / time / dose / wavelength sweep), not fabricated data.
+    panels (magnetic-field / 2-theta / time / dose / wavelength sweep), not a data inconsistency.
     Real measured data is never a perfect progression; a reused perfect progression is an axis.
     Demote these out of the high/medium review priority (kept in scan.json, reversible via
     forensic). A ONE-OFF perfect progression keeps its severity — that is the genuinely
@@ -2815,16 +2815,20 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         except ValueError as exc:
             scan_errors.append({"error": str(exc)})
         else:
+            inventory_ready = False
             try:
                 from .image._dependencies import preflight_image_dependencies
-                image_pdfs = any(
-                    path.is_file() and path.suffix.lower() == ".pdf"
-                    for path in Path(in_dir).iterdir()
-                )
                 preflight_image_dependencies(
-                    render_pdf=image_pdfs,
+                    render_pdf=False,
                     diagnostics=False,
                 )
+                image_assets, image_errors = prepare_image_assets(
+                    in_dir,
+                    out_dir,
+                    artifact_budget=image_budget,
+                )
+                scan_errors.extend(image_errors)
+                inventory_ready = True
             except ImageDependencyError as exc:
                 scan_errors.append(_optional_image_error(
                     "optional image inventory unavailable",
@@ -2835,47 +2839,29 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                     "optional image inventory unavailable",
                     exc,
                 ))
-            else:
+            if image_diagnostics and inventory_ready:
                 try:
-                    image_assets, image_errors = prepare_image_assets(
-                        in_dir,
+                    preflight_image_dependencies(
+                        render_pdf=False,
+                        diagnostics=True,
+                    )
+                    from .image._diagnostics import diagnose_image_assets
+                    image_findings, diagnostic_errors = diagnose_image_assets(
+                        image_assets,
                         out_dir,
                         artifact_budget=image_budget,
                     )
-                    scan_errors.extend(image_errors)
+                    scan_errors.extend(diagnostic_errors)
                 except ImageDependencyError as exc:
                     scan_errors.append(_optional_image_error(
-                        "optional image inventory unavailable",
+                        "optional image diagnostics unavailable",
                         exc,
                     ))
                 except Exception as exc:
                     scan_errors.append(_optional_image_error(
-                        "optional image inventory unavailable",
+                        "optional image diagnostics unavailable",
                         exc,
                     ))
-                if image_diagnostics:
-                    try:
-                        preflight_image_dependencies(
-                            render_pdf=False,
-                            diagnostics=True,
-                        )
-                        from .image._diagnostics import diagnose_image_assets
-                        image_findings, diagnostic_errors = diagnose_image_assets(
-                            image_assets,
-                            out_dir,
-                            artifact_budget=image_budget,
-                        )
-                        scan_errors.extend(diagnostic_errors)
-                    except ImageDependencyError as exc:
-                        scan_errors.append(_optional_image_error(
-                            "optional image diagnostics unavailable",
-                            exc,
-                        ))
-                    except Exception as exc:
-                        scan_errors.append(_optional_image_error(
-                            "optional image diagnostics unavailable",
-                            exc,
-                        ))
 
     out = dict(tool="paperconan",
                tool_version=_version(),
