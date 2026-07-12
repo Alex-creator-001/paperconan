@@ -473,9 +473,14 @@ def test_download_candidate_pins_output_root_across_publications(
     real_write_collision_safe = _download._write_collision_safe
     publications = 0
 
-    def publish_then_swap(output, name, data):
+    def publish_then_swap(output, name, data, **kwargs):
         nonlocal publications
-        result = real_write_collision_safe(output, name, data)
+        result = real_write_collision_safe(
+            output,
+            name,
+            data,
+            **kwargs,
+        )
         publications += 1
         if publications == 1:
             out_dir.rename(displaced)
@@ -508,6 +513,69 @@ def test_download_candidate_pins_output_root_across_publications(
     assert list(outside.iterdir()) == []
     assert (displaced / "Fig1.png").read_bytes() == b"first-image"
     assert not (displaced / "Fig2.png").exists()
+
+
+def test_download_candidate_rejects_root_replacement_after_direct_publication(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    displaced = tmp_path / "displaced-out"
+    payload = b"a,b\n1,2\n"
+    replacement = b"replacement,root\n"
+    root_replaced = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    real_write_collision_safe = _download._write_collision_safe
+
+    def publish_then_replace_root(output, name, data, **kwargs):
+        nonlocal root_replaced
+        published = real_write_collision_safe(
+            output,
+            name,
+            data,
+            **kwargs,
+        )
+        if not root_replaced:
+            out_dir.rename(displaced)
+            out_dir.mkdir()
+            (out_dir / "data.csv").write_bytes(replacement)
+            root_replaced = True
+        return published
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_write_collision_safe",
+        publish_then_replace_root,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert root_replaced
+    assert summary["downloaded"] == []
+    assert len(summary["skipped"]) == 1
+    assert "output directory changed" in summary["skipped"][0]["reason"]
+    assert (out_dir / "data.csv").read_bytes() == replacement
+    assert (displaced / "data.csv").read_bytes() == payload
 
 
 def test_direct_download_staging_stays_on_pinned_root_during_replacement(
@@ -882,6 +950,135 @@ def test_archive_result_rejects_post_extraction_output_root_replacement(
     assert "output directory changed" in summary["skipped"][0]["reason"]
     assert (out_dir / "data.csv").read_bytes() == b"replacement,root\n"
     assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_download_candidate_rejects_root_replacement_after_archive_helper(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    displaced = tmp_path / "displaced-out"
+    payload = _archive_bytes(archive_kind)
+    replacement = b"replacement,root\n"
+    root_replaced = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    helper_name = (
+        "_download_oa_package"
+        if archive_kind == "oa"
+        else "_download_supplementary_archive"
+    )
+    real_helper = getattr(_download, helper_name)
+
+    def helper_then_replace_root(*args, **kwargs):
+        nonlocal root_replaced
+        extracted = real_helper(*args, **kwargs)
+        out_dir.rename(displaced)
+        out_dir.mkdir()
+        (out_dir / "data.csv").write_bytes(replacement)
+        root_replaced = True
+        return extracted
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, helper_name, helper_then_replace_root)
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": f"{archive_kind}.archive",
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert root_replaced
+    assert summary["downloaded"] == []
+    assert len(summary["skipped"]) == 1
+    assert "output directory changed" in summary["skipped"][0]["reason"]
+    assert (out_dir / "data.csv").read_bytes() == replacement
+    assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
+
+
+def test_supplementary_archive_skips_replaced_final_entry(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes("supplementary")
+    replacement = b"replacement,entry\n"
+    entry_replaced = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    real_verify = _download._verify_published_output_file
+
+    def replace_entry_then_verify(output, entry):
+        nonlocal entry_replaced
+        if not entry_replaced:
+            os.unlink(entry.filename, dir_fd=output.fd)
+            replacement_fd = os.open(
+                entry.filename,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=output.fd,
+            )
+            try:
+                os.write(replacement_fd, replacement)
+            finally:
+                os.close(replacement_fd)
+            entry_replaced = True
+        return real_verify(output, entry)
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_verify_published_output_file",
+        replace_entry_then_verify,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementary",
+            "name": "supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert entry_replaced
+    assert summary["downloaded"] == []
+    assert len(summary["skipped"]) == 1
+    assert "stable regular file" in summary["skipped"][0]["reason"]
+    assert (out_dir / "data.csv").read_bytes() == replacement
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])

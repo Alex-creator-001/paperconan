@@ -683,9 +683,8 @@ def _record_image(
                 raise ValueError(
                     f"{source.name}: source changed while preparing image asset"
                 )
-            decode_fd = source_fd if source_fd is not None else native_temp_fd
-            os.lseek(decode_fd, 0, os.SEEK_SET)
-            with os.fdopen(os.dup(decode_fd), "rb") as source_fh:
+            os.lseek(native_temp_fd, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(native_temp_fd), "rb") as source_fh:
                 with Image.open(source_fh) as image:
                     frame_count = int(getattr(image, "n_frames", 1))
                     if frame_count != 1:

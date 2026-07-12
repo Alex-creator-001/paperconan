@@ -1262,9 +1262,63 @@ def test_local_image_stat_hash_replacement_uses_one_stable_source_handle(
     assert errors == []
     assert len(assets) == 1
     assert assets[0]["sha256"] == original_digest
-    assert decoded_identities == [original_identity]
+    assert len(decoded_identities) == 1
+    assert decoded_identities[0] != original_identity
     assert (output / assets[0]["path"]).read_bytes() == original_bytes
     assert image_path.read_bytes() == replacement_bytes
+
+
+def test_local_image_decode_stays_bound_to_verified_native_staging(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    image_path = source / "FigA.png"
+    _image(image_path, size=(80, 60), color=(20, 90, 180))
+    original_bytes = image_path.read_bytes()
+    original_digest = _assets._sha256(image_path)
+    original_identity = (
+        image_path.stat().st_dev,
+        image_path.stat().st_ino,
+    )
+    replacement_path = tmp_path / "replacement.png"
+    _image(replacement_path, size=(31, 17), color=(190, 30, 40))
+    replacement_bytes = replacement_path.read_bytes()
+    real_sha256_fd = _assets._sha256_fd
+    source_mutated = False
+
+    def hash_staging_then_mutate_source(fd):
+        nonlocal source_mutated
+        digest = real_sha256_fd(fd)
+        current = os.fstat(fd)
+        if (
+            not source_mutated
+            and (current.st_dev, current.st_ino) != original_identity
+            and digest == original_digest
+        ):
+            with image_path.open("r+b") as source_fh:
+                source_fh.seek(0)
+                source_fh.write(replacement_bytes)
+                source_fh.truncate()
+            source_mutated = True
+        return digest
+
+    monkeypatch.setattr(_assets, "_sha256_fd", hash_staging_then_mutate_source)
+    output = tmp_path / "audit"
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert source_mutated
+    assert image_path.read_bytes() == replacement_bytes
+    assert errors == []
+    assert len(assets) == 1
+    asset = assets[0]
+    assert asset["sha256"] == original_digest
+    assert (asset["width"], asset["height"]) == (80, 60)
+    assert (output / asset["path"]).read_bytes() == original_bytes
+    with PIL.open(output / asset["preview_path"]) as preview:
+        assert preview.size == (80, 60)
 
 
 def test_second_temp_allocation_failure_cleans_first_temp(tmp_path, monkeypatch):

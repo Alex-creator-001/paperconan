@@ -644,7 +644,7 @@ def _verify_published_output_file(
 def _download_oa_package(
     pkg,
     out_dir,
-    downloaded,
+    published_outputs,
     skipped,
     max_bytes,
     *,
@@ -676,7 +676,7 @@ def _download_oa_package(
         for entry in extracted:
             _verify_published_output_file(out_dir, entry)
         out_dir.verify()
-        downloaded.extend(entry.display_path(out_dir) for entry in extracted)
+        published_outputs.extend(extracted)
         return extracted
     except (tarfile.TarError, OSError, ValueError) as e:
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
@@ -688,7 +688,7 @@ def _download_oa_package(
 def _download_supplementary_archive(
     arch,
     out_dir,
-    downloaded,
+    published_outputs,
     skipped,
     max_bytes,
     archive_max=_ARCHIVE_MAX,
@@ -724,13 +724,17 @@ def _download_supplementary_archive(
         for entry in extracted:
             _verify_published_output_file(out_dir, entry)
         out_dir.verify()
-        downloaded.extend(entry.display_path(out_dir) for entry in extracted)
+        published_outputs.extend(extracted)
         return extracted
-    except (zipfile.BadZipFile, ValueError) as exc:
+    except (zipfile.BadZipFile, OSError, ValueError) as exc:
         reason = (
             "not a valid zip archive"
             if isinstance(exc, zipfile.BadZipFile)
-            else f"archive processing unavailable: {exc}"
+            else (
+                f"archive publication unavailable: {exc}"
+                if isinstance(exc, OSError)
+                else f"archive processing unavailable: {exc}"
+            )
         )
         skipped.append({"name": arch.get("name"), "reason": reason})
         return []
@@ -848,7 +852,7 @@ def download_candidate(
         include_images=include_images,
     )
     with _pinned_output_directory(out_dir) as output:
-        downloaded, skipped = [], []
+        published_outputs, skipped = [], []
         provenance_files = []
         direct_asset_types = set()
         for f in files:
@@ -891,17 +895,22 @@ def download_candidate(
                         })
                         continue
                     try:
-                        published = _write_collision_safe(output, f["name"], data)
+                        published = _write_collision_safe(
+                            output,
+                            f["name"],
+                            data,
+                            _return_entry=True,
+                        )
                     except (OSError, ValueError) as exc:
                         skipped.append({
                             "name": f["name"],
                             "reason": f"secure publication failed: {exc}",
                         })
                         continue
-                    downloaded.append(published)
+                    published_outputs.append(published)
                     direct_asset_types.add(asset_type(f.get("name") or ""))
                     provenance_files.append(_provenance_entry(
-                        published,
+                        published.filename,
                         res.get("source_url") or f.get("download_url"),
                         content_type=res.get("content_type"),
                         size=res.get("size"),
@@ -918,7 +927,7 @@ def download_candidate(
             extracted = _download_oa_package(
                 pkg,
                 output,
-                downloaded,
+                published_outputs,
                 skipped,
                 max_bytes,
                 include_images=include_images,
@@ -932,7 +941,7 @@ def download_candidate(
                 for entry in extracted
             )
         arch = cand.get("supplementary_archive")
-        needs_archive = not downloaded
+        needs_archive = not published_outputs
         if include_images:
             needs_archive = needs_archive or bool(
                 {"tabular", "image", "document"} - direct_asset_types
@@ -941,7 +950,7 @@ def download_candidate(
             extracted = _download_supplementary_archive(
                 arch,
                 output,
-                downloaded,
+                published_outputs,
                 skipped,
                 max_bytes,
                 archive_max=archive_max,
@@ -955,11 +964,33 @@ def download_candidate(
                 )
                 for entry in extracted
             )
-        downloaded = list(dict.fromkeys(downloaded))
         by_file = {}
         for entry in provenance_files:
             by_file.setdefault(entry["file"], entry)
         _write_source_sidecar(cand, output, downloads=list(by_file.values()))
+        try:
+            for entry in published_outputs:
+                _verify_published_output_file(output, entry)
+            output.verify()
+        except (OSError, ValueError) as exc:
+            if not any(
+                str(exc) in str(item.get("reason") or "")
+                for item in skipped
+            ):
+                skipped.append({
+                    "name": cand.get("cand_id"),
+                    "reason": f"published output verification failed: {exc}",
+                })
+            downloaded = []
+        else:
+            unique_outputs = list({
+                entry.filename: entry
+                for entry in published_outputs
+            }.values())
+            downloaded = [
+                entry.display_path(output)
+                for entry in unique_outputs
+            ]
         return {
             "cand_id": cand.get("cand_id"),
             "out_dir": output.path,
