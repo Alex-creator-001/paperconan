@@ -60,6 +60,27 @@ class _PinnedOutputDirectory:
             raise ValueError("fetch output directory changed during publication")
 
 
+class _DownloadStagingFile:
+    def __init__(
+        self,
+        output: _PinnedOutputDirectory,
+        name: str,
+        fd: int,
+    ):
+        self.output = output
+        self.name = name
+        self.fd = fd
+
+    @property
+    def display_path(self) -> str:
+        return os.path.join(self.output.path, self.name)
+
+    def __fspath__(self) -> str:
+        if os.path.isdir("/dev/fd"):
+            return f"/dev/fd/{self.fd}"
+        return f"/proc/self/fd/{self.fd}"
+
+
 @contextmanager
 def _pinned_output_directory(path: str):
     absolute = os.path.abspath(path)
@@ -84,6 +105,88 @@ def _pinned_output_directory(path: str):
 
 def _output_path(output: str | _PinnedOutputDirectory) -> str:
     return output.path if isinstance(output, _PinnedOutputDirectory) else output
+
+
+def _verify_staging_file(staging: _DownloadStagingFile) -> None:
+    opened = os.fstat(staging.fd)
+    try:
+        current = os.stat(
+            staging.name,
+            dir_fd=staging.output.fd,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise _UnstableRegularFileError(
+            "download staging entry is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(current.st_mode)
+        or opened.st_dev != current.st_dev
+        or opened.st_ino != current.st_ino
+    ):
+        raise _UnstableRegularFileError(
+            "download staging entry is not a stable regular file"
+        )
+
+
+def _download_staging_file(
+    output: _PinnedOutputDirectory,
+    *,
+    prefix: str,
+    suffix: str,
+) -> _DownloadStagingFile:
+    output.verify()
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    for _ in range(128):
+        name = f"{prefix}{secrets.token_hex(8)}{suffix}"
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=output.fd)
+        except FileExistsError:
+            continue
+        staging = _DownloadStagingFile(output, name, fd)
+        try:
+            _verify_staging_file(staging)
+            output.verify()
+            return staging
+        except Exception:
+            os.close(fd)
+            try:
+                os.unlink(name, dir_fd=output.fd)
+            except FileNotFoundError:
+                pass
+            raise
+    raise FileExistsError("could not allocate fetch download staging file")
+
+
+def _cleanup_download_staging(
+    staging: _DownloadStagingFile | None,
+) -> None:
+    if staging is None:
+        return
+    try:
+        os.unlink(staging.name, dir_fd=staging.output.fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(staging.fd)
+
+
+@contextmanager
+def _open_download_staging(staging: _DownloadStagingFile):
+    try:
+        staging.output.verify()
+        _verify_staging_file(staging)
+    except ValueError as exc:
+        raise _UnstableRegularFileError(str(exc)) from exc
+    with os.fdopen(os.dup(staging.fd), "rb") as fh:
+        fh.seek(0)
+        yield fh
+        _verify_staging_file(staging)
+        try:
+            staging.output.verify()
+        except ValueError as exc:
+            raise _UnstableRegularFileError(str(exc)) from exc
 
 
 @contextmanager
@@ -116,7 +219,32 @@ def _open_stable_regular(path: str):
             os.close(fd)
 
 
+def _dir_size_fd(directory_fd: int) -> int:
+    total = 0
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    for name in os.listdir(directory_fd):
+        try:
+            current = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISREG(current.st_mode):
+                total += current.st_size
+            elif stat.S_ISDIR(current.st_mode):
+                child_fd = os.open(name, flags, dir_fd=directory_fd)
+                try:
+                    total += _dir_size_fd(child_fd)
+                finally:
+                    os.close(child_fd)
+        except OSError:
+            pass
+    return total
+
+
 def _dir_size(path):
+    if isinstance(path, _PinnedOutputDirectory):
+        return _dir_size_fd(path.fd)
     total = 0
     for dp, _, fs in os.walk(path):
         for f in fs:
@@ -132,8 +260,14 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
     """Download to disk with redirects, size cap, HTML sniffing, and retry/backoff.
     Streams the body in chunks (no whole-file buffering). Retries on timeout and
     HTTP 5xx; auth errors (401/403) and size/HTML rejections are terminal."""
+    staging = (
+        dest_path
+        if isinstance(dest_path, _DownloadStagingFile)
+        else None
+    )
+    result_path = staging.display_path if staging is not None else dest_path
     if not url.lower().startswith(("https://", "http://")):
-        return {"ok": False, "path": dest_path,
+        return {"ok": False, "path": result_path,
                 "skipped_reason": f"unsupported URL scheme: {url!r}"}
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
     last_reason = "unknown error"
@@ -144,50 +278,66 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 ctype = (resp.info().get("Content-Type") or "").lower()
                 if "text/html" in ctype:
-                    return {"ok": False, "path": dest_path,
+                    return {"ok": False, "path": result_path,
                             "skipped_reason": f"server returned HTML ({ctype}), not a data file"}
                 clen = resp.info().get("Content-Length")
                 if clen and clen.isdigit() and int(clen) > max_bytes:
-                    return {"ok": False, "path": dest_path,
+                    return {"ok": False, "path": result_path,
                             "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
-                dest_dir = os.path.realpath(
-                    os.path.dirname(os.path.abspath(dest_path)) or "."
-                )
-                os.makedirs(dest_dir, exist_ok=True)
-                resolved_dest = os.path.join(dest_dir, os.path.basename(dest_path))
-                fd, temp_path = tempfile.mkstemp(
-                    prefix=".paperconan-download-body-",
-                    dir=dest_dir,
-                )
+                if staging is None:
+                    dest_dir = os.path.realpath(
+                        os.path.dirname(os.path.abspath(dest_path)) or "."
+                    )
+                    os.makedirs(dest_dir, exist_ok=True)
+                    resolved_dest = os.path.join(
+                        dest_dir,
+                        os.path.basename(dest_path),
+                    )
+                    fd, temp_path = tempfile.mkstemp(
+                        prefix=".paperconan-download-body-",
+                        dir=dest_dir,
+                    )
+                    destination_fd = fd
+                else:
+                    _verify_staging_file(staging)
+                    os.ftruncate(staging.fd, 0)
+                    os.lseek(staging.fd, 0, os.SEEK_SET)
+                    destination_fd = os.dup(staging.fd)
                 total = 0
-                with os.fdopen(fd, "wb") as fh:
-                    fd = -1
+                with os.fdopen(destination_fd, "wb") as fh:
+                    if staging is None:
+                        fd = -1
                     while True:
                         chunk = resp.read(65536)
                         if not chunk:
                             break
                         total += len(chunk)
                         if total > max_bytes:
-                            return {"ok": False, "path": dest_path,
+                            return {"ok": False, "path": result_path,
                                     "skipped_reason": f"file exceeds max_bytes ({max_bytes})"}
                         fh.write(chunk)
-                os.replace(temp_path, resolved_dest)
-                temp_path = None
+                    fh.flush()
+                if staging is None:
+                    os.replace(temp_path, resolved_dest)
+                    temp_path = None
+                else:
+                    _verify_staging_file(staging)
+                    staging.output.verify()
                 return {
                     "ok": True,
-                    "path": dest_path,
+                    "path": result_path,
                     "size": total,
                     "content_type": ctype.split(";", 1)[0].strip(),
                     "source_url": url,
                 }
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                return {"ok": False, "path": dest_path,
+                return {"ok": False, "path": result_path,
                         "skipped_reason": (f"requires authentication (HTTP {e.code}); "
                                            "download this file manually from the dataset page")}
             last_reason = f"HTTP {e.code}: {e.reason}"
             if not (500 <= e.code < 600):
-                return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
+                return {"ok": False, "path": result_path, "skipped_reason": last_reason}
         except Exception as e:
             last_reason = f"download error: {e}"
         finally:
@@ -200,7 +350,7 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                     pass
         if attempt < retries - 1:
             time.sleep(backoff * (2 ** attempt))
-    return {"ok": False, "path": dest_path, "skipped_reason": last_reason}
+    return {"ok": False, "path": result_path, "skipped_reason": last_reason}
 
 
 def _write_collision_safe(
@@ -311,19 +461,15 @@ def _write_collision_safe(
                 pass
 
 
-def _archive_staging_path(
-    out_dir: str | _PinnedOutputDirectory,
+def _archive_staging_file(
+    out_dir: _PinnedOutputDirectory,
     suffix: str,
-) -> str:
-    resolved_out = _output_path(out_dir)
-    os.makedirs(resolved_out, exist_ok=True)
-    fd, path = tempfile.mkstemp(
+) -> _DownloadStagingFile:
+    return _download_staging_file(
+        out_dir,
         prefix=".paperconan-archive-",
         suffix=suffix,
-        dir=resolved_out,
     )
-    os.close(fd)
-    return path
 
 
 def _extract_selected_zip(
@@ -334,7 +480,7 @@ def _extract_selected_zip(
     max_member_bytes=_DEFAULT_MAX,
 ):
     extracted = []
-    written = _dir_size(_output_path(out_dir))
+    written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
         allowed.update({"image", "document"})
@@ -370,7 +516,7 @@ def _extract_selected_tar(
     max_member_bytes=_DEFAULT_MAX,
 ):
     extracted = []
-    written = _dir_size(_output_path(out_dir))
+    written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
         allowed.update({"image", "document"})
@@ -423,14 +569,15 @@ def _download_oa_package(
     include_images=False,
 ):
     """Download the static PMC OA tar.gz, extract selected members, drop the tarball."""
-    tmp = _archive_staging_path(out_dir, ".tar.gz")
+    tmp = None
     try:
+        tmp = _archive_staging_file(out_dir, ".tar.gz")
         res = download_file(pkg["url"], tmp, max_bytes=_ARCHIVE_MAX)
         if not res.get("ok"):
             skipped.append({"name": pkg.get("name"), "reason": res.get("skipped_reason")})
             return []
         try:
-            with _open_stable_regular(tmp) as archive_fh:
+            with _open_download_staging(tmp) as archive_fh:
                 extracted = _extract_selected_tar(
                     archive_fh,
                     out_dir,
@@ -445,14 +592,11 @@ def _download_oa_package(
             return []
         downloaded.extend(extracted)
         return extracted
-    except (tarfile.TarError, OSError) as e:
+    except (tarfile.TarError, OSError, ValueError) as e:
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
         return []
     finally:
-        try:
-            os.remove(tmp)
-        except (OSError, ValueError):
-            pass
+        _cleanup_download_staging(tmp)
 
 
 def _download_supplementary_archive(
@@ -469,14 +613,15 @@ def _download_supplementary_archive(
 
     The archive downloads with the larger ``archive_max`` cap; each extracted member is
     still capped at the per-file ``max_bytes``."""
-    tmp_zip = _archive_staging_path(out_dir, ".zip")
+    tmp_zip = None
     try:
+        tmp_zip = _archive_staging_file(out_dir, ".zip")
         res = download_file(arch["url"], tmp_zip, max_bytes=archive_max)
         if not res.get("ok"):
             skipped.append({"name": arch.get("name"), "reason": res.get("skipped_reason")})
             return []
         try:
-            with _open_stable_regular(tmp_zip) as archive_fh:
+            with _open_download_staging(tmp_zip) as archive_fh:
                 extracted = _extract_selected_zip(
                     archive_fh.read(),
                     out_dir,
@@ -491,14 +636,16 @@ def _download_supplementary_archive(
             return []
         downloaded.extend(extracted)
         return extracted
-    except zipfile.BadZipFile:
-        skipped.append({"name": arch.get("name"), "reason": "not a valid zip archive"})
+    except (zipfile.BadZipFile, ValueError) as exc:
+        reason = (
+            "not a valid zip archive"
+            if isinstance(exc, zipfile.BadZipFile)
+            else f"archive processing unavailable: {exc}"
+        )
+        skipped.append({"name": arch.get("name"), "reason": reason})
         return []
     finally:
-        try:
-            os.remove(tmp_zip)
-        except OSError:
-            pass
+        _cleanup_download_staging(tmp_zip)
 
 
 def _safe_source_url(url: object) -> str | None:
@@ -615,26 +762,36 @@ def download_candidate(
         provenance_files = []
         direct_asset_types = set()
         for f in files:
-            if _dir_size(output.path) > _MAX_PAPER_BYTES:
+            if _dir_size(output) > _MAX_PAPER_BYTES:
                 skipped.append({
                     "name": f["name"],
                     "reason": "paper data exceeds per-paper cap",
                 })
                 continue
             suffix = os.path.splitext(os.path.basename(f["name"]))[1]
-            fd, temp_path = tempfile.mkstemp(
-                prefix=".paperconan-download-",
-                suffix=suffix,
-                dir=output.path,
-            )
-            os.close(fd)
             try:
-                res = download_file(f["download_url"], temp_path, max_bytes=max_bytes)
+                staging = _download_staging_file(
+                    output,
+                    prefix=".paperconan-download-",
+                    suffix=suffix,
+                )
+            except (OSError, ValueError) as exc:
+                skipped.append({
+                    "name": f["name"],
+                    "reason": f"secure download staging failed: {exc}",
+                })
+                continue
+            try:
+                res = download_file(
+                    f["download_url"],
+                    staging,
+                    max_bytes=max_bytes,
+                )
                 if res.get("ok"):
                     try:
-                        with _open_stable_regular(temp_path) as fh:
+                        with _open_download_staging(staging) as fh:
                             data = fh.read()
-                    except _UnstableRegularFileError as e:
+                    except (_UnstableRegularFileError, ValueError) as e:
                         skipped.append({
                             "name": f["name"],
                             "reason": (
@@ -665,10 +822,7 @@ def download_candidate(
                         "reason": res.get("skipped_reason"),
                     })
             finally:
-                try:
-                    os.remove(temp_path)
-                except FileNotFoundError:
-                    pass
+                _cleanup_download_staging(staging)
         pkg = cand.get("oa_package")
         if pkg and pkg.get("url"):
             extracted = _download_oa_package(

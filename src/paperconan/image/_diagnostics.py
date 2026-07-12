@@ -235,7 +235,7 @@ def _decode_registered_image(
     *,
     max_bytes: int,
     max_pixels: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, str]:
     payload = _registered_image_bytes(
         asset,
         artifact_dir,
@@ -257,7 +257,7 @@ def _decode_registered_image(
     )
     if image is None:
         raise ValueError("unable to decode registered image")
-    return image
+    return image, hashlib.sha256(payload).hexdigest()
 
 
 def diagnose_image_assets(
@@ -293,7 +293,7 @@ def diagnose_image_assets(
             continue
         native = root.joinpath(*relative_parts)
         try:
-            image = _decode_registered_image(
+            image, source_sha256 = _decode_registered_image(
                 asset,
                 artifact_dir,
                 cv2,
@@ -364,6 +364,7 @@ def diagnose_image_assets(
                     "_box_a": box_a,
                     "_box_b": box_b,
                     "_file": asset.get("file"),
+                    "_source_sha256": source_sha256,
                 })
             if pairs_omitted or scan_comparisons_omitted:
                 break
@@ -411,6 +412,7 @@ def diagnose_image_assets(
                 artifact_dir,
                 evidence_id,
                 artifact_budget=budget,
+                expected_sha256=candidate["_source_sha256"],
             )
         except Exception as exc:
             errors.append({

@@ -209,6 +209,88 @@ def test_prepare_image_assets_renders_pdf_pages(tmp_path):
     assert pages[0]["render_dpi"] == 200
 
 
+def test_pdf_render_uses_stable_open_source_when_path_is_replaced(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    pdf = source / "supp.pdf"
+    original_payload = b"original-pdf-payload"
+    replacement_payload = b"replacement-pdf-payload"
+    pdf.write_bytes(original_payload)
+    displaced = tmp_path / "displaced.pdf"
+    events = {"consumed": None, "rendered": 0, "document_closed": 0}
+
+    class StableImage:
+        def __init__(self):
+            self.image = PIL.new("RGB", (12, 8), (20, 30, 40))
+
+        def save(self, destination, format=None):
+            self.image.save(destination, format=format)
+
+        def close(self):
+            self.image.close()
+
+    class StableBitmap:
+        def to_pil(self):
+            return StableImage()
+
+        def close(self):
+            pass
+
+    class StablePage:
+        def get_size(self):
+            return 72, 72
+
+        def render(self, scale):
+            events["rendered"] += 1
+            return StableBitmap()
+
+        def close(self):
+            pass
+
+    class StableDocument:
+        def __init__(self, pdf_input):
+            pdf.rename(displaced)
+            pdf.write_bytes(replacement_payload)
+            if hasattr(pdf_input, "read"):
+                pdf_input.seek(0)
+                events["consumed"] = pdf_input.read()
+            else:
+                events["consumed"] = Path(pdf_input).read_bytes()
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return StablePage()
+
+        def close(self):
+            events["document_closed"] += 1
+
+    monkeypatch.setitem(
+        sys.modules,
+        "pypdfium2",
+        types.SimpleNamespace(PdfDocument=StableDocument),
+    )
+
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(tmp_path / "audit"),
+    )
+
+    assert errors == []
+    assert len(assets) == 1
+    assert events == {
+        "consumed": original_payload,
+        "rendered": 1,
+        "document_closed": 1,
+    }
+    assert pdf.read_bytes() == replacement_payload
+
+
 def test_pdf_asset_limit_stops_later_pages_and_closes_resources(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
@@ -361,7 +443,7 @@ def test_pdf_render_staging_respects_total_image_artifact_budget(
     assert len(errors) == 1
     assert errors[0]["file"] == "supp.pdf"
     assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in errors[0]["error"]
-    assert events["rendered"] == [1]
+    assert events["rendered"] == []
     assert not list(output.glob(".paperconan-rendered-*"))
     assert not list((output / "images").rglob("*.*"))
 
@@ -415,6 +497,7 @@ def test_failed_pdf_pages_consume_scan_wide_attempt_budget(
         "pages_closed": [],
         "documents_closed": [],
     }
+    pdf_names = iter(("a.pdf", "b.pdf"))
 
     class FailingPage:
         def __init__(self, pdf_name):
@@ -431,8 +514,9 @@ def test_failed_pdf_pages_consume_scan_wide_attempt_budget(
             events["pages_closed"].append(self.pdf_name)
 
     class FailingDocument:
-        def __init__(self, path):
-            self.pdf_name = Path(path).name
+        def __init__(self, pdf_input):
+            assert hasattr(pdf_input, "read")
+            self.pdf_name = next(pdf_names)
             events["documents_opened"].append(self.pdf_name)
 
         def __len__(self):
@@ -489,6 +573,7 @@ def test_partial_page_cleanup_failure_still_consumes_attempt_budget(
         "pages_closed": [],
         "documents_closed": [],
     }
+    pdf_names = iter(("a.pdf",))
 
     class FailingImage:
         def __init__(self, pdf_name):
@@ -527,8 +612,9 @@ def test_partial_page_cleanup_failure_still_consumes_attempt_budget(
             events["pages_closed"].append(self.pdf_name)
 
     class FailingDocument:
-        def __init__(self, path):
-            self.pdf_name = Path(path).name
+        def __init__(self, pdf_input):
+            assert hasattr(pdf_input, "read")
+            self.pdf_name = next(pdf_names)
             events["documents_opened"].append(self.pdf_name)
 
         def __len__(self):

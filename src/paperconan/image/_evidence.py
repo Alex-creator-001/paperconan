@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import contextmanager
+import hashlib
 import math
 import mimetypes
 import os
@@ -124,12 +125,32 @@ def _verify_directory_entry(
         )
 
 
+def _verify_artifact_root(root: Path, root_fd: int) -> None:
+    try:
+        current = os.stat(root, follow_symlinks=False)
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise ValueError(
+            "image artifact root changed during evidence publication"
+        ) from exc
+    opened = os.fstat(root_fd)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or opened.st_dev != current.st_dev
+        or opened.st_ino != current.st_ino
+    ):
+        raise ValueError(
+            "image artifact root changed during evidence publication"
+        )
+
+
 def _verify_evidence_directories(
     root: Path,
     root_fd: int,
     images_fd: int,
     evidence_fd: int,
 ) -> None:
+    _verify_artifact_root(root, root_fd)
     images = root / "images"
     evidence = images / "evidence"
     _verify_directory_entry(root_fd, "images", images_fd, images)
@@ -137,14 +158,14 @@ def _verify_evidence_directories(
 
 
 @contextmanager
-def _evidence_output_directory(root: Path):
+def _pinned_artifact_root(root: Path):
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     if nofollow is None or directory is None:
         raise ValueError(
             "secure image evidence destination handling is unavailable"
         )
-    root_fd = images_fd = evidence_fd = None
+    root_fd = None
     try:
         try:
             root_fd = os.open(
@@ -155,6 +176,22 @@ def _evidence_output_directory(root: Path):
             raise ValueError(
                 "image evidence destination escapes artifact root"
             ) from exc
+        _verify_artifact_root(root, root_fd)
+        yield root_fd
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+@contextmanager
+def _evidence_output_directory(root: Path, *, root_fd: int | None = None):
+    images_fd = evidence_fd = None
+    root_context = None
+    if root_fd is None:
+        root_context = _pinned_artifact_root(root)
+        root_fd = root_context.__enter__()
+    try:
+        _verify_artifact_root(root, root_fd)
         images_fd = _open_output_child_directory(
             root_fd,
             "images",
@@ -173,9 +210,11 @@ def _evidence_output_directory(root: Path):
         )
         yield root_fd, images_fd, evidence_fd
     finally:
-        for fd in (evidence_fd, images_fd, root_fd):
+        for fd in (evidence_fd, images_fd):
             if fd is not None:
                 os.close(fd)
+        if root_context is not None:
+            root_context.__exit__(None, None, None)
 
 
 def _stage_file(evidence_fd: int) -> tuple[str, int]:
@@ -362,8 +401,9 @@ def _verify_open_artifact_chain(
 
 
 @contextmanager
-def _open_artifact_regular(
+def _open_artifact_regular_from_root_fd(
     root: Path,
+    root_fd: int,
     relative_path: Path,
     *,
     verify_stable: bool = False,
@@ -388,11 +428,8 @@ def _open_artifact_regular(
     fh = None
     try:
         try:
-            parent_fd = os.open(
-                root,
-                os.O_RDONLY | directory | nofollow,
-            )
-            directory_fds.append(parent_fd)
+            _verify_artifact_root(root, root_fd)
+            parent_fd = root_fd
             for part in parts[:-1]:
                 child_fd = os.open(
                     part,
@@ -421,7 +458,7 @@ def _open_artifact_regular(
             if verify_stable:
                 _verify_open_artifact_chain(
                     root,
-                    directory_fds[0],
+                    root_fd,
                     opened_directories,
                     parent_fd,
                     parts[-1],
@@ -432,6 +469,23 @@ def _open_artifact_regular(
             os.close(file_fd)
         for directory_fd in reversed(directory_fds):
             os.close(directory_fd)
+
+
+@contextmanager
+def _open_artifact_regular(
+    root: Path,
+    relative_path: Path,
+    *,
+    verify_stable: bool = False,
+):
+    with _pinned_artifact_root(root) as root_fd:
+        with _open_artifact_regular_from_root_fd(
+            root,
+            root_fd,
+            relative_path,
+            verify_stable=verify_stable,
+        ) as fh:
+            yield fh
 
 
 @contextmanager
@@ -447,7 +501,7 @@ def _open_registered_artifact_regular(
             "registered evidence path is not a stable regular file "
             "under artifact root"
         )
-    root = Path(artifact_dir)
+    root = Path(os.path.abspath(artifact_dir))
     with _open_artifact_regular(
         root,
         Path(*parts),
@@ -534,17 +588,16 @@ def registered_preview_data_uri(
     artifact_dir: str | None,
     budget: EvidenceBudget,
 ) -> str | None:
-    location = _registered_artifact_location(
-        artifact_dir,
-        asset.get("preview_path"),
-    )
-    if location is None:
-        return None
-    root, path, relative = location
-    if not path.is_file():
+    preview_path = asset.get("preview_path")
+    parts = _registered_relative_parts(preview_path)
+    if not artifact_dir or parts is None:
         return None
     try:
-        with _open_artifact_regular(root, relative) as fh:
+        with _open_registered_artifact_regular(
+            artifact_dir,
+            preview_path,
+            verify_stable=True,
+        ) as fh:
             size = os.fstat(fh.fileno()).st_size
             if size > _max_image_bytes():
                 return None
@@ -571,14 +624,16 @@ def registered_preview_data_uri(
             if len(payload) != size:
                 return None
             encoded = base64.b64encode(payload).decode("ascii")
-            if len(encoded) != encoded_size or not budget.consume(len(encoded)):
+            if len(encoded) != encoded_size:
                 return None
     except (OSError, ValueError):
+        return None
+    if not budget.consume(len(encoded)):
         return None
     metadata_mime = asset.get("preview_mime")
     mime = str(metadata_mime).strip().lower() if isinstance(metadata_mime, str) else ""
     if mime not in _SUPPORTED_PREVIEW_MIMES:
-        guessed = mimetypes.guess_type(path.name)[0] or ""
+        guessed = mimetypes.guess_type(parts[-1])[0] or ""
         mime = guessed if guessed in _SUPPORTED_PREVIEW_MIMES else "image/jpeg"
     return f"data:{mime};base64,{encoded}"
 
@@ -590,6 +645,7 @@ def write_native_pair_evidence(
     output_root: str,
     evidence_id: str,
     artifact_budget: ImageArtifactBudget | None = None,
+    expected_sha256: str | None = None,
 ) -> dict[str, str]:
     from PIL import Image
 
@@ -600,10 +656,9 @@ def write_native_pair_evidence(
         or "\\" in evidence_id
     ):
         raise ValueError("evidence_id must be a single path-safe name")
-    root = Path(output_root).resolve()
+    root = Path(os.path.abspath(output_root))
     budget = artifact_budget or ImageArtifactBudget.from_environment()
-    budget.initialize_from_root(root)
-    source = Path(image_path).resolve()
+    source = Path(os.path.abspath(image_path))
     try:
         source_relative = source.relative_to(root)
     except ValueError as exc:
@@ -611,29 +666,36 @@ def write_native_pair_evidence(
     if not source_relative.parts:
         raise ValueError("image evidence source escapes artifact root")
     out_dir = root / "images" / "evidence"
-    try:
-        out_dir.resolve().relative_to(root)
-    except ValueError as exc:
-        raise ValueError(
-            "image evidence destination escapes artifact root"
-        ) from exc
-    with _open_artifact_regular(root, source_relative) as source_fh:
-        with Image.open(source_fh) as image:
-            max_pixels = _max_image_pixels()
-            validated_a = _validated_crop_box(
-                box_a,
-                width=image.width,
-                height=image.height,
-                max_pixels=max_pixels,
-            )
-            validated_b = _validated_crop_box(
-                box_b,
-                width=image.width,
-                height=image.height,
-                max_pixels=max_pixels,
-            )
-            crop_a = image.crop(validated_a)
-            crop_b = image.crop(validated_b)
+    with _pinned_artifact_root(root) as pinned_root_fd:
+        with _open_artifact_regular_from_root_fd(
+            root,
+            pinned_root_fd,
+            source_relative,
+            verify_stable=expected_sha256 is not None,
+        ) as source_fh:
+            if expected_sha256 is not None:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: source_fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                if digest.hexdigest() != expected_sha256:
+                    raise ValueError("registered image changed after scoring")
+                source_fh.seek(0)
+            with Image.open(source_fh) as image:
+                max_pixels = _max_image_pixels()
+                validated_a = _validated_crop_box(
+                    box_a,
+                    width=image.width,
+                    height=image.height,
+                    max_pixels=max_pixels,
+                )
+                validated_b = _validated_crop_box(
+                    box_b,
+                    width=image.width,
+                    height=image.height,
+                    max_pixels=max_pixels,
+                )
+                crop_a = image.crop(validated_a)
+                crop_b = image.crop(validated_b)
         suffix_a, format_a, save_a = _crop_encoding(crop_a)
         suffix_b, format_b, save_b = _crop_encoding(crop_b)
         crop_a_path = out_dir / f"{evidence_id}-a{suffix_a}"
@@ -652,8 +714,12 @@ def write_native_pair_evidence(
         canvas.paste(preview_a.convert("RGB"), (0, 0))
         canvas.paste(preview_b.convert("RGB"), (preview_a.width + 20, 0))
         preview_path = out_dir / f"{evidence_id}-preview.jpg"
-        with _evidence_output_directory(root) as directory_fds:
+        with _evidence_output_directory(
+            root,
+            root_fd=pinned_root_fd,
+        ) as directory_fds:
             root_fd, images_fd, evidence_fd = directory_fds
+            budget.initialize_from_images_fd(images_fd)
             staged: list[tuple[str, int, str]] = []
             try:
                 temp_name, temp_fd = _stage_image(

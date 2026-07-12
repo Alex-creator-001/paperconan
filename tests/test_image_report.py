@@ -12,7 +12,7 @@ from paperconan._adjudicated_html import (
     _normalized_verdict_copy,
     render_adjudicated_report,
 )
-from paperconan._html import _all_findings, _render_finding_card
+from paperconan._html import _all_findings, _render_finding_card, write_html_report
 from paperconan.image import _evidence
 from paperconan.image._evidence import (
     EvidenceBudget,
@@ -111,6 +111,51 @@ def test_image_finding_card_renders_registered_regions(tmp_path):
     assert "[0, 0, 1, 1]" in html
     assert "score=0.97" in html
     assert "transform=flip" in html
+
+
+def test_standard_report_rejects_in_root_registered_native_symlink(tmp_path):
+    native_dir = tmp_path / "images" / "native"
+    native_dir.mkdir(parents=True)
+    target = native_dir / "target.png"
+    Image.new("RGB", (8, 8), (30, 90, 150)).save(target)
+    registered = native_dir / "registered.png"
+    registered.symlink_to(target.name)
+    scan = {
+        "input_dir": str(tmp_path / "input"),
+        "relations_blocks": [],
+        "cross_sheet_findings": [],
+        "image_assets": [
+            {
+                "asset_id": "img:registered",
+                "file": "registered.png",
+                "path": registered.relative_to(tmp_path).as_posix(),
+            },
+            {
+                "asset_id": "img:target",
+                "file": "target.png",
+                "path": target.relative_to(tmp_path).as_posix(),
+            },
+        ],
+        "image_findings": [{
+            "finding_id": "image:pair:symlink",
+            "kind": "image_pair_similarity_signal",
+            "severity": "medium",
+            "rule": "registered regions require contextual review",
+            "asset_ids": ["img:registered", "img:target"],
+            "regions": [
+                {"asset_id": "img:registered", "box": [0, 0, 8, 8]},
+                {"asset_id": "img:target", "box": [0, 0, 8, 8]},
+            ],
+            "score": 0.99,
+            "transform": "identity",
+            "profile_action": "kept",
+        }],
+    }
+    out = tmp_path / "report.html"
+
+    write_html_report(scan, str(out))
+
+    assert "data:image/jpeg;base64," not in out.read_text(encoding="utf-8")
 
 
 def test_mixed_numeric_and_agent_only_image_findings_share_one_report(tmp_path):
@@ -427,6 +472,45 @@ def test_report_shares_preview_budget_across_image_findings(tmp_path, monkeypatc
     assert "Second image reference" in html
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-number", "inf", "-1", "1e10000"],
+    ids=["malformed", "non-finite", "negative", "overflow"],
+)
+def test_standard_report_invalid_image_evidence_limit_suppresses_only_images(
+    tmp_path,
+    monkeypatch,
+    value,
+):
+    scan = _scan(tmp_path)
+    out = tmp_path / "report.html"
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_EVIDENCE_MB", value)
+
+    write_html_report(scan, str(out))
+
+    html = out.read_text(encoding="utf-8")
+    assert "constant_offset" in html
+    assert "data:image/" not in html
+
+
+def test_standard_numeric_only_report_ignores_invalid_image_evidence_limit(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    scan["image_assets"] = []
+    scan["image_findings"] = []
+    out = tmp_path / "report.html"
+    monkeypatch.setenv(
+        "PAPERCONAN_MAX_IMAGE_EVIDENCE_MB",
+        "not-a-number",
+    )
+
+    write_html_report(scan, str(out))
+
+    assert "constant_offset" in out.read_text(encoding="utf-8")
+
+
 def test_oversized_registered_preview_is_rejected_before_pillow_validation(
     tmp_path,
     monkeypatch,
@@ -615,7 +699,7 @@ def test_registered_preview_rejects_malformed_data_without_budget(tmp_path):
     assert budget.used_bytes == 0
 
 
-def test_registered_preview_reads_payload_from_stable_validated_descriptor(
+def test_registered_preview_rejects_path_swap_after_secure_open(
     tmp_path,
     monkeypatch,
 ):
@@ -648,11 +732,8 @@ def test_registered_preview_reads_payload_from_stable_validated_descriptor(
     )
 
     assert opened_from_file_object
-    assert uri is not None
-    payload = base64.b64decode(uri.split(",", 1)[1])
-    with original_open(io.BytesIO(payload)) as embedded:
-        assert embedded.getpixel((0, 0)) == (255, 0, 0)
-    assert budget.used_bytes == len(base64.b64encode(payload))
+    assert uri is None
+    assert budget.used_bytes == 0
 
 
 def test_registered_preview_short_read_does_not_consume_budget(

@@ -10,13 +10,13 @@ import html
 import os
 from typing import Any, Iterable
 
+from .image._budget import report_image_evidence_bytes
 from .image._evidence import (
     EvidenceBudget,
     _base64_encoded_size,
     _max_image_bytes,
     _max_image_pixels,
-    _open_artifact_regular,
-    _registered_artifact_location,
+    _open_registered_artifact_regular,
     _validated_crop_box,
     registered_preview_data_uri,
 )
@@ -209,14 +209,11 @@ def _registered_pair_preview_data_uri(
         if asset is None:
             return None
         try:
-            location = _registered_artifact_location(
+            with _open_registered_artifact_regular(
                 artifact_dir,
                 asset.get("path"),
-            )
-            if location is None:
-                return None
-            root, _, relative = location
-            with _open_artifact_regular(root, relative) as fh:
+                verify_stable=True,
+            ) as fh:
                 if os.fstat(fh.fileno()).st_size > _max_image_bytes():
                     return None
                 with Image.open(fh) as image:
@@ -649,12 +646,7 @@ def write_html_report(scan: dict, out_path: str) -> None:
     input_dir = scan.get("input_dir", "")
     input_label = os.path.basename(os.path.normpath(input_dir)) or input_dir or "audit"
     artifact_dir = os.path.dirname(os.path.abspath(out_path))
-    image_budget = EvidenceBudget(
-        int(
-            float(os.environ.get("PAPERCONAN_MAX_IMAGE_EVIDENCE_MB", "20"))
-            * 1024 * 1024
-        )
-    )
+    image_budget = EvidenceBudget(report_image_evidence_bytes())
     findings = _all_findings(scan)
     n_sheets = len({(it["file"], it["sheet"]) for it in findings if it["scope"] == "block"})
     sev = _severity_counts(findings)

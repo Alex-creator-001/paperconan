@@ -206,7 +206,7 @@ def test_raw_pair_preview_reuses_crop_area_validation_before_crop(
     assert budget.used_bytes == 0
 
 
-def test_raw_pair_preview_uses_stable_open_file_object(
+def test_raw_pair_preview_rejects_path_swap_after_secure_open(
     tmp_path,
     monkeypatch,
 ):
@@ -236,12 +236,8 @@ def test_raw_pair_preview_uses_stable_open_file_object(
     )
 
     assert opened_from_file_object
-    assert uri is not None
-    payload = base64.b64decode(uri.split(",", 1)[1])
-    with original_open(io.BytesIO(payload)) as montage:
-        red, _, blue = montage.getpixel((2, 2))
-    assert red > blue
-    assert budget.used_bytes == len(base64.b64encode(payload))
+    assert uri is None
+    assert budget.used_bytes == 0
 
 
 def test_raw_pair_preview_charges_encoded_payload_length(tmp_path):
@@ -825,6 +821,45 @@ def test_candidate_evidence_write_error_is_non_gating(tmp_path, monkeypatch):
     }]
 
 
+def test_diagnostics_reject_evidence_when_scored_asset_is_replaced(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(replacement)
+    replaced = False
+
+    def score_then_replace(left, right):
+        nonlocal replaced
+        if not replaced:
+            replacement.replace(native)
+            replaced = True
+        return 0.99, "identity"
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "transform_robust_similarity",
+        score_then_replace,
+    )
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert replaced
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+    assert not (out / "images" / "evidence").exists()
+
+
 def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
     tmp_path,
     monkeypatch,
@@ -1109,6 +1144,51 @@ def test_native_evidence_uses_stable_file_object_when_source_path_is_swapped(
     assert opened_from_file_object
     with original_open(out / evidence["crop_a_path"]) as crop:
         assert crop.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_native_evidence_pins_one_root_for_source_and_all_publication(
+    tmp_path,
+    monkeypatch,
+):
+    out = tmp_path / "audit"
+    native = out / "images" / "native" / "source.png"
+    native.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(native)
+    displaced = tmp_path / "displaced-audit"
+    original_open = Image.open
+    swapped = False
+
+    def swap_root_during_source_open(fp, *args, **kwargs):
+        nonlocal swapped
+        if hasattr(fp, "read") and not swapped:
+            out.rename(displaced)
+            out.mkdir()
+            swapped = True
+        return original_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", swap_root_during_source_open)
+    evidence_id = "image-pair-pinned-root"
+
+    with pytest.raises(ValueError, match="artifact root.*changed"):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 4, 4),
+            (4, 4, 8, 8),
+            str(out),
+            evidence_id,
+        )
+
+    assert swapped
+    expected_names = {
+        f"{evidence_id}-a.png",
+        f"{evidence_id}-b.png",
+        f"{evidence_id}-preview.jpg",
+    }
+    for root in (out, displaced):
+        evidence_dir = root / "images" / "evidence"
+        assert not evidence_dir.exists() or not (
+            expected_names & {path.name for path in evidence_dir.iterdir()}
+        )
 
 
 def test_native_evidence_rejects_native_parent_swap(tmp_path, monkeypatch):

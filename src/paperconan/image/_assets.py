@@ -10,6 +10,7 @@ import re
 import secrets
 import shutil
 import stat
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -404,6 +405,38 @@ def _sha256_fd(fd: int) -> str:
     return digest.hexdigest()
 
 
+@contextmanager
+def _open_stable_source_regular(path: Path):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ValueError("secure PDF source opening is unavailable")
+    fd = -1
+    try:
+        try:
+            fd = os.open(path, os.O_RDONLY | nofollow)
+            opened = os.fstat(fd)
+            current = os.stat(path, follow_symlinks=False)
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise ValueError(
+                f"{path.name}: PDF source is not a stable no-follow regular file"
+            ) from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_dev != current.st_dev
+            or opened.st_ino != current.st_ino
+        ):
+            raise ValueError(
+                f"{path.name}: PDF source is not a stable no-follow regular file"
+            )
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            yield fh
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _entry_exists(directory_fd: int, name: str) -> bool:
     try:
         os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -749,14 +782,29 @@ def _exception_text(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
-def _render_pdf_pages(pdf_path: Path, temp_dir_fd: int):
+def _pdf_page_render_bound(pixel_width: int, pixel_height: int) -> int:
+    raw_bytes = pixel_width * pixel_height * 4
+    overhead = pixel_height + max(64 * 1024, raw_bytes // 100)
+    bound = raw_bytes + overhead
+    if bound < 0 or bound > sys.maxsize:
+        raise ValueError("PDF page render bound exceeds platform capacity")
+    return bound
+
+
+def _render_pdf_pages(
+    pdf_path: Path,
+    pdf_fh,
+    temp_dir_fd: int,
+    artifact_budget: ImageArtifactBudget,
+):
     try:
         import pypdfium2 as pdfium
     except ImportError as exc:
         raise ImageDependencyError(
             'PDF image rendering requires `pip install "paperconan[image]"`'
         ) from exc
-    doc = pdfium.PdfDocument(str(pdf_path))
+    pdf_fh.seek(0)
+    doc = pdfium.PdfDocument(pdf_fh)
     scale = _PDF_DPI / 72.0
     try:
         page_count = len(doc)
@@ -767,6 +815,7 @@ def _render_pdf_pages(pdf_path: Path, temp_dir_fd: int):
             dest_name = None
             dest_fd = None
             page_error = None
+            reserved_size = 0
             try:
                 page = doc[index]
                 width, height = page.get_size()
@@ -777,6 +826,11 @@ def _render_pdf_pages(pdf_path: Path, temp_dir_fd: int):
                         f"{pdf_path.name} page {index + 1}: exceeds "
                         f"PAPERCONAN_MAX_IMAGE_PIXELS={_MAX_IMAGE_PIXELS}"
                     )
+                reserved_size = _pdf_page_render_bound(
+                    pixel_width,
+                    pixel_height,
+                )
+                artifact_budget.reserve_temporary(reserved_size)
                 bitmap = page.render(scale=scale)
                 image = bitmap.to_pil()
                 dest_name = f"{pdf_path.stem}.p{index + 1}.png"
@@ -789,6 +843,10 @@ def _render_pdf_pages(pdf_path: Path, temp_dir_fd: int):
                 with os.fdopen(os.dup(dest_fd), "wb") as destination:
                     image.save(destination, format="PNG")
                     destination.flush()
+                if os.fstat(dest_fd).st_size > reserved_size:
+                    raise ImageArtifactBudgetExceeded(
+                        "rendered PDF page exceeds reserved image artifact bound"
+                    )
             except Exception as exc:
                 page_error = _exception_text(exc)
             finally:
@@ -813,6 +871,7 @@ def _render_pdf_pages(pdf_path: Path, temp_dir_fd: int):
                             f"{cleanup_error}"
                         )
             if page_error is not None:
+                artifact_budget.release_temporary(reserved_size)
                 yield index + 1, page_count, None, None, page_error
                 continue
             try:
@@ -824,6 +883,7 @@ def _render_pdf_pages(pdf_path: Path, temp_dir_fd: int):
                     None,
                 )
             finally:
+                artifact_budget.release_temporary(reserved_size)
                 os.close(dest_fd)
                 _unlink_at(dest_name, temp_dir_fd)
     finally:
@@ -954,51 +1014,47 @@ def prepare_image_assets(
             with _pdf_staging_directory(directory_fds[0]) as temp_dir_fd:
                 for pdf in pdfs:
                     try:
-                        if pdf.stat().st_size > _MAX_IMAGE_BYTES:
-                            raise ValueError(
-                                f"{pdf.name}: exceeds "
-                                f"PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
-                            )
-                    except ImageDependencyError:
-                        raise
-                    except Exception as exc:
-                        errors.append({"file": pdf.name, "error": str(exc)})
-                        continue
-                    if pdf_page_attempts >= _MAX_IMAGE_ASSETS:
-                        errors.append({
-                            "file": pdf.name,
-                            "page": 1,
-                            "error": _asset_limit_error(),
-                        })
-                        continue
-                    if len(assets_by_digest) >= _MAX_IMAGE_ASSETS:
-                        errors.append({
-                            "file": pdf.name,
-                            "error": _asset_limit_error(),
-                        })
-                        continue
-                    pages = _render_pdf_pages(pdf, temp_dir_fd)
-                    try:
-                        for (
-                            page_number,
-                            page_count,
-                            page_path,
-                            page_fd,
-                            page_error,
-                        ) in pages:
-                            pdf_page_attempts += 1
-                            if page_error is not None:
+                        with _open_stable_source_regular(pdf) as pdf_fh:
+                            if os.fstat(pdf_fh.fileno()).st_size > _MAX_IMAGE_BYTES:
+                                raise ValueError(
+                                    f"{pdf.name}: exceeds "
+                                    f"PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
+                                )
+                            if pdf_page_attempts >= _MAX_IMAGE_ASSETS:
                                 errors.append({
                                     "file": pdf.name,
-                                    "page": page_number,
-                                    "error": page_error,
+                                    "page": 1,
+                                    "error": _asset_limit_error(),
                                 })
-                            else:
-                                staged_size = 0
-                                try:
-                                    staged_size = os.fstat(page_fd).st_size
-                                    budget.reserve_temporary(staged_size)
-                                    try:
+                                continue
+                            if len(assets_by_digest) >= _MAX_IMAGE_ASSETS:
+                                errors.append({
+                                    "file": pdf.name,
+                                    "error": _asset_limit_error(),
+                                })
+                                continue
+                            pages = _render_pdf_pages(
+                                pdf,
+                                pdf_fh,
+                                temp_dir_fd,
+                                budget,
+                            )
+                            try:
+                                for (
+                                    page_number,
+                                    page_count,
+                                    page_path,
+                                    page_fd,
+                                    page_error,
+                                ) in pages:
+                                    pdf_page_attempts += 1
+                                    if page_error is not None:
+                                        errors.append({
+                                            "file": pdf.name,
+                                            "page": page_number,
+                                            "error": page_error,
+                                        })
+                                    else:
                                         add(
                                             page_path,
                                             source_fd=page_fd,
@@ -1010,33 +1066,36 @@ def prepare_image_assets(
                                             page=page_number,
                                             render_dpi=_PDF_DPI,
                                         )
-                                    finally:
-                                        budget.release_temporary(staged_size)
-                                except ImageArtifactBudgetExceeded as exc:
-                                    errors.append({
-                                        "file": pdf.name,
-                                        "page": page_number,
-                                        "error": str(exc),
-                                    })
-                            if (
-                                (
-                                    pdf_page_attempts >= _MAX_IMAGE_ASSETS
-                                    or len(assets_by_digest) >= _MAX_IMAGE_ASSETS
-                                )
-                                and page_number < page_count
-                            ):
+                                    if (
+                                        (
+                                            pdf_page_attempts >= _MAX_IMAGE_ASSETS
+                                            or len(assets_by_digest)
+                                            >= _MAX_IMAGE_ASSETS
+                                        )
+                                        and page_number < page_count
+                                    ):
+                                        errors.append({
+                                            "file": pdf.name,
+                                            "page": page_number + 1,
+                                            "error": _asset_limit_error(),
+                                        })
+                                        break
+                            except ImageDependencyError:
+                                raise
+                            except Exception as exc:
                                 errors.append({
                                     "file": pdf.name,
-                                    "page": page_number + 1,
-                                    "error": _asset_limit_error(),
+                                    "error": str(exc),
                                 })
-                                break
+                            finally:
+                                pages.close()
                     except ImageDependencyError:
                         raise
                     except Exception as exc:
-                        errors.append({"file": pdf.name, "error": str(exc)})
-                    finally:
-                        pages.close()
+                        errors.append({
+                            "file": pdf.name,
+                            "error": str(exc),
+                        })
         try:
             _verify_asset_directories(
                 output_root,

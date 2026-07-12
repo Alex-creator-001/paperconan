@@ -9,6 +9,8 @@ import sys
 
 _BUDGET_NAME = "PAPERCONAN_MAX_IMAGE_TOTAL_MB"
 _DEFAULT_MAX_IMAGE_TOTAL_MB = Decimal("1500")
+_EVIDENCE_BUDGET_NAME = "PAPERCONAN_MAX_IMAGE_EVIDENCE_MB"
+_DEFAULT_MAX_IMAGE_EVIDENCE_MB = Decimal("20")
 _MEBIBYTE = Decimal(1024 * 1024)
 
 
@@ -23,21 +25,38 @@ def _budget_exhausted_error() -> ImageArtifactBudgetExceeded:
     )
 
 
-def _max_image_total_bytes() -> int:
-    raw = os.environ.get(_BUDGET_NAME, str(_DEFAULT_MAX_IMAGE_TOTAL_MB))
+def _mebibyte_limit_bytes(name: str, default: Decimal) -> int:
+    raw = os.environ.get(name, str(default))
     try:
         value = Decimal(raw)
         byte_value = value * _MEBIBYTE
     except (DecimalException, TypeError, ValueError) as exc:
-        raise ValueError(f"invalid {_BUDGET_NAME} limit") from exc
+        raise ValueError(f"invalid {name} limit") from exc
     if (
         not value.is_finite()
         or value < 0
         or not byte_value.is_finite()
         or byte_value > sys.maxsize
     ):
-        raise ValueError(f"invalid {_BUDGET_NAME} limit")
+        raise ValueError(f"invalid {name} limit")
     return int(byte_value)
+
+
+def _max_image_total_bytes() -> int:
+    return _mebibyte_limit_bytes(
+        _BUDGET_NAME,
+        _DEFAULT_MAX_IMAGE_TOTAL_MB,
+    )
+
+
+def report_image_evidence_bytes() -> int:
+    try:
+        return _mebibyte_limit_bytes(
+            _EVIDENCE_BUDGET_NAME,
+            _DEFAULT_MAX_IMAGE_EVIDENCE_MB,
+        )
+    except ValueError:
+        return 0
 
 
 def regular_file_size(directory_fd: int, name: str) -> int:

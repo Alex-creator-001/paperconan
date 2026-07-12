@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+import os
 import tarfile
 import zipfile
 from pathlib import Path
@@ -509,6 +510,53 @@ def test_download_candidate_pins_output_root_across_publications(
     assert not (displaced / "Fig2.png").exists()
 
 
+def test_direct_download_staging_stays_on_pinned_root_during_replacement(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    displaced = tmp_path / "displaced-out"
+    payload = b"a,b\n1,2\n"
+    replacement_received_bytes = False
+
+    def swap_then_download(url, destination, **kwargs):
+        nonlocal replacement_received_bytes
+        out_dir.rename(displaced)
+        out_dir.mkdir()
+        if hasattr(destination, "fd"):
+            os.ftruncate(destination.fd, 0)
+            os.lseek(destination.fd, 0, os.SEEK_SET)
+            os.write(destination.fd, payload)
+        else:
+            path = Path(destination)
+            path.write_bytes(payload)
+            replacement_received_bytes = path.parent == out_dir
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", swap_then_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert summary["downloaded"] == []
+    assert summary["skipped"]
+    assert replacement_received_bytes is False
+    assert list(out_dir.iterdir()) == []
+    assert not list(displaced.glob(".paperconan-download-*"))
+
+
 def test_provenance_sidecar_does_not_follow_or_replace_final_symlink(
     monkeypatch,
     tmp_path,
@@ -706,6 +754,60 @@ def _archive_bytes(kind, member_name="tables/data.csv", data=b"a,b\n1,2\n"):
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_download_staging_stays_on_pinned_root_during_replacement(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    displaced = tmp_path / "displaced-out"
+    payload = _archive_bytes(archive_kind)
+    replacement_received_bytes = False
+
+    def swap_then_download(url, destination, **kwargs):
+        nonlocal replacement_received_bytes
+        out_dir.rename(displaced)
+        out_dir.mkdir()
+        if hasattr(destination, "fd"):
+            os.ftruncate(destination.fd, 0)
+            os.lseek(destination.fd, 0, os.SEEK_SET)
+            os.write(destination.fd, payload)
+        else:
+            path = Path(destination)
+            path.write_bytes(payload)
+            replacement_received_bytes = path.parent == out_dir
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", swap_then_download)
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": f"{archive_kind}.archive",
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert summary["downloaded"] == []
+    assert summary["skipped"]
+    assert replacement_received_bytes is False
+    assert list(out_dir.iterdir()) == []
+    assert not list(displaced.glob(".paperconan-archive-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
 @pytest.mark.parametrize("metadata_kind", ["symlink", "absolute", "parent"])
 def test_archive_download_staging_ignores_unsafe_metadata_paths(
     monkeypatch,
@@ -753,8 +855,9 @@ def test_archive_download_staging_ignores_unsafe_metadata_paths(
     assert sentinel.read_bytes() == b"outside"
     assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
     assert len(destinations) == 1
-    assert Path(destinations[0]).parent.resolve() == out_dir.resolve()
-    assert Path(destinations[0]).name != Path(metadata_name).name
+    assert hasattr(destinations[0], "fd")
+    assert destinations[0].output.path == str(out_dir.resolve())
+    assert destinations[0].name != Path(metadata_name).name
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
@@ -799,10 +902,16 @@ def test_direct_download_rejects_staging_path_swapped_to_symlink(
     outside.write_bytes(b"outside,bytes\n")
 
     def swapped_download(url, dest, **kwargs):
-        path = Path(dest)
-        path.write_bytes(b"downloaded,bytes\n")
-        path.unlink()
-        path.symlink_to(outside)
+        if hasattr(dest, "fd"):
+            os.ftruncate(dest.fd, 0)
+            os.write(dest.fd, b"downloaded,bytes\n")
+            os.unlink(dest.name, dir_fd=dest.output.fd)
+            os.symlink(outside, dest.name, dir_fd=dest.output.fd)
+        else:
+            path = Path(dest)
+            path.write_bytes(b"downloaded,bytes\n")
+            path.unlink()
+            path.symlink_to(outside)
         return {
             "ok": True,
             "path": dest,
@@ -843,11 +952,18 @@ def test_archive_download_rejects_staging_path_swapped_to_symlink(
     )
 
     def swapped_download(url, dest, **kwargs):
-        path = Path(dest)
-        path.write_bytes(_archive_bytes(archive_kind))
-        path.unlink()
-        path.symlink_to(outside_archive)
-        return {"ok": True, "path": dest, "size": path.stat().st_size}
+        payload = _archive_bytes(archive_kind)
+        if hasattr(dest, "fd"):
+            os.ftruncate(dest.fd, 0)
+            os.write(dest.fd, payload)
+            os.unlink(dest.name, dir_fd=dest.output.fd)
+            os.symlink(outside_archive, dest.name, dir_fd=dest.output.fd)
+        else:
+            path = Path(dest)
+            path.write_bytes(payload)
+            path.unlink()
+            path.symlink_to(outside_archive)
+        return {"ok": True, "path": dest, "size": len(payload)}
 
     monkeypatch.setattr(_download, "download_file", swapped_download)
     archive = {

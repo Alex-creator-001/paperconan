@@ -67,7 +67,8 @@ paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 图像 evidence 只会从 `scan.json image_assets[]` 登记且位于审计 artifact 根目录下的有界
 preview 读取并内嵌；`verdict.json` 不能提供任意本机路径。报告中的预览用于复核定位，
 Agent 的小区域判断仍应回到登记的原始像素资产。总内嵌预算由
-`PAPERCONAN_MAX_IMAGE_EVIDENCE_MB` 控制。
+`PAPERCONAN_MAX_IMAGE_EVIDENCE_MB` 控制；格式错误、非有限、负数或溢出值会按 `0`
+处理并关闭图像内嵌，数值 evidence 与报告生成不受影响。
 
 注意：`paperconan report` 是本地、公开、无私有依赖的渲染器；不读取 Postgres、Blob、云端队列或任何
 `recheck/` 私有缓存。真实论文 PDF、截图、主图等材料若要展示，应由使用者在自己的审计目录中合法保存并另行归档。

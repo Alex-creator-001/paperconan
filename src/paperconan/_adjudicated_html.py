@@ -19,6 +19,7 @@ import tempfile
 from typing import Any
 
 from ._html import _all_findings, _esc, _render_cross_sheet_examples, _render_evidence_table
+from .image._budget import report_image_evidence_bytes
 from .image._evidence import EvidenceBudget, registered_preview_data_uri
 
 
@@ -764,10 +765,7 @@ def _render_unified(scan: dict[str, Any], verdict: dict[str, Any], title: str,
     needs_author_data) renders as a compact kv block under the conclusion.
     """
     conclusion = _render_md(paper.get("paper_conclusion")) or "<p>—</p>"
-    max_image_bytes = int(
-        float(os.environ.get("PAPERCONAN_MAX_IMAGE_EVIDENCE_MB", "20")) * 1024 * 1024
-    )
-    image_budget = EvidenceBudget(max_image_bytes)
+    image_budget = EvidenceBudget(report_image_evidence_bytes())
     blocks = "".join(
         _render_finding_block(
             scan, scan_findings, f, i, artifact_dir, image_budget

@@ -118,6 +118,72 @@ def test_write_adjudicated_report_accepts_artifact_dir(tmp_path):
     assert "data:image/png;base64," in out.read_text(encoding="utf-8")
 
 
+def test_adjudicated_report_rejects_in_root_registered_preview_symlink(tmp_path):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    registered = audit / scan["image_assets"][0]["preview_path"]
+    target = registered.with_name("target.png")
+    registered.replace(target)
+    registered.symlink_to(target.name)
+
+    html = render_adjudicated_report(
+        scan,
+        _image_verdict(),
+        artifact_dir=str(audit),
+    )
+
+    assert "data:image/png;base64," not in html
+    assert "preview unavailable" in html
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["not-a-number", "inf", "-1", "1e10000"],
+    ids=["malformed", "non-finite", "negative", "overflow"],
+)
+def test_adjudicated_report_invalid_image_evidence_limit_suppresses_images(
+    tmp_path,
+    monkeypatch,
+    value,
+):
+    audit = tmp_path / "audit"
+    scan = _image_scan(audit)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_EVIDENCE_MB", value)
+
+    html = render_adjudicated_report(
+        scan,
+        _image_verdict(),
+        artifact_dir=str(audit),
+    )
+
+    assert "data:image/" not in html
+    assert "preview unavailable" in html
+
+
+def test_adjudicated_numeric_only_report_ignores_invalid_image_evidence_limit(
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "PAPERCONAN_MAX_IMAGE_EVIDENCE_MB",
+        "not-a-number",
+    )
+
+    html = render_adjudicated_report(
+        {
+            "relations_blocks": [],
+            "cross_sheet_findings": [],
+            "image_assets": [],
+            "image_findings": [],
+        },
+        {
+            "verdict": "NEEDS_HUMAN",
+            "report_md": "Numeric evidence remains available for review.",
+        },
+    )
+
+    assert "Numeric evidence remains available for review." in html
+
+
 def test_write_adjudicated_report_validation_failure_preserves_existing_output(
     tmp_path,
 ):

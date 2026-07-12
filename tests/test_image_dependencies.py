@@ -7,6 +7,7 @@ import pytest
 
 from paperconan import scan_dir
 from paperconan import _audit
+from paperconan._html import write_html_report
 from paperconan.image import ImageDependencyError
 
 
@@ -138,6 +139,31 @@ def test_numeric_only_scan_does_not_preflight_image_dependencies(
 
     assert scan["n_files"] == 1
     assert scan["image_assets"] == []
+
+
+def test_numeric_only_report_ignores_image_dependency_and_limit_state(
+    tmp_path,
+    monkeypatch,
+):
+    _missing(monkeypatch, "PIL.Image", "PIL.ImageOps")
+    monkeypatch.setenv(
+        "PAPERCONAN_MAX_IMAGE_EVIDENCE_MB",
+        "not-a-number",
+    )
+    out = tmp_path / "report.html"
+
+    write_html_report(
+        {
+            "input_dir": str(tmp_path / "input"),
+            "relations_blocks": [],
+            "cross_sheet_findings": [],
+            "image_assets": [],
+            "image_findings": [],
+        },
+        str(out),
+    )
+
+    assert out.exists()
 
 
 def test_cli_exits_nonzero_with_image_install_guidance(
