@@ -64,8 +64,10 @@ paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 
 `verdict.json` 的**主形态**是带 `findings` 数组的论文级对象（每条 finding 各带 `finding_ref` / `suspicion_tier` / `impact_scope` / `review_status` / `report_md`，图像 finding 还可带 `finding_type: "image"` 与 `image_refs`，论文级另有 `paper_conclusion` / `overall_impact` / `review_note` / `image_review`）；**单条 finding 只是"列了一条"**，同样富渲染，不再是旧版朴素排版。完整 schema 与例子见 [`references/adjudication-tiers.md`](../skills/paperconan/references/adjudication-tiers.md) › "Multiple Findings In One Paper" 和 [`references/report-templates.md`](../skills/paperconan/references/report-templates.md) › "Adaptive Numeric And Image Report"。旧的扁平 `report_md` + `finding_refs` 形态向后兼容，现在也会渲染成同样的高保真版式。适合单篇论文复核或批量审计后的归档。
 
-在入口 schema 中，`findings[]`、`finding_ref`、`extra_refs[]`、`image_refs[]`
-以及旧形态的 `finding_refs[]` 条目必须是 concrete JSON objects。Markdown-rendered verdict fields must be strings or `null`：包括 `paper_conclusion`、`review_note`、
+The top-level verdict and all nested verdict objects must be concrete JSON objects.
+在 Python 库入口中，这表示必须使用内建 `dict`，不接受 mapping wrapper 或 `dict` 子类；
+嵌套对象包括 `findings[]`、`finding_ref`、`extra_refs[]`、`image_refs[]`
+以及旧形态的 `finding_refs[]` 条目。Markdown-rendered verdict fields must be strings or `null`：包括 `paper_conclusion`、`review_note`、
 现代 finding 的 `report_md` 和旧形态顶层 `report_md`。
 
 为限制匹配、图像读取和 HTML 卡片构建，单个 verdict 最多接受 5,000 raw verdict references。

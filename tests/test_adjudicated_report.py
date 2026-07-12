@@ -24,6 +24,23 @@ class _DictionarySubclass(dict):
     pass
 
 
+class _StatefulVerdictSubclass(dict):
+    def __init__(self) -> None:
+        super().__init__(
+            verdict="NEEDS_HUMAN",
+            report_md="The signal requires contextual review.",
+        )
+        self.title_reads = 0
+
+    def get(self, key, default=None):
+        if key == "title":
+            self.title_reads += 1
+            if self.title_reads == 1:
+                return "Contextual review"
+            return "mis" + "conduct"
+        return super().get(key, default)
+
+
 def _verdict() -> dict:
     return {
         "verdict": "KEEP",
@@ -203,6 +220,125 @@ def test_write_adjudicated_report_validation_failure_preserves_existing_output(
             str(out),
         )
 
+    assert out.read_text(encoding="utf-8") == "existing-report"
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        UserDict({
+            "verdict": "NEEDS_HUMAN",
+            "report_md": "The signal requires contextual review.",
+        }),
+        _DictionarySubclass(
+            verdict="NEEDS_HUMAN",
+            report_md="The signal requires contextual review.",
+        ),
+    ],
+    ids=["user-dictionary", "dictionary-subclass"],
+)
+def test_top_level_verdict_requires_a_concrete_json_object(verdict):
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+        )
+
+    assert str(exc.value) == "verdict must be a concrete JSON object"
+
+
+def test_stateful_top_level_verdict_is_rejected_before_any_report_work(
+    monkeypatch,
+):
+    verdict = _StatefulVerdictSubclass()
+
+    def reject_late_work(*args, **kwargs):
+        raise AssertionError("report work must not start")
+
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_visible_scan_findings",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html.copy,
+        "deepcopy",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_validate_neutral_verdict",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_scan_title",
+        reject_late_work,
+    )
+    monkeypatch.setattr(
+        _adjudicated_html,
+        "_render_unified",
+        reject_late_work,
+    )
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+        )
+
+    assert str(exc.value) == "verdict must be a concrete JSON object"
+    assert verdict.title_reads == 0
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected"),
+    [
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "paper_conclusion": "Paper-level context.",
+                "findings": [{"report_md": "Modern finding context."}],
+            },
+            "Modern finding context.",
+        ),
+        (
+            {
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "Legacy finding context.",
+            },
+            "Legacy finding context.",
+        ),
+    ],
+    ids=["modern", "legacy"],
+)
+def test_concrete_top_level_verdict_preserves_modern_and_legacy_behavior(
+    verdict,
+    expected,
+):
+    html = render_adjudicated_report(
+        {"relations_blocks": [], "cross_sheet_findings": []},
+        verdict,
+    )
+
+    assert expected in html
+
+
+def test_top_level_verdict_validation_preserves_existing_output(tmp_path):
+    out = tmp_path / "adjudication.html"
+    out.write_text("existing-report", encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        write_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            UserDict({
+                "verdict": "NEEDS_HUMAN",
+                "report_md": "The signal requires contextual review.",
+            }),
+            str(out),
+        )
+
+    assert str(exc.value) == "verdict must be a concrete JSON object"
     assert out.read_text(encoding="utf-8") == "existing-report"
 
 

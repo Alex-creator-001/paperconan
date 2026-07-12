@@ -140,6 +140,11 @@ def _validate_optional_markdown(value: object, message: str) -> None:
         raise ValueError(message)
 
 
+def _validate_top_level_verdict(verdict: object) -> None:
+    if type(verdict) is not dict:
+        raise ValueError("verdict must be a concrete JSON object")
+
+
 def _modern_findings(verdict: dict[str, Any]) -> list[Any] | None:
     if "findings" not in verdict:
         return None
@@ -1046,6 +1051,7 @@ def render_adjudicated_report(
     ``finding_refs``) are folded by :func:`_normalize_verdict` into one findings
     list, then rendered as a paper header + per-finding blocks with evidence.
     """
+    _validate_top_level_verdict(verdict)
     scan_findings = _visible_scan_findings(scan)
     verdict = _normalized_verdict_copy(
         scan,
@@ -1076,6 +1082,7 @@ def write_adjudicated_report(
     artifact_dir: str | None = None,
 ) -> None:
     """Write an adjudicated PaperConan HTML report."""
+    _validate_top_level_verdict(verdict)
     rendered = render_adjudicated_report(scan, verdict, artifact_dir=artifact_dir)
     absolute_out = os.path.abspath(out_path)
     destination_dir = os.path.dirname(absolute_out) or "."

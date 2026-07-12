@@ -263,6 +263,10 @@ def test_verdict_reference_ceiling_is_documented() -> None:
 def test_verdict_ingress_schema_contract_is_documented() -> None:
     reports = (ROOT / "docs" / "reports.md").read_text(encoding="utf-8")
 
+    assert (
+        "The top-level verdict and all nested verdict objects must be "
+        "concrete JSON objects."
+    ) in reports
     assert "concrete JSON objects" in reports
     assert "Markdown-rendered verdict fields must be strings or `null`" in reports
 
