@@ -44,6 +44,7 @@ _URL_IN_ERROR = re.compile(r"https?://[^\s]+")
 _ZIP_EOCD = struct.Struct("<4s4H2IH")
 _ZIP64_LOCATOR = struct.Struct("<4sIQI")
 _ZIP64_EOCD = struct.Struct("<4sQ2H2I4Q")
+_ZIP_CENTRAL_FILE_HEADER = struct.Struct("<4s6H3I5H2I")
 _ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
 _ZIP64_LOCATOR_SIGNATURE = b"PK\x06\x07"
 _ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
@@ -67,6 +68,7 @@ class _PublishedOutputFile:
     size: int
     identity: tuple[int, int]
     sha256: str
+    created: bool
 
     def display_path(self, output: _PinnedOutputDirectory) -> str:
         return os.path.join(output.path, self.filename)
@@ -306,6 +308,75 @@ def _open_stable_regular(path: str):
             os.close(fd)
 
 
+def _remove_new_publication_if_same(
+    output: _PinnedOutputDirectory,
+    entry: _PublishedOutputFile,
+) -> str:
+    if not entry.created:
+        return "reused"
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        return "unavailable"
+    fd = -1
+    try:
+        try:
+            fd = os.open(
+                entry.filename,
+                os.O_RDONLY | nofollow,
+                dir_fd=output.fd,
+            )
+        except FileNotFoundError:
+            return "absent"
+        except (OSError, TypeError, NotImplementedError):
+            return "unavailable"
+        try:
+            opened = os.fstat(fd)
+        except OSError:
+            return "unavailable"
+        try:
+            current = os.stat(
+                entry.filename,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return "absent"
+        except (OSError, TypeError, NotImplementedError):
+            return "unavailable"
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != entry.identity
+            or (current.st_dev, current.st_ino) != entry.identity
+        ):
+            return "replaced"
+        try:
+            final = os.stat(
+                entry.filename,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return "absent"
+        except (OSError, TypeError, NotImplementedError):
+            return "unavailable"
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or (final.st_dev, final.st_ino) != entry.identity
+        ):
+            return "replaced"
+        try:
+            os.unlink(entry.filename, dir_fd=output.fd)
+        except FileNotFoundError:
+            return "absent"
+        except (OSError, TypeError, NotImplementedError):
+            return "unavailable"
+        return "removed"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _dir_size_fd(directory_fd: int) -> int:
     total = 0
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -507,16 +578,21 @@ def _write_collision_safe(
             if fd >= 0:
                 os.close(fd)
 
-    def result(
+    def publication(
         filename: str,
         current: os.stat_result,
-    ) -> str | _PublishedOutputFile:
-        entry = _PublishedOutputFile(
+        *,
+        created: bool,
+    ) -> _PublishedOutputFile:
+        return _PublishedOutputFile(
             filename=filename,
             size=current.st_size,
             identity=(current.st_dev, current.st_ino),
             sha256=content_sha256,
+            created=created,
         )
+
+    def result(entry: _PublishedOutputFile) -> str | _PublishedOutputFile:
         if _return_entry:
             return entry
         return entry.display_path(out_dir)
@@ -565,7 +641,9 @@ def _write_collision_safe(
                 matched = regular_file_matches(filename)
                 if matched is not None:
                     out_dir.verify()
-                    return result(filename, matched)
+                    return result(
+                        publication(filename, matched, created=False)
+                    )
                 collision_index += 1
                 continue
             try:
@@ -583,9 +661,10 @@ def _write_collision_safe(
                     )
                 out_dir.verify()
             except Exception:
-                os.unlink(filename, dir_fd=out_dir.fd)
+                entry = publication(filename, current, created=True)
+                _remove_new_publication_if_same(out_dir, entry)
                 raise
-            return result(filename, current)
+            return result(publication(filename, current, created=True))
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
@@ -655,14 +734,11 @@ def _validate_zip_central_directory(
     directory_size: int,
     directory_offset: int,
     record_position: int,
+    max_entries: int,
     prefix_adjustment: int | None = None,
-) -> None:
-    if entry_count == 0:
-        if directory_size != 0 or directory_offset > record_position:
-            raise ValueError("ZIP central directory metadata is inconsistent")
-        return
-    if directory_size < entry_count * 46:
-        raise ValueError("ZIP central directory length is inconsistent")
+) -> int:
+    if directory_size > record_position:
+        raise ValueError("ZIP central directory position is invalid")
     actual_offset = record_position - directory_size
     if actual_offset < directory_offset or actual_offset < 0:
         raise ValueError("ZIP central directory position is invalid")
@@ -671,14 +747,47 @@ def _validate_zip_central_directory(
         and actual_offset - directory_offset != prefix_adjustment
     ):
         raise ValueError("ZIP central directory position is inconsistent")
-    signature = _read_exact_zip_range(
-        source,
-        actual_offset,
-        len(_ZIP_CENTRAL_DIRECTORY_SIGNATURE),
-        "central directory",
-    )
-    if signature != _ZIP_CENTRAL_DIRECTORY_SIGNATURE:
-        raise ValueError("ZIP central directory signature is invalid")
+    observed = 0
+    position = actual_offset
+    while position < record_position:
+        remaining = record_position - position
+        if remaining < _ZIP_CENTRAL_FILE_HEADER.size:
+            raise ValueError("ZIP central directory fixed header is truncated")
+        fixed = _read_exact_zip_range(
+            source,
+            position,
+            _ZIP_CENTRAL_FILE_HEADER.size,
+            "central directory fixed header",
+        )
+        fields = _ZIP_CENTRAL_FILE_HEADER.unpack(fixed)
+        if fields[0] != _ZIP_CENTRAL_DIRECTORY_SIGNATURE:
+            raise ValueError("ZIP central directory signature is invalid")
+        filename_size, extra_size, comment_size = fields[10:13]
+        disk_number = fields[13]
+        if disk_number != 0:
+            raise ValueError("multi-disk ZIP archives are unavailable")
+        variable_size = filename_size + extra_size + comment_size
+        record_size = _ZIP_CENTRAL_FILE_HEADER.size + variable_size
+        record_end = position + record_size
+        if (
+            record_size < _ZIP_CENTRAL_FILE_HEADER.size
+            or record_end <= position
+            or record_end > record_position
+        ):
+            raise ValueError("ZIP central directory record is truncated")
+        observed += 1
+        if observed > max_entries:
+            raise ValueError(
+                f"observed ZIP entry count {observed} exceeds "
+                f"preflight ceiling {max_entries}"
+            )
+        position = record_end
+        source.seek(position, os.SEEK_SET)
+    if position != record_position:
+        raise ValueError("ZIP central directory end is inconsistent")
+    if observed != entry_count:
+        raise ValueError("ZIP entry counts are inconsistent")
+    return observed
 
 
 def _preflight_zip_entry_count(source, *, max_entries: int) -> int:
@@ -742,14 +851,15 @@ def _preflight_zip_entry_count(source, *, max_entries: int) -> int:
                 f"raw ZIP entry count {total_entries} exceeds "
                 f"preflight ceiling {max_entries}"
             )
-        _validate_zip_central_directory(
+        observed_entries = _validate_zip_central_directory(
             source,
             entry_count=total_entries,
             directory_size=directory_size,
             directory_offset=directory_offset,
             record_position=record_position,
+            max_entries=max_entries,
         )
-        return total_entries
+        return observed_entries
 
     locator_position = record_position - _ZIP64_LOCATOR.size
     locator_data = _read_exact_zip_range(
@@ -842,15 +952,16 @@ def _preflight_zip_entry_count(source, *, max_entries: int) -> int:
     prefix_adjustment = zip64_position - declared_zip64_offset
     if prefix_adjustment < 0:
         raise ValueError("ZIP64 EOCD position is invalid")
-    _validate_zip_central_directory(
+    observed_entries = _validate_zip_central_directory(
         source,
         entry_count=zip64_total_entries,
         directory_size=zip64_directory_size,
         directory_offset=zip64_directory_offset,
         record_position=zip64_position,
+        max_entries=max_entries,
         prefix_adjustment=prefix_adjustment,
     )
-    return zip64_total_entries
+    return observed_entries
 
 
 def _extract_selected_zip(
@@ -863,8 +974,10 @@ def _extract_selected_zip(
     cardinality=None,
     limit_reasons=None,
     published_entries=None,
+    pending_entries=None,
 ):
     extracted = published_entries if published_entries is not None else []
+    pending = pending_entries if pending_entries is not None else []
     written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
@@ -917,12 +1030,15 @@ def _extract_selected_zip(
                 data,
                 _return_entry=return_entries,
             )
+            if return_entries:
+                pending.append(dest)
             if cardinality is not None:
                 cardinality.record_publication()
             written += len(data)
             if return_entries:
                 _verify_published_output_file(out_dir, dest)
                 out_dir.verify()
+                pending.remove(dest)
             extracted.append(dest)
     return extracted
 
@@ -937,8 +1053,10 @@ def _extract_selected_tar(
     cardinality=None,
     limit_reasons=None,
     published_entries=None,
+    pending_entries=None,
 ):
     extracted = published_entries if published_entries is not None else []
+    pending = pending_entries if pending_entries is not None else []
     written = _dir_size(out_dir)
     allowed = {"tabular"}
     if include_images:
@@ -986,12 +1104,15 @@ def _extract_selected_tar(
                 data,
                 _return_entry=return_entries,
             )
+            if return_entries:
+                pending.append(dest)
             if cardinality is not None:
                 cardinality.record_publication()
             written += len(data)
             if return_entries:
                 _verify_published_output_file(out_dir, dest)
                 out_dir.verify()
+                pending.remove(dest)
             extracted.append(dest)
     return extracted
 
@@ -1077,6 +1198,53 @@ def _verify_published_output_file(
         os.close(fd)
 
 
+def _reconcile_archive_publications(
+    output: _PinnedOutputDirectory,
+    accepted: list[_PublishedOutputFile],
+    pending: list[_PublishedOutputFile],
+) -> tuple[list[_PublishedOutputFile], list[str], BaseException | None]:
+    reconciled = []
+    outcomes = []
+    first_error = None
+    seen = set()
+    for entry in [*accepted, *pending]:
+        key = (entry.filename, entry.identity)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            _verify_published_output_file(output, entry)
+            output.verify()
+        except (OSError, ValueError) as exc:
+            if first_error is None:
+                first_error = exc
+            if not entry.created:
+                outcomes.append(
+                    "retained collision-reused output without reporting it: "
+                    f"{entry.filename}"
+                )
+                continue
+            removal = _remove_new_publication_if_same(output, entry)
+            if removal in {"removed", "absent"}:
+                outcomes.append(
+                    f"removed unverified new output: {entry.filename}"
+                )
+            elif removal == "replaced":
+                outcomes.append(
+                    f"retained replacement path for recovery: {entry.filename}"
+                )
+            else:
+                outcomes.append(
+                    f"retained new output for recovery: {entry.filename}"
+                )
+            continue
+        reconciled.append(entry)
+        outcomes.append(f"retained verified output: {entry.filename}")
+    accepted[:] = reconciled
+    pending.clear()
+    return reconciled, outcomes, first_error
+
+
 def _download_oa_package(
     pkg,
     out_dir,
@@ -1102,44 +1270,65 @@ def _download_oa_package(
         try:
             limit_reasons = []
             extracted = []
+            pending = []
             processing_error = None
-            with _open_download_staging(tmp) as archive_fh:
-                try:
-                    _extract_selected_tar(
-                        archive_fh,
-                        out_dir,
-                        include_images=include_images,
-                        max_member_bytes=max_bytes,
-                        return_entries=True,
-                        cardinality=cardinality,
-                        limit_reasons=limit_reasons,
-                        published_entries=extracted,
+            staging_error = None
+            try:
+                with _open_download_staging(tmp) as archive_fh:
+                    try:
+                        _extract_selected_tar(
+                            archive_fh,
+                            out_dir,
+                            include_images=include_images,
+                            max_member_bytes=max_bytes,
+                            return_entries=True,
+                            cardinality=cardinality,
+                            limit_reasons=limit_reasons,
+                            published_entries=extracted,
+                            pending_entries=pending,
+                        )
+                    except (tarfile.TarError, OSError, ValueError) as exc:
+                        processing_error = exc
+            except _UnstableRegularFileError as exc:
+                staging_error = exc
+            reconciled, outcomes, reconciliation_error = (
+                _reconcile_archive_publications(
+                    out_dir,
+                    extracted,
+                    pending,
+                )
+            )
+            published_outputs.extend(reconciled)
+            failure = staging_error or processing_error or reconciliation_error
+            if failure is not None:
+                if staging_error is not None:
+                    reason = (
+                        "downloaded archive is not a stable regular file: "
+                        f"{staging_error}"
                     )
-                except (tarfile.TarError, OSError, ValueError) as exc:
-                    processing_error = exc
-        except _UnstableRegularFileError as e:
-            skipped.append({
-                "name": pkg.get("name"),
-                "reason": f"downloaded archive is not a stable regular file: {e}",
-            })
-            return []
-        for entry in extracted:
-            _verify_published_output_file(out_dir, entry)
-        out_dir.verify()
-        published_outputs.extend(extracted)
-        if processing_error is not None:
+                else:
+                    reason = (
+                        f"archive publication unavailable: {failure}"
+                        if isinstance(failure, OSError)
+                        else f"archive processing unavailable: {failure}"
+                    )
+                if outcomes:
+                    reason += "; " + "; ".join(outcomes)
+                skipped.append({"name": pkg.get("name"), "reason": reason})
+                return reconciled
+        except (tarfile.TarError, OSError, ValueError) as e:
             reason = (
-                f"archive publication unavailable: {processing_error}"
-                if isinstance(processing_error, OSError)
-                else f"archive processing unavailable: {processing_error}"
+                f"archive publication unavailable: {e}"
+                if isinstance(e, OSError)
+                else f"archive processing unavailable: {e}"
             )
             skipped.append({"name": pkg.get("name"), "reason": reason})
-            return extracted
+            return []
         skipped.extend(
             {"name": pkg.get("name"), "reason": reason}
             for reason in limit_reasons
         )
-        return extracted
+        return reconciled
     except (tarfile.TarError, OSError, ValueError) as e:
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
         return []
@@ -1176,48 +1365,73 @@ def _download_supplementary_archive(
         try:
             limit_reasons = []
             extracted = []
+            pending = []
             processing_error = None
-            with _open_download_staging(tmp_zip) as archive_fh:
-                try:
-                    _extract_selected_zip(
-                        archive_fh,
-                        out_dir,
-                        include_images=include_images,
-                        max_member_bytes=max_bytes,
-                        return_entries=True,
-                        cardinality=cardinality,
-                        limit_reasons=limit_reasons,
-                        published_entries=extracted,
+            staging_error = None
+            try:
+                with _open_download_staging(tmp_zip) as archive_fh:
+                    try:
+                        _extract_selected_zip(
+                            archive_fh,
+                            out_dir,
+                            include_images=include_images,
+                            max_member_bytes=max_bytes,
+                            return_entries=True,
+                            cardinality=cardinality,
+                            limit_reasons=limit_reasons,
+                            published_entries=extracted,
+                            pending_entries=pending,
+                        )
+                    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+                        processing_error = exc
+            except _UnstableRegularFileError as exc:
+                staging_error = exc
+            reconciled, outcomes, reconciliation_error = (
+                _reconcile_archive_publications(
+                    out_dir,
+                    extracted,
+                    pending,
+                )
+            )
+            published_outputs.extend(reconciled)
+            failure = staging_error or processing_error or reconciliation_error
+            if failure is not None:
+                if staging_error is not None:
+                    reason = (
+                        "downloaded archive is not a stable regular file: "
+                        f"{staging_error}"
                     )
-                except (zipfile.BadZipFile, OSError, ValueError) as exc:
-                    processing_error = exc
-        except _UnstableRegularFileError as e:
-            skipped.append({
-                "name": arch.get("name"),
-                "reason": f"downloaded archive is not a stable regular file: {e}",
-            })
-            return []
-        for entry in extracted:
-            _verify_published_output_file(out_dir, entry)
-        out_dir.verify()
-        published_outputs.extend(extracted)
-        if processing_error is not None:
+                else:
+                    reason = (
+                        "not a valid zip archive"
+                        if isinstance(failure, zipfile.BadZipFile)
+                        else (
+                            f"archive publication unavailable: {failure}"
+                            if isinstance(failure, OSError)
+                            else f"archive processing unavailable: {failure}"
+                        )
+                    )
+                if outcomes:
+                    reason += "; " + "; ".join(outcomes)
+                skipped.append({"name": arch.get("name"), "reason": reason})
+                return reconciled
+        except (zipfile.BadZipFile, OSError, ValueError) as exc:
             reason = (
                 "not a valid zip archive"
-                if isinstance(processing_error, zipfile.BadZipFile)
+                if isinstance(exc, zipfile.BadZipFile)
                 else (
-                    f"archive publication unavailable: {processing_error}"
-                    if isinstance(processing_error, OSError)
-                    else f"archive processing unavailable: {processing_error}"
+                    f"archive publication unavailable: {exc}"
+                    if isinstance(exc, OSError)
+                    else f"archive processing unavailable: {exc}"
                 )
             )
             skipped.append({"name": arch.get("name"), "reason": reason})
-            return extracted
+            return []
         skipped.extend(
             {"name": arch.get("name"), "reason": reason}
             for reason in limit_reasons
         )
-        return extracted
+        return reconciled
     except (zipfile.BadZipFile, OSError, ValueError) as exc:
         reason = (
             "not a valid zip archive"

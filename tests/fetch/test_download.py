@@ -1229,6 +1229,281 @@ def test_archive_later_publication_failure_keeps_verified_partial_entry(
     assert not list(out_dir.glob(".paperconan-publish-*"))
 
 
+def _archive_candidate(archive_kind):
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": f"{archive_kind}.archive",
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+    return candidate, archive
+
+
+def _install_archive_payload(monkeypatch, payload):
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_reconciles_entry_verification_failure_after_publication(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes(archive_kind)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    real_verify = _download._verify_published_output_file
+    verification_calls = 0
+
+    def fail_first_verification(output, entry):
+        nonlocal verification_calls
+        verification_calls += 1
+        if verification_calls == 1:
+            raise _download._UnstableRegularFileError(
+                "entry verification unavailable"
+            )
+        return real_verify(output, entry)
+
+    monkeypatch.setattr(
+        _download,
+        "_verify_published_output_file",
+        fail_first_verification,
+    )
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert [entry["file"] for entry in sidecar["downloads"]] == ["data.csv"]
+    assert summary["skipped"] == [{
+        "name": archive["name"],
+        "reason": (
+            "archive publication unavailable: entry verification unavailable; "
+            "retained verified output: data.csv"
+        ),
+    }]
+    assert (out_dir / "data.csv").read_bytes() == b"a,b\n1,2\n"
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_removes_new_output_after_output_root_verification_failure(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    displaced = tmp_path / "displaced-out"
+    payload = _archive_bytes(archive_kind)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    real_write = _download._write_collision_safe
+    root_replaced = False
+
+    def publish_then_replace_root(output, name, data, **kwargs):
+        nonlocal root_replaced
+        published = real_write(output, name, data, **kwargs)
+        if not root_replaced:
+            out_dir.rename(displaced)
+            out_dir.mkdir()
+            root_replaced = True
+        return published
+
+    monkeypatch.setattr(
+        _download,
+        "_write_collision_safe",
+        publish_then_replace_root,
+    )
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert root_replaced
+    assert summary["downloaded"] == []
+    assert summary["skipped"] == [{
+        "name": archive["name"],
+        "reason": (
+            "downloaded archive is not a stable regular file: "
+            "fetch output directory changed during publication; "
+            "removed unverified new output: data.csv"
+        ),
+    }]
+    assert list(out_dir.iterdir()) == []
+    assert not (displaced / "data.csv").exists()
+    assert not list(displaced.glob(".paperconan-archive-*"))
+    assert not list(displaced.glob(".paperconan-publish-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_reconciles_post_yield_staging_failure(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    payload = _archive_bytes(archive_kind)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    real_open = _download._open_download_staging
+
+    @contextmanager
+    def fail_after_yield(staging):
+        with real_open(staging) as source:
+            yield source
+        raise _download._UnstableRegularFileError(
+            "post-yield staging verification unavailable"
+        )
+
+    monkeypatch.setattr(
+        _download,
+        "_open_download_staging",
+        fail_after_yield,
+    )
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert [Path(path).name for path in summary["downloaded"]] == ["data.csv"]
+    assert [entry["file"] for entry in sidecar["downloads"]] == ["data.csv"]
+    assert summary["skipped"] == [{
+        "name": archive["name"],
+        "reason": (
+            "downloaded archive is not a stable regular file: "
+            "post-yield staging verification unavailable; "
+            "retained verified output: data.csv"
+        ),
+    }]
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_never_removes_collision_reused_output_during_reconciliation(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    existing = out_dir / "data.csv"
+    existing.write_bytes(b"a,b\n1,2\n")
+    payload = _archive_bytes(archive_kind)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+
+    def fail_verification(output, entry):
+        raise _download._UnstableRegularFileError(
+            "entry verification unavailable"
+        )
+
+    monkeypatch.setattr(
+        _download,
+        "_verify_published_output_file",
+        fail_verification,
+    )
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert summary["downloaded"] == []
+    assert sidecar["downloads"] == []
+    assert summary["skipped"] == [{
+        "name": archive["name"],
+        "reason": (
+            "archive publication unavailable: entry verification unavailable; "
+            "retained collision-reused output without reporting it: data.csv"
+        ),
+    }]
+    assert existing.read_bytes() == b"a,b\n1,2\n"
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_reconciliation_never_removes_replacement_inode(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    replacement = b"replacement,value\n9,8\n"
+    payload = _archive_bytes(archive_kind)
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(monkeypatch, payload)
+    real_write = _download._write_collision_safe
+    original_identity = None
+
+    def publish_then_replace_entry(output, name, data, **kwargs):
+        nonlocal original_identity
+        published = real_write(output, name, data, **kwargs)
+        original_identity = published.identity
+        os.unlink(published.filename, dir_fd=output.fd)
+        replacement_fd = os.open(
+            published.filename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=output.fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+        finally:
+            os.close(replacement_fd)
+        return published
+
+    monkeypatch.setattr(
+        _download,
+        "_write_collision_safe",
+        publish_then_replace_entry,
+    )
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    current = (out_dir / "data.csv").stat()
+    sidecar = json.loads(
+        (out_dir / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert original_identity is not None
+    assert (current.st_dev, current.st_ino) != original_identity
+    assert summary["downloaded"] == []
+    assert sidecar["downloads"] == []
+    assert summary["skipped"] == [{
+        "name": archive["name"],
+        "reason": (
+            "archive publication unavailable: published output entry is not "
+            "a stable regular file; retained replacement path for recovery: "
+            "data.csv"
+        ),
+    }]
+    assert (out_dir / "data.csv").read_bytes() == replacement
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
+
+
 def test_excessive_zip_entries_are_rejected_before_zipfile_construction(
     monkeypatch,
     tmp_path,
@@ -1493,6 +1768,148 @@ def test_malformed_zip_metadata_is_rejected_before_zipfile_construction(
     )
     assert not list(out_dir.glob("*.csv"))
     assert not list(out_dir.glob(".paperconan-archive-*"))
+
+
+def _rewrite_classic_zip_counts(payload, count):
+    rewritten = bytearray(payload)
+    eocd_offset = payload.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    struct.pack_into("<HH", rewritten, eocd_offset + 8, count, count)
+    return bytes(rewritten)
+
+
+def _rewrite_zip64_counts(payload, count):
+    rewritten = bytearray(payload)
+    zip64_offset = payload.rfind(b"PK\x06\x06")
+    assert zip64_offset >= 0
+    struct.pack_into("<QQ", rewritten, zip64_offset + 24, count, count)
+    return bytes(rewritten)
+
+
+def _central_directory_offset(payload):
+    eocd_offset = payload.rfind(b"PK\x05\x06")
+    assert eocd_offset >= 0
+    fields = struct.unpack_from("<4s4H2IH", payload, eocd_offset)
+    return fields[6]
+
+
+def _classic_zip_bytes(files):
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        for name, data in files:
+            archive.writestr(name, data)
+    return payload.getvalue()
+
+
+def _forged_low_count_zip():
+    payload = _classic_zip_bytes([
+        (f"tables/data-{index}.csv", b"")
+        for index in range(3)
+    ])
+    return _rewrite_classic_zip_counts(payload, 1), 2
+
+
+def _forged_high_count_zip():
+    payload = _classic_zip_bytes([
+        ("tables/" + ("x" * 100) + ".csv", b""),
+    ])
+    return _rewrite_classic_zip_counts(payload, 2), 10
+
+
+def _forged_zip64_count_zip():
+    payload = _zip64_archive_bytes([
+        ("tables/first.csv", b""),
+        ("tables/second.csv", b""),
+    ])
+    return _rewrite_zip64_counts(payload, 1), 10
+
+
+def _oversized_central_name_zip():
+    payload = bytearray(_classic_zip_bytes([
+        ("tables/data.csv", b""),
+    ]))
+    central_offset = _central_directory_offset(payload)
+    struct.pack_into("<H", payload, central_offset + 28, 0xFFFF)
+    return bytes(payload), 10
+
+
+def _unknown_trailing_central_record_zip():
+    payload = bytearray(_classic_zip_bytes([
+        ("tables/first.csv", b""),
+        ("tables/second.csv", b""),
+    ]))
+    first_offset = _central_directory_offset(payload)
+    first_header = struct.unpack_from(
+        "<4s6H3I5H2I",
+        payload,
+        first_offset,
+    )
+    second_offset = (
+        first_offset
+        + 46
+        + first_header[10]
+        + first_header[11]
+        + first_header[12]
+    )
+    payload[second_offset:second_offset + 4] = b"NOPE"
+    return bytes(payload), 10
+
+
+@pytest.mark.parametrize(
+    ("payload_factory", "expected_reason"),
+    [
+        (_forged_low_count_zip, "observed ZIP entry count"),
+        (_forged_high_count_zip, "ZIP entry counts are inconsistent"),
+        (_forged_zip64_count_zip, "ZIP entry counts are inconsistent"),
+        (_oversized_central_name_zip, "central directory record is truncated"),
+        (
+            _unknown_trailing_central_record_zip,
+            "central directory signature is invalid",
+        ),
+    ],
+    ids=[
+        "classic-forged-low-count",
+        "classic-forged-high-count",
+        "zip64-forged-count",
+        "oversized-variable-field",
+        "unknown-trailing-record",
+    ],
+)
+def test_forged_central_directory_is_rejected_before_zipfile_construction(
+    monkeypatch,
+    tmp_path,
+    payload_factory,
+    expected_reason,
+):
+    payload, max_entries = payload_factory()
+    out_dir = tmp_path / "out"
+    zipfile_init_called = False
+    _install_archive_payload(monkeypatch, payload)
+
+    def fail_zipfile_init(archive, *args, **kwargs):
+        nonlocal zipfile_init_called
+        zipfile_init_called = True
+        raise zipfile.BadZipFile("ZipFile constructed before central walk")
+
+    monkeypatch.setattr(
+        _download,
+        "_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE",
+        max_entries,
+    )
+    monkeypatch.setattr(zipfile.ZipFile, "__init__", fail_zipfile_init)
+    candidate, _ = _archive_candidate("supplementary")
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert zipfile_init_called is False
+    assert summary["downloaded"] == []
+    assert any(
+        expected_reason in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(out_dir.glob("*.csv"))
+    assert not list(out_dir.glob(".paperconan-archive-*"))
+    assert not list(out_dir.glob(".paperconan-publish-*"))
 
 
 def _zero_byte_archive_bytes(kind, prefix, count):
@@ -2059,7 +2476,7 @@ def test_archive_result_rejects_post_extraction_output_root_replacement(
     assert len(summary["skipped"]) == 1
     assert "output directory changed" in summary["skipped"][0]["reason"]
     assert (out_dir / "data.csv").read_bytes() == b"replacement,root\n"
-    assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
+    assert not (displaced / "data.csv").exists()
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
