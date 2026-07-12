@@ -40,3 +40,4 @@ REPORT.md
 # Local-only audit working dirs — NEVER commit (contain paper DOIs, judgments, dossiers, source data)
 /recheck/
 /batches/
+.worktrees/
