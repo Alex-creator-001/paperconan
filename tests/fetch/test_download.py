@@ -664,6 +664,95 @@ def test_provenance_sidecar_does_not_follow_or_replace_final_symlink(
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
+@pytest.mark.parametrize("existing_sidecar", [False, True])
+def test_final_output_replacement_rolls_back_provenance_sidecar(
+    monkeypatch,
+    tmp_path,
+    existing_sidecar,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    previous_bytes = json.dumps({
+        "cand_id": "previous:1",
+        "downloads": [{"file": "previous.csv"}],
+    }).encode("utf-8")
+    if existing_sidecar:
+        sidecar.write_bytes(previous_bytes)
+    payload = b"a,b\n1,2\n"
+    replacement = b"x,y\n9,8\n"
+    sidecar_published = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    real_write_source_sidecar = _download._write_source_sidecar
+
+    def publish_sidecar_then_replace_output(cand, output, downloads=None):
+        nonlocal sidecar_published
+        publication = real_write_source_sidecar(
+            cand,
+            output,
+            downloads=downloads,
+        )
+        published = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert published["downloads"] == [{
+            "file": "data.csv",
+            "source_url": "https://example.test/data.csv",
+            "content_type": None,
+            "asset_type": "tabular",
+            "size": len(payload),
+        }]
+        sidecar_published = True
+        os.unlink("data.csv", dir_fd=output.fd)
+        replacement_fd = os.open(
+            "data.csv",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=output.fd,
+        )
+        try:
+            os.write(replacement_fd, replacement)
+        finally:
+            os.close(replacement_fd)
+        return publication
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_write_source_sidecar",
+        publish_sidecar_then_replace_output,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert sidecar_published
+    assert summary["downloaded"] == []
+    assert len(summary["skipped"]) == 1
+    assert "stable regular file" in summary["skipped"][0]["reason"]
+    if existing_sidecar:
+        assert sidecar.read_bytes() == previous_bytes
+    else:
+        assert not sidecar.exists()
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))
+
+
 def test_direct_download_does_not_follow_existing_destination_symlink(
     monkeypatch,
     tmp_path,
@@ -819,6 +908,98 @@ def _archive_bytes(kind, member_name="tables/data.csv", data=b"a,b\n1,2\n"):
         with zipfile.ZipFile(payload, "w") as archive:
             archive.writestr(member_name, data)
     return payload.getvalue()
+
+
+@pytest.mark.parametrize("publication_kind", ["direct", "oa", "supplementary"])
+def test_download_candidate_rejects_equal_size_in_place_content_mutation(
+    monkeypatch,
+    tmp_path,
+    publication_kind,
+):
+    out_dir = tmp_path / "out"
+    original = b"a,b\n1,2\n"
+    replacement = b"x,y\n9,8\n"
+    assert len(replacement) == len(original)
+    payload = (
+        original
+        if publication_kind == "direct"
+        else _archive_bytes(publication_kind, data=original)
+    )
+    content_mutated = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    real_write_source_sidecar = _download._write_source_sidecar
+
+    def mutate_content_then_write_sidecar(cand, output, downloads=None):
+        nonlocal content_mutated
+        entry_fd = os.open(
+            "data.csv",
+            os.O_WRONLY | os.O_NOFOLLOW,
+            dir_fd=output.fd,
+        )
+        try:
+            opened = os.fstat(entry_fd)
+            os.lseek(entry_fd, 0, os.SEEK_SET)
+            os.write(entry_fd, replacement)
+            os.fsync(entry_fd)
+            current = os.fstat(entry_fd)
+        finally:
+            os.close(entry_fd)
+        assert (opened.st_dev, opened.st_ino) == (
+            current.st_dev,
+            current.st_ino,
+        )
+        assert opened.st_size == current.st_size
+        content_mutated = True
+        return real_write_source_sidecar(
+            cand,
+            output,
+            downloads=downloads,
+        )
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_write_source_sidecar",
+        mutate_content_then_write_sidecar,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if publication_kind == "direct":
+        candidate["tabular_files"] = [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }]
+    else:
+        archive = {
+            "url": f"https://example.test/{publication_kind}",
+            "name": f"{publication_kind}.archive",
+        }
+        if publication_kind == "oa":
+            candidate["oa_package"] = archive
+        else:
+            candidate["supplementary_archive"] = archive
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert content_mutated
+    assert (out_dir / "data.csv").read_bytes() == replacement
+    assert summary["downloaded"] == []
+    assert len(summary["skipped"]) == 1
+    assert "content changed" in summary["skipped"][0]["reason"]
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])

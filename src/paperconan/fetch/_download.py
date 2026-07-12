@@ -44,6 +44,7 @@ class _PublishedOutputFile:
     filename: str
     size: int
     identity: tuple[int, int]
+    sha256: str
 
     def display_path(self, output: _PinnedOutputDirectory) -> str:
         return os.path.join(output.path, self.filename)
@@ -69,6 +70,39 @@ class _PinnedOutputDirectory:
             or self._opened.st_ino != current.st_ino
         ):
             raise ValueError("fetch output directory changed during publication")
+
+
+@dataclass
+class _SidecarPublication:
+    output: _PinnedOutputDirectory
+    backup_name: str | None
+    active: bool = True
+
+    def commit(self) -> None:
+        if not self.active:
+            return
+        if self.backup_name is not None:
+            os.unlink(self.backup_name, dir_fd=self.output.fd)
+            self.backup_name = None
+        self.active = False
+
+    def rollback(self) -> None:
+        if not self.active:
+            return
+        if self.backup_name is None:
+            try:
+                os.unlink(SOURCE_SIDECAR, dir_fd=self.output.fd)
+            except FileNotFoundError:
+                pass
+        else:
+            os.replace(
+                self.backup_name,
+                SOURCE_SIDECAR,
+                src_dir_fd=self.output.fd,
+                dst_dir_fd=self.output.fd,
+            )
+            self.backup_name = None
+        self.active = False
 
 
 class _DownloadStagingFile:
@@ -428,6 +462,7 @@ def _write_collision_safe(
             filename=filename,
             size=current.st_size,
             identity=(current.st_dev, current.st_ino),
+            sha256=content_sha256,
         )
         if _return_entry:
             return entry
@@ -435,7 +470,8 @@ def _write_collision_safe(
 
     out_dir.verify()
     stem, suffix = os.path.splitext(os.path.basename(name))
-    digest = hashlib.sha256(data).hexdigest()[:10]
+    content_sha256 = hashlib.sha256(data).hexdigest()
+    digest = content_sha256[:10]
     temp_name = None
     temp_fd = -1
     try:
@@ -621,24 +657,72 @@ def _verify_published_output_file(
     output: _PinnedOutputDirectory,
     entry: _PublishedOutputFile,
 ) -> None:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _UnstableRegularFileError(
+            "published output verification is unavailable"
+        )
     try:
-        current = os.stat(
+        fd = os.open(
             entry.filename,
+            os.O_RDONLY | nofollow,
             dir_fd=output.fd,
-            follow_symlinks=False,
         )
     except (OSError, TypeError, NotImplementedError) as exc:
         raise _UnstableRegularFileError(
-            "extracted archive entry is unavailable"
+            "published output entry is unavailable"
         ) from exc
-    if (
-        not stat.S_ISREG(current.st_mode)
-        or current.st_size != entry.size
-        or (current.st_dev, current.st_ino) != entry.identity
-    ):
-        raise _UnstableRegularFileError(
-            "extracted archive entry is not a stable regular file"
-        )
+    try:
+        opened = os.fstat(fd)
+        try:
+            current = os.stat(
+                entry.filename,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise _UnstableRegularFileError(
+                "published output entry is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or opened.st_size != entry.size
+            or current.st_size != entry.size
+            or (opened.st_dev, opened.st_ino) != entry.identity
+            or (current.st_dev, current.st_ino) != entry.identity
+        ):
+            raise _UnstableRegularFileError(
+                "published output entry is not a stable regular file"
+            )
+        digest = hashlib.sha256()
+        with os.fdopen(os.dup(fd), "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        try:
+            final = os.stat(
+                entry.filename,
+                dir_fd=output.fd,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise _UnstableRegularFileError(
+                "published output entry is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or final.st_size != entry.size
+            or (final.st_dev, final.st_ino) != entry.identity
+        ):
+            raise _UnstableRegularFileError(
+                "published output entry is not a stable regular file"
+            )
+        if digest.hexdigest() != entry.sha256:
+            raise _UnstableRegularFileError(
+                "published output entry content changed during publication"
+            )
+    finally:
+        os.close(fd)
 
 
 def _download_oa_package(
@@ -758,12 +842,20 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
     if not isinstance(out_dir, _PinnedOutputDirectory):
         try:
             with _pinned_output_directory(out_dir) as output:
-                _write_source_sidecar(cand, output, downloads=downloads)
+                publication = _write_source_sidecar(
+                    cand,
+                    output,
+                    downloads=downloads,
+                )
+                if publication is not None:
+                    publication.commit()
         except OSError:
             pass
         return
     temp_name = None
+    backup_name = None
     temp_fd = -1
+    publication = None
     try:
         out_dir.verify()
         try:
@@ -775,7 +867,7 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
         except FileNotFoundError:
             current = None
         if current is not None and not stat.S_ISREG(current.st_mode):
-            return
+            return None
         temp_name = f".paperconan-sidecar-{secrets.token_hex(8)}"
         temp_fd = os.open(
             temp_name,
@@ -789,6 +881,43 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
             fh.flush()
             os.fsync(fh.fileno())
         out_dir.verify()
+        if current is not None:
+            for _ in range(128):
+                backup_name = f".paperconan-sidecar-backup-{secrets.token_hex(8)}"
+                try:
+                    os.link(
+                        SOURCE_SIDECAR,
+                        backup_name,
+                        src_dir_fd=out_dir.fd,
+                        dst_dir_fd=out_dir.fd,
+                        follow_symlinks=False,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise FileExistsError(
+                    "could not retain prior provenance sidecar"
+                )
+            retained = os.stat(
+                backup_name,
+                dir_fd=out_dir.fd,
+                follow_symlinks=False,
+            )
+            current = os.stat(
+                SOURCE_SIDECAR,
+                dir_fd=out_dir.fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(retained.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or retained.st_dev != current.st_dev
+                or retained.st_ino != current.st_ino
+            ):
+                raise _UnstableRegularFileError(
+                    "provenance sidecar changed during publication"
+                )
         os.replace(
             temp_name,
             SOURCE_SIDECAR,
@@ -796,15 +925,33 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
             dst_dir_fd=out_dir.fd,
         )
         temp_name = None
+        publication = _SidecarPublication(
+            output=out_dir,
+            backup_name=backup_name,
+        )
+        backup_name = None
         out_dir.verify()
+        return publication
     except (OSError, ValueError):
-        pass  # provenance is best-effort; never fail a download over it
+        if publication is not None:
+            try:
+                publication.rollback()
+            except (OSError, ValueError) as exc:
+                raise _UnstableRegularFileError(
+                    "provenance sidecar rollback unavailable"
+                ) from exc
+        return None  # provenance is best-effort when no state was replaced
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
         if temp_name is not None:
             try:
                 os.unlink(temp_name, dir_fd=out_dir.fd)
+            except FileNotFoundError:
+                pass
+        if backup_name is not None:
+            try:
+                os.unlink(backup_name, dir_fd=out_dir.fd)
             except FileNotFoundError:
                 pass
 
@@ -967,12 +1114,28 @@ def download_candidate(
         by_file = {}
         for entry in provenance_files:
             by_file.setdefault(entry["file"], entry)
-        _write_source_sidecar(cand, output, downloads=list(by_file.values()))
+        sidecar_publication = None
         try:
             for entry in published_outputs:
                 _verify_published_output_file(output, entry)
             output.verify()
+            sidecar_publication = _write_source_sidecar(
+                cand,
+                output,
+                downloads=list(by_file.values()),
+            )
+            for entry in published_outputs:
+                _verify_published_output_file(output, entry)
+            output.verify()
         except (OSError, ValueError) as exc:
+            if sidecar_publication is not None:
+                try:
+                    sidecar_publication.rollback()
+                except (OSError, ValueError) as rollback_exc:
+                    exc = _UnstableRegularFileError(
+                        "provenance sidecar rollback unavailable: "
+                        f"{rollback_exc}"
+                    )
             if not any(
                 str(exc) in str(item.get("reason") or "")
                 for item in skipped
@@ -983,14 +1146,29 @@ def download_candidate(
                 })
             downloaded = []
         else:
-            unique_outputs = list({
-                entry.filename: entry
-                for entry in published_outputs
-            }.values())
-            downloaded = [
-                entry.display_path(output)
-                for entry in unique_outputs
-            ]
+            try:
+                if sidecar_publication is not None:
+                    sidecar_publication.commit()
+            except (OSError, ValueError) as exc:
+                if sidecar_publication is not None:
+                    try:
+                        sidecar_publication.rollback()
+                    except (OSError, ValueError):
+                        pass
+                skipped.append({
+                    "name": cand.get("cand_id"),
+                    "reason": f"provenance sidecar commit failed: {exc}",
+                })
+                downloaded = []
+            else:
+                unique_outputs = list({
+                    entry.filename: entry
+                    for entry in published_outputs
+                }.values())
+                downloaded = [
+                    entry.display_path(output)
+                    for entry in unique_outputs
+                ]
         return {
             "cand_id": cand.get("cand_id"),
             "out_dir": output.path,
