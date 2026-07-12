@@ -1655,6 +1655,61 @@ def detect_repeated_decimals(values, label):
     return dict(label=label, n=n, n_unique=len(counts), top=flags)
 
 
+_TAIL_CLUSTER_MIN_N = int(os.environ.get("PAPERCONAN_TAIL_CLUSTER_MIN_N", "100"))
+_TAIL_CLUSTER_SHARE = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_SHARE", "0.40"))
+
+
+def detect_decimal_tail_clustering(values, label, top_k=6):
+    """A few multi-digit fractional TAILS recurring far above chance across many
+    INDEPENDENT high-precision values — a fingerprint of numbers drawn from a small set
+    of fractional parts (copied/derived) rather than independently measured.
+
+    Distinct from detect_last_digit (a single last digit), detect_repeated_decimals
+    (2-digit endings, no concentration test) and within_col_value_duplication (repeated
+    whole VALUES, not shared tails). Gated hard: only values with >=3 fractional digits
+    (at read precision) count; needs >=_TAIL_CLUSTER_MIN_N of them; the top-`top_k`
+    3-digit tails must cover >=_TAIL_CLUSTER_SHARE of them; AND the full fractional parts
+    must be MOSTLY DISTINCT — otherwise a quantized / common-denominator column (values
+    like k/7 or eighths) trivially shares tails and would false-positive. Large-magnitude
+    values (>=1e7) are skipped: read-precision noise there reaches the captured digits."""
+    tails, full = [], []
+    for v in values:
+        av = abs(float(v))
+        if av >= 1e7:
+            continue
+        s = f"{av:.10f}".rstrip("0")
+        if "." not in s:
+            continue
+        frac = s.split(".")[1]
+        if len(frac) >= 3:
+            tails.append(frac[-3:])
+            full.append(frac)
+    n = len(tails)
+    if n < _TAIL_CLUSTER_MIN_N:
+        return None
+    # Quantized / common-denominator data (few distinct fractions) shares tails trivially.
+    # The genuine fingerprint is MANY independent values that nonetheless collide on a few
+    # tails, so require the full fractional parts to be mostly distinct.
+    if len(set(full)) < max(50, n // 2):
+        return None
+    counts = Counter(tails)
+    top = counts.most_common(top_k)
+    top_sum = sum(c for _, c in top)
+    share = top_sum / n
+    if share < _TAIL_CLUSTER_SHARE:
+        return None
+    top_tails = [t for t, _ in top]
+    # complementary pairs (t + t' = 1000) among the dominant tails — a stronger sub-signal
+    comp = sum(1 for t in top_tails if int(t) < 500 and f"{1000 - int(t):03d}" in top_tails)
+    return dict(label=label, n=n, n_unique=len(counts), n_distinct_fraction=len(set(full)),
+                top=[[t, c] for t, c in top], top_share=round(share, 4),
+                complementary_pairs=comp, severity="high",
+                rule=(f"the {top_k} most common 3-digit fractional tails cover "
+                      f"{top_sum}/{n} ({share:.0%}) of the high-precision values "
+                      f"(uniform expectation ~{100 * top_k / 1000:.1f}%), which have "
+                      f"{len(set(full))} distinct fractional parts"))
+
+
 def benjamini_hochberg(pvals, alpha=0.05):
     """Benjamini-Hochberg step-up FDR. Returns (adjusted_pvals, significant_flags),
     both in the original order. Adjusted p (q-value) is the BH-corrected p; a sheet
@@ -3121,7 +3176,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     cross_sheet_findings += detect_scaled_row_reuse(grid_sheets, profile=profile)
     _attach_benign(cross_sheet_findings)
 
-    digit_reports, decimal_reports = [], []
+    digit_reports, decimal_reports, tail_cluster_reports = [], [], []
     for key, nums in per_sheet_numbers.items():
         d = detect_last_digit(nums, label=f"{key[0]}::{key[1]}")
         if d:
@@ -3129,6 +3184,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         dec = detect_repeated_decimals(nums, label=f"{key[0]}::{key[1]}")
         if dec:
             decimal_reports.append(dec)
+        tc = detect_decimal_tail_clustering(nums, label=f"{key[0]}::{key[1]}")
+        if tc:
+            tail_cluster_reports.append(tc)
 
     # Multiple-testing control: dozens of per-sheet χ² tests run at once, so a raw
     # p-threshold over-reports. Attach a BH-adjusted q-value + significance flag.
@@ -3153,6 +3211,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
+               decimal_tail_clusters=tail_cluster_reports,
                cross_sheet_findings=cross_sheet_findings)
     os.makedirs(out_dir, exist_ok=True)
     if write_json:
