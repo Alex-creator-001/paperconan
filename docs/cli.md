@@ -107,5 +107,7 @@ paperconan report data/audit/scan.json --verdict verdict.json --out adjudication
 | `PAPERCONAN_MAX_IMAGE_MB` | `100` | 单个图像资产读取前的文件大小上限 |
 | `PAPERCONAN_MAX_IMAGE_PIXELS` | `100000000` | 单图或单个 PDF 渲染页的解码像素上限 |
 | `PAPERCONAN_MAX_IMAGE_ASSETS` | `1000` | 单次扫描最多登记的去重图像资产数 |
+| `PAPERCONAN_MAX_IMAGE_TOTAL_MB` | `1500` | 单次扫描的图像产物总预算，覆盖原图副本、预览、PDF 渲染暂存、诊断原始裁剪和拼图证据；重跑替换按已有最终文件体积抵扣 |
 | `PAPERCONAN_MAX_IMAGE_FINDINGS` | `200` | 可选确定性图像提示上限；超出部分写入 `scan_errors` |
+| `PAPERCONAN_MAX_IMAGE_COMPARISONS` | `100000` | 可选确定性图像提示在整次扫描中最多尝试的区域比较数；达到后停止并写入 `scan_errors` |
 | `PAPERCONAN_MAX_IMAGE_EVIDENCE_MB` | `20` | 一份判定后 HTML 中登记预览的总内嵌预算 |

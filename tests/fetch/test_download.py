@@ -451,6 +451,103 @@ def test_direct_files_with_same_name_publish_distinct_files_and_provenance(
     } == expected_sources
 
 
+def test_download_candidate_pins_output_root_across_publications(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    displaced = tmp_path / "displaced-out"
+    payloads = {
+        "https://example.test/Fig1.png": b"first-image",
+        "https://example.test/Fig2.png": b"second-image",
+    }
+
+    def fake_download(url, dest, **kwargs):
+        data = payloads[url]
+        Path(dest).write_bytes(data)
+        return {"ok": True, "path": dest, "size": len(data), "source_url": url}
+
+    real_write_collision_safe = _download._write_collision_safe
+    publications = 0
+
+    def publish_then_swap(output, name, data):
+        nonlocal publications
+        result = real_write_collision_safe(output, name, data)
+        publications += 1
+        if publications == 1:
+            out_dir.rename(displaced)
+            out_dir.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(
+        _download,
+        "_write_collision_safe",
+        publish_then_swap,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "image_files": [
+            {"name": Path(url).name, "download_url": url}
+            for url in payloads
+        ],
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(out_dir),
+        include_images=True,
+    )
+
+    assert summary["skipped"]
+    assert list(outside.iterdir()) == []
+    assert (displaced / "Fig1.png").read_bytes() == b"first-image"
+    assert not (displaced / "Fig2.png").exists()
+
+
+def test_provenance_sidecar_does_not_follow_or_replace_final_symlink(
+    monkeypatch,
+    tmp_path,
+):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    sentinel = tmp_path / "sentinel.json"
+    sentinel.write_text("outside-sentinel", encoding="utf-8")
+    sidecar = out_dir / _download.SOURCE_SIDECAR
+    sidecar.symlink_to(sentinel)
+
+    def fake_download(url, dest, **kwargs):
+        Path(dest).write_bytes(b"image")
+        return {"ok": True, "path": dest, "size": 5, "source_url": url}
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+        "image_files": [{
+            "name": "Fig1.png",
+            "download_url": "https://example.test/Fig1.png",
+        }],
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(out_dir),
+        include_images=True,
+    )
+
+    assert len(summary["downloaded"]) == 1
+    assert sidecar.is_symlink()
+    assert sidecar.readlink() == sentinel
+    assert sentinel.read_text(encoding="utf-8") == "outside-sentinel"
+    assert not list(out_dir.glob(".paperconan-sidecar-*"))
+
+
 def test_direct_download_does_not_follow_existing_destination_symlink(
     monkeypatch,
     tmp_path,
@@ -573,7 +670,11 @@ def test_write_collision_safe_does_not_clobber_file_created_during_publish(
 
     def racing_link(src, dst, *args, **kwargs):
         nonlocal raced
-        if not raced and Path(dst) == candidate:
+        if (
+            not raced
+            and Path(dst).name == candidate.name
+            and kwargs.get("dst_dir_fd") is not None
+        ):
             raced = True
             candidate.write_bytes(b"concurrent")
             raise FileExistsError(dst)

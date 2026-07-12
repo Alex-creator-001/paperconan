@@ -22,7 +22,12 @@
 - Renderer file reads are limited to paths registered in `scan.json image_assets[]` and rooted under the scan artifact directory.
 - All user-facing and committed language must remain neutral: statistical signal, data inconsistency, unresolved image similarity, or request for clarification.
 - Existing numeric-only CLI, JSON, report appearance, fetch defaults, and library calls remain backward compatible.
-- New resource limits are `PAPERCONAN_MAX_IMAGE_MB`, `PAPERCONAN_MAX_IMAGE_PIXELS`, `PAPERCONAN_MAX_IMAGE_ASSETS`, `PAPERCONAN_MAX_IMAGE_FINDINGS`, and `PAPERCONAN_MAX_IMAGE_EVIDENCE_MB`.
+- New resource limits are `PAPERCONAN_MAX_IMAGE_MB`, `PAPERCONAN_MAX_IMAGE_PIXELS`,
+  `PAPERCONAN_MAX_IMAGE_ASSETS`, `PAPERCONAN_MAX_IMAGE_TOTAL_MB`,
+  `PAPERCONAN_MAX_IMAGE_FINDINGS`, `PAPERCONAN_MAX_IMAGE_COMPARISONS`, and
+  `PAPERCONAN_MAX_IMAGE_EVIDENCE_MB`. The total artifact budget defaults to `1500` MiB and covers
+  native copies, previews, PDF render staging, diagnostic native crops, and montage evidence. The
+  scan-wide attempted-comparison ceiling defaults to `100000`.
 
 ---
 
@@ -2377,7 +2382,11 @@ paperconan data/ --images --image-diagnostics
 paperconan report data/audit/scan.json --verdict verdict.json --out adjudication.html
 ```
 
-Add the five new resource-limit rows to `docs/cli.md`. In `docs/reports.md`, state that image evidence is embedded only from registered bounded previews and appears beside numeric evidence in the same finding list. In `README.md`, add image review to the completed workflow without claiming autonomous semantic judgment.
+Add the image resource-limit rows to `docs/cli.md`, including the total artifact budget and
+scan-wide attempted-comparison ceiling. In `docs/reports.md`, state that image evidence is embedded
+only from registered bounded previews and appears beside numeric evidence in the same finding list.
+In `README.md`, add image review to the completed workflow without claiming autonomous semantic
+judgment.
 
 - [ ] **Step 8: Run documentation, workflow, and full regression tests**
 

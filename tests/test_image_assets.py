@@ -120,6 +120,81 @@ def test_exact_duplicate_files_are_one_asset_with_all_source_names(tmp_path):
     assert assets[0]["source_files"] == ["A.png", "B.png"]
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["-1", "inf", "not-a-number", "1e10000", "1e10000000"],
+)
+def test_invalid_total_image_artifact_budget_fails_closed(
+    tmp_path,
+    monkeypatch,
+    value,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_TOTAL_MB", value)
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert assets == []
+    assert errors == [{
+        "error": "invalid PAPERCONAN_MAX_IMAGE_TOTAL_MB limit",
+    }]
+    assert not (output / "images").exists()
+
+
+def test_total_image_artifact_budget_removes_rejected_staging(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_TOTAL_MB", "0")
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert assets == []
+    assert len(errors) == 1
+    assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in errors[0]["error"]
+    assert "budget exhausted" in errors[0]["error"]
+    assert not list((output / "images").rglob("*.*"))
+
+
+def test_total_image_artifact_budget_credits_rerun_replacements(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    first, errors = _assets.prepare_image_assets(str(source), str(output))
+    assert errors == []
+    total = sum(
+        (output / first[0][key]).stat().st_size
+        for key in ("path", "preview_path")
+    )
+    monkeypatch.setenv(
+        "PAPERCONAN_MAX_IMAGE_TOTAL_MB",
+        str(total / (1024 * 1024)),
+    )
+    _image(source / "FigB.png", color=(180, 60, 20))
+
+    second, rerun_errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+    )
+
+    assert second == first
+    assert len(rerun_errors) == 1
+    assert rerun_errors[0]["file"] == "FigB.png"
+    assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in rerun_errors[0]["error"]
+    assert "budget exhausted" in rerun_errors[0]["error"]
+
+
 def test_prepare_image_assets_renders_pdf_pages(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -182,26 +257,35 @@ def test_pdf_rendered_temp_is_removed_after_each_registration(tmp_path, monkeypa
     output = tmp_path / "audit"
     observed_temp_dirs = []
     observed_temp_files = []
-    real_sha256 = _assets._sha256
     real_record_image = _assets._record_image
     synthetic_digest = "a" * 64
 
-    def observe_and_hash(path):
-        observed_temp_dirs.append(path.parent)
-        observed_temp_files.append(
-            sorted(item.name for item in path.parent.glob("*.png"))
-        )
-        if path.name in {"supp.p1.png", "supp.p2.png"}:
+    def observe_and_hash(_file_fd):
+        temp_dirs = list(output.glob(".paperconan-rendered-*"))
+        assert len(temp_dirs) == 1
+        temp_dir = temp_dirs[0]
+        opened = _assets.os.fstat(_file_fd)
+        staged_files = list(temp_dir.glob("*.png"))
+        if not any(
+            (current := staged.stat()).st_dev == opened.st_dev
+            and current.st_ino == opened.st_ino
+            for staged in staged_files
+        ):
             return synthetic_digest
-        return real_sha256(path)
+        observed_temp_dirs.append(temp_dir)
+        observed_temp_files.append(
+            sorted(item.name for item in staged_files)
+        )
+        if staged_files[0].name == "supp.p3.png":
+            return "b" * 64
+        return synthetic_digest
 
     def reject_third_page(path, *args, **kwargs):
         if path.name == "supp.p3.png":
             raise ValueError("synthetic page rejection")
         return real_record_image(path, *args, **kwargs)
 
-    monkeypatch.setattr(_assets, "_sha256", observe_and_hash)
-    monkeypatch.setattr(_assets, "_sha256_fd", lambda _fd: synthetic_digest)
+    monkeypatch.setattr(_assets, "_sha256_fd", observe_and_hash)
     monkeypatch.setattr(_assets, "_record_image", reject_third_page)
 
     assets, errors = _assets.prepare_image_assets(str(source), str(output))
@@ -258,6 +342,63 @@ def test_pdf_staging_does_not_follow_or_delete_images_symlink(
         Path(".rendered/sentinel.txt"),
     ]
     assert not list(output.glob(".paperconan-rendered-*"))
+
+
+def test_pdf_render_staging_respects_total_image_artifact_budget(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "supp.pdf").write_bytes(b"synthetic-pdf")
+    events = _fake_pdfium(monkeypatch, [(72, 72)])
+    output = tmp_path / "audit"
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_TOTAL_MB", "0")
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert assets == []
+    assert len(errors) == 1
+    assert errors[0]["file"] == "supp.pdf"
+    assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in errors[0]["error"]
+    assert events["rendered"] == [1]
+    assert not list(output.glob(".paperconan-rendered-*"))
+    assert not list((output / "images").rglob("*.*"))
+
+
+def test_pdf_render_staging_is_created_under_pinned_root_fd(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "supp.pdf").write_bytes(b"synthetic-pdf")
+    _fake_pdfium(monkeypatch, [(72, 72)])
+    output = tmp_path / "audit"
+    real_mkdir = _assets.os.mkdir
+    staging_dir_fds = []
+
+    def observe_mkdir(path, mode=0o777, *, dir_fd=None):
+        if Path(path).name.startswith(".paperconan-rendered-"):
+            staging_dir_fds.append(dir_fd)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(_assets.os, "mkdir", observe_mkdir)
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            observe_mkdir if function is real_mkdir else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert errors == []
+    assert assets
+    assert staging_dir_fds
+    assert all(directory_fd is not None for directory_fd in staging_dir_fds)
 
 
 def test_failed_pdf_pages_consume_scan_wide_attempt_budget(
@@ -353,8 +494,9 @@ def test_partial_page_cleanup_failure_still_consumes_attempt_budget(
         def __init__(self, pdf_name):
             self.pdf_name = pdf_name
 
-        def save(self, path, format=None):
-            path.write_bytes(b"partial-page")
+        def save(self, destination, format=None):
+            destination.write(b"partial-page")
+            destination.flush()
             raise ValueError(f"{self.pdf_name} save failed")
 
         def close(self):
@@ -399,22 +541,19 @@ def test_partial_page_cleanup_failure_still_consumes_attempt_budget(
         def close(self):
             events["documents_closed"].append(self.pdf_name)
 
-    real_unlink = Path.unlink
+    real_unlink_at = _assets._unlink_at
 
-    def fail_partial_page_unlink(path, *args, **kwargs):
-        if (
-            path.name == "a.p1.png"
-            and path.parent.name.startswith(".paperconan-rendered-")
-        ):
+    def fail_partial_page_unlink(name, directory_fd):
+        if name == "a.p1.png":
             raise OSError("cleanup failed")
-        return real_unlink(path, *args, **kwargs)
+        return real_unlink_at(name, directory_fd)
 
     monkeypatch.setitem(
         sys.modules,
         "pypdfium2",
         types.SimpleNamespace(PdfDocument=FailingDocument),
     )
-    monkeypatch.setattr(Path, "unlink", fail_partial_page_unlink)
+    monkeypatch.setattr(_assets, "_unlink_at", fail_partial_page_unlink)
     monkeypatch.setattr(_assets, "_MAX_IMAGE_ASSETS", 1)
     output = tmp_path / "audit"
 
@@ -725,6 +864,55 @@ def test_output_asset_directory_symlink_outside_artifact_root_is_rejected(
     assert errors
     assert "outside artifact root" in errors[0]["error"]
     assert list(outside.iterdir()) == []
+
+
+def test_output_artifact_root_symlink_is_rejected(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output = tmp_path / "audit"
+    output.symlink_to(outside, target_is_directory=True)
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert assets == []
+    assert errors
+    assert "artifact root" in errors[0]["error"]
+    assert list(outside.iterdir()) == []
+
+
+def test_asset_preparation_pins_root_across_all_assets(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    _image(source / "FigB.png", color=(180, 60, 20))
+    output = tmp_path / "audit"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    displaced = tmp_path / "displaced-audit"
+    real_record_image = _assets._record_image
+    recorded = 0
+
+    def record_then_swap(*args, **kwargs):
+        nonlocal recorded
+        result = real_record_image(*args, **kwargs)
+        recorded += 1
+        if recorded == 1:
+            output.rename(displaced)
+            output.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(_assets, "_record_image", record_then_swap)
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert assets
+    assert errors
+    assert any("artifact root" in item["error"] for item in errors)
+    assert list(outside.iterdir()) == []
+    assert (displaced / assets[0]["path"]).is_file()
 
 
 def test_failed_source_validation_leaves_no_published_asset_pair(tmp_path):
@@ -1091,9 +1279,13 @@ def test_rollback_restore_failure_preserves_recovery_backup(
 
     assert rerun_assets == []
     assert rerun_errors
-    assert "rollback failed" in rerun_errors[0]["error"]
+    error = rerun_errors[0]["error"]
+    assert "rollback failed" in error
+    assert "synthetic native restore failure" in error
     backups = list(native.parent.glob(".paperconan-image-*.backup"))
     assert len(backups) == 1
+    assert f"images/native/{backups[0].name}" in error
+    assert str(tmp_path) not in error
     assert backups[0].is_symlink()
     assert backups[0].readlink() == native_target
     assert native_target.read_bytes() == b"native-sentinel"
@@ -1151,6 +1343,45 @@ def test_secure_dirfd_capability_unavailable_is_explicit(
     assert "secure image asset publication is unavailable" in errors[0]["error"]
     assert "dir_fd" in errors[0]["error"]
     assert not (output / "images").exists()
+
+
+def test_secure_dirfd_runtime_error_includes_sanitized_context(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    output.mkdir()
+    original_open = _assets.os.open
+
+    def reject_root_open(path, flags, *args, **kwargs):
+        if Path(path) == output:
+            raise NotImplementedError(
+                "synthetic runtime failure /private/sensitive token=top-secret"
+            )
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(_assets.os, "open", reject_root_open)
+    monkeypatch.setattr(
+        _assets.os,
+        "supports_dir_fd",
+        frozenset(
+            reject_root_open if function is original_open else function
+            for function in _assets.os.supports_dir_fd
+        ),
+    )
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert assets == []
+    assert len(errors) == 1
+    error = errors[0]["error"]
+    assert "NotImplementedError" in error
+    assert "synthetic runtime failure" in error
+    assert "/private/sensitive" not in error
+    assert "top-secret" not in error
 
 
 def test_oversized_pdf_is_rejected_before_pdfium_open(tmp_path, monkeypatch):

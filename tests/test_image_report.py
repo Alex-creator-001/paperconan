@@ -415,7 +415,8 @@ def test_report_shares_preview_budget_across_image_findings(tmp_path, monkeypatc
             },
         ],
     }
-    budget_mb = (len(PNG_1X1) + 0.5) / (1024 * 1024)
+    encoded_size = len(base64.b64encode(PNG_1X1))
+    budget_mb = (encoded_size + 0.5) / (1024 * 1024)
     monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_EVIDENCE_MB", str(budget_mb))
 
     html = render_adjudicated_report(scan, verdict, artifact_dir=str(tmp_path))
@@ -460,6 +461,73 @@ def test_evidence_budget_can_consume_is_non_mutating():
     assert budget.can_consume(5)
     assert not budget.can_consume(6)
     assert budget.used_bytes == 0
+
+
+def test_registered_preview_preflights_encoded_payload_budget_before_read(
+    tmp_path,
+    monkeypatch,
+):
+    scan = _scan(tmp_path)
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    raw_size = preview.stat().st_size
+    encoded_size = 4 * ((raw_size + 2) // 3)
+    assert encoded_size > raw_size
+    budget = EvidenceBudget(encoded_size - 1)
+    original_fdopen = _evidence.os.fdopen
+    payload_read = False
+
+    class TrackingFile:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            self._fh.close()
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def read(self, requested=-1):
+            nonlocal payload_read
+            if requested == raw_size + 1:
+                payload_read = True
+            return self._fh.read(requested)
+
+    monkeypatch.setattr(
+        _evidence.os,
+        "fdopen",
+        lambda fd, *args, **kwargs: TrackingFile(
+            original_fdopen(fd, *args, **kwargs)
+        ),
+    )
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is None
+    assert not payload_read
+    assert budget.used_bytes == 0
+
+
+def test_registered_preview_charges_actual_base64_payload_length(tmp_path):
+    scan = _scan(tmp_path)
+    preview = tmp_path / scan["image_assets"][0]["preview_path"]
+    encoded_size = 4 * ((preview.stat().st_size + 2) // 3)
+    budget = EvidenceBudget(encoded_size)
+
+    uri = registered_preview_data_uri(
+        scan["image_assets"][0],
+        str(tmp_path),
+        budget,
+    )
+
+    assert uri is not None
+    assert budget.used_bytes == len(uri.split(",", 1)[1]) == encoded_size
 
 
 def test_zero_preview_budget_skips_pillow_and_payload_read(tmp_path, monkeypatch):
@@ -584,7 +652,7 @@ def test_registered_preview_reads_payload_from_stable_validated_descriptor(
     payload = base64.b64decode(uri.split(",", 1)[1])
     with original_open(io.BytesIO(payload)) as embedded:
         assert embedded.getpixel((0, 0)) == (255, 0, 0)
-    assert budget.used_bytes == displaced.stat().st_size
+    assert budget.used_bytes == len(base64.b64encode(payload))
 
 
 def test_registered_preview_short_read_does_not_consume_budget(

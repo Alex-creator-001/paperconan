@@ -32,6 +32,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from fractions import Fraction
+from pathlib import Path
 
 import openpyxl
 import numpy as np
@@ -2632,6 +2633,16 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         raise PaperconanInputError(
             f"no {supported} files in {in_dir}"
         )
+    if images:
+        from .image._dependencies import preflight_image_dependencies
+        image_pdfs = any(
+            path.is_file() and path.suffix.lower() == ".pdf"
+            for path in Path(in_dir).iterdir()
+        )
+        preflight_image_dependencies(
+            render_pdf=image_pdfs,
+            diagnostics=image_diagnostics,
+        )
 
     report_blocks = []
     findings_omitted_total = 0   # findings dropped by the per-block / global finding caps
@@ -2800,19 +2811,34 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     image_findings = []
     if images:
         from .image._assets import prepare_image_assets
-        image_assets, image_errors = prepare_image_assets(in_dir, out_dir)
-        scan_errors.extend(image_errors)
-        if image_diagnostics:
-            try:
-                from .image._diagnostics import diagnose_image_assets
-                image_findings, diagnostic_errors = diagnose_image_assets(
-                    image_assets, out_dir
-                )
-                scan_errors.extend(diagnostic_errors)
-            except Exception as exc:
-                scan_errors.append({
-                    "error": f"optional image diagnostics unavailable: {exc}",
-                })
+        from .image._budget import ImageArtifactBudget
+        try:
+            image_budget = ImageArtifactBudget.from_environment()
+        except ValueError as exc:
+            scan_errors.append({"error": str(exc)})
+        else:
+            image_assets, image_errors = prepare_image_assets(
+                in_dir,
+                out_dir,
+                artifact_budget=image_budget,
+            )
+            scan_errors.extend(image_errors)
+            if image_diagnostics:
+                try:
+                    from .image import ImageDependencyError
+                    from .image._diagnostics import diagnose_image_assets
+                    image_findings, diagnostic_errors = diagnose_image_assets(
+                        image_assets,
+                        out_dir,
+                        artifact_budget=image_budget,
+                    )
+                    scan_errors.extend(diagnostic_errors)
+                except ImageDependencyError:
+                    raise
+                except Exception as exc:
+                    scan_errors.append({
+                        "error": f"optional image diagnostics unavailable: {exc}",
+                    })
 
     out = dict(tool="paperconan",
                tool_version=_version(),
@@ -2993,11 +3019,14 @@ def main():
     paper = None
     if args.doi or args.title:
         paper = {"doi": args.doi, "title": args.title}
+    from .image import ImageDependencyError
     try:
         res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
                        paper=paper, profile=args.profile, images=args.images,
                        image_diagnostics=args.image_diagnostics)
     except PaperconanInputError as e:
+        sys.exit(str(e))
+    except ImageDependencyError as e:
         sys.exit(str(e))
     outputs = [f"{out_dir}/scan.json"]
     if write_html:

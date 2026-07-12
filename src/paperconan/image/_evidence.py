@@ -10,6 +10,11 @@ import secrets
 import stat
 import sys
 
+from ._budget import (
+    ImageArtifactBudget,
+    regular_file_size,
+)
+
 
 _SUPPORTED_PREVIEW_MIMES = frozenset({
     "image/avif",
@@ -37,6 +42,12 @@ class EvidenceBudget:
             return False
         self.used_bytes += size
         return True
+
+
+def _base64_encoded_size(raw_size: int) -> int:
+    if raw_size < 0:
+        raise ValueError("encoded evidence size cannot be negative")
+    return 4 * ((raw_size + 2) // 3)
 
 
 def _crop_encoding(image) -> tuple[str, str, dict]:
@@ -312,8 +323,51 @@ def _max_image_pixels() -> int:
     return value
 
 
+def _same_opened_entry(opened: os.stat_result, current: os.stat_result) -> bool:
+    return (
+        opened.st_dev == current.st_dev
+        and opened.st_ino == current.st_ino
+        and stat.S_IFMT(opened.st_mode) == stat.S_IFMT(current.st_mode)
+    )
+
+
+def _verify_open_artifact_chain(
+    root: Path,
+    root_fd: int,
+    opened_directories: list[tuple[int, str, int]],
+    final_parent_fd: int,
+    final_name: str,
+    final_fd: int,
+) -> None:
+    try:
+        current_root = os.stat(root, follow_symlinks=False)
+        if not _same_opened_entry(os.fstat(root_fd), current_root):
+            raise OSError("artifact root changed")
+        for parent_fd, name, child_fd in opened_directories:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not _same_opened_entry(os.fstat(child_fd), current):
+                raise OSError("artifact directory changed")
+        current_file = os.stat(
+            final_name,
+            dir_fd=final_parent_fd,
+            follow_symlinks=False,
+        )
+        if not _same_opened_entry(os.fstat(final_fd), current_file):
+            raise OSError("artifact file changed")
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise ValueError(
+            "registered evidence path is not a stable regular file "
+            "under artifact root"
+        ) from exc
+
+
 @contextmanager
-def _open_artifact_regular(root: Path, relative_path: Path):
+def _open_artifact_regular(
+    root: Path,
+    relative_path: Path,
+    *,
+    verify_stable: bool = False,
+):
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     parts = relative_path.parts
@@ -329,6 +383,7 @@ def _open_artifact_regular(root: Path, relative_path: Path):
             "under artifact root"
         )
     directory_fds: list[int] = []
+    opened_directories: list[tuple[int, str, int]] = []
     file_fd = -1
     fh = None
     try:
@@ -339,12 +394,14 @@ def _open_artifact_regular(root: Path, relative_path: Path):
             )
             directory_fds.append(parent_fd)
             for part in parts[:-1]:
-                parent_fd = os.open(
+                child_fd = os.open(
                     part,
                     os.O_RDONLY | directory | nofollow,
                     dir_fd=parent_fd,
                 )
-                directory_fds.append(parent_fd)
+                opened_directories.append((parent_fd, part, child_fd))
+                parent_fd = child_fd
+                directory_fds.append(child_fd)
             file_fd = os.open(
                 parts[-1],
                 os.O_RDONLY | nofollow,
@@ -361,11 +418,42 @@ def _open_artifact_regular(root: Path, relative_path: Path):
             ) from exc
         with fh:
             yield fh
+            if verify_stable:
+                _verify_open_artifact_chain(
+                    root,
+                    directory_fds[0],
+                    opened_directories,
+                    parent_fd,
+                    parts[-1],
+                    fh.fileno(),
+                )
     finally:
         if file_fd >= 0:
             os.close(file_fd)
         for directory_fd in reversed(directory_fds):
             os.close(directory_fd)
+
+
+@contextmanager
+def _open_registered_artifact_regular(
+    artifact_dir: str | None,
+    relative_path: object,
+    *,
+    verify_stable: bool = False,
+):
+    parts = _registered_relative_parts(relative_path)
+    if not artifact_dir or parts is None:
+        raise ValueError(
+            "registered evidence path is not a stable regular file "
+            "under artifact root"
+        )
+    root = Path(artifact_dir)
+    with _open_artifact_regular(
+        root,
+        Path(*parts),
+        verify_stable=verify_stable,
+    ) as fh:
+        yield fh
 
 
 def _registered_relative_parts(relative_path: object) -> tuple[str, ...] | None:
@@ -460,7 +548,8 @@ def registered_preview_data_uri(
             size = os.fstat(fh.fileno()).st_size
             if size > _max_image_bytes():
                 return None
-            if not budget.can_consume(size):
+            encoded_size = _base64_encoded_size(size)
+            if not budget.can_consume(encoded_size):
                 return None
             try:
                 from PIL import Image
@@ -481,9 +570,9 @@ def registered_preview_data_uri(
             payload = fh.read(size + 1)
             if len(payload) != size:
                 return None
-            if not budget.consume(size):
-                return None
             encoded = base64.b64encode(payload).decode("ascii")
+            if len(encoded) != encoded_size or not budget.consume(len(encoded)):
+                return None
     except (OSError, ValueError):
         return None
     metadata_mime = asset.get("preview_mime")
@@ -500,6 +589,7 @@ def write_native_pair_evidence(
     box_b: tuple[int, int, int, int],
     output_root: str,
     evidence_id: str,
+    artifact_budget: ImageArtifactBudget | None = None,
 ) -> dict[str, str]:
     from PIL import Image
 
@@ -511,6 +601,8 @@ def write_native_pair_evidence(
     ):
         raise ValueError("evidence_id must be a single path-safe name")
     root = Path(output_root).resolve()
+    budget = artifact_budget or ImageArtifactBudget.from_environment()
+    budget.initialize_from_root(root)
     source = Path(image_path).resolve()
     try:
         source_relative = source.relative_to(root)
@@ -592,12 +684,28 @@ def write_native_pair_evidence(
                     optimize=True,
                 )
                 staged.append((temp_name, temp_fd, preview_path.name))
+                existing_size = sum(
+                    regular_file_size(evidence_fd, final_name)
+                    for _, _, final_name in staged
+                )
+                staged_size = sum(
+                    os.fstat(temp_fd).st_size
+                    for _, temp_fd, _ in staged
+                )
+                budget.require_replacement(
+                    existing_size=existing_size,
+                    staged_size=staged_size,
+                )
                 _publish_staged_images(
                     root,
                     root_fd,
                     images_fd,
                     evidence_fd,
                     staged,
+                )
+                budget.commit_replacement(
+                    existing_size=existing_size,
+                    staged_size=staged_size,
                 )
             finally:
                 for temp_name, temp_fd, _ in staged:

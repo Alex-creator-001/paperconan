@@ -15,6 +15,7 @@ import html
 from html.parser import HTMLParser
 import os
 import re
+import tempfile
 from typing import Any
 
 from ._html import _all_findings, _esc, _render_cross_sheet_examples, _render_evidence_table
@@ -187,7 +188,10 @@ def _normalize_image_review(review: object, known_asset_ids: set[str]) -> dict[s
     return result
 
 
-def _iter_verdict_text(verdict: dict[str, Any]):
+def _iter_verdict_text(
+    verdict: dict[str, Any],
+    scan_findings: list[dict[str, Any]] | None = None,
+):
     def visible_values(
         source: dict[str, Any],
         keys: tuple[str, ...],
@@ -253,6 +257,21 @@ def _iter_verdict_text(verdict: dict[str, Any]):
             ("status", "note"),
             markdown=False,
         )
+    findings = verdict.get("findings")
+    if scan_findings is not None and isinstance(findings, list) and len(findings) > 1:
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            ref = finding.get("finding_ref")
+            if not isinstance(ref, dict) or _match_finding(scan_findings, ref) is not None:
+                continue
+            location = ref.get("sheet") or ref.get("file")
+            if location not in (None, ""):
+                yield str(location), False
+            for key in ("rows", "kind"):
+                value = ref.get(key)
+                if value not in (None, ""):
+                    yield str(value), False
 
 
 def _rendered_visible_text(value: str) -> str:
@@ -262,10 +281,13 @@ def _rendered_visible_text(value: str) -> str:
     return parser.text()
 
 
-def _validate_neutral_verdict(verdict: dict[str, Any]) -> None:
+def _validate_neutral_verdict(
+    verdict: dict[str, Any],
+    scan_findings: list[dict[str, Any]] | None = None,
+) -> None:
     text = "\n".join(
         _rendered_visible_text(value) if markdown else value
-        for value, markdown in _iter_verdict_text(verdict)
+        for value, markdown in _iter_verdict_text(verdict, scan_findings)
     ).casefold()
     if any(term.casefold() in text for term in _REPORT_TERMS):
         raise ValueError(
@@ -275,7 +297,12 @@ def _validate_neutral_verdict(verdict: dict[str, Any]) -> None:
         )
 
 
-def _normalized_verdict_copy(scan: dict[str, Any], verdict: dict[str, Any]) -> dict[str, Any]:
+def _normalized_verdict_copy(
+    scan: dict[str, Any],
+    verdict: dict[str, Any],
+    *,
+    scan_findings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     normalized = copy.deepcopy(verdict)
     known = {
         str(asset.get("asset_id"))
@@ -291,7 +318,9 @@ def _normalized_verdict_copy(scan: dict[str, Any], verdict: dict[str, Any]) -> d
         normalized["image_review"] = _normalize_image_review(
             normalized.get("image_review"), known
         )
-    _validate_neutral_verdict(normalized)
+    if scan_findings is None:
+        scan_findings = _visible_scan_findings(scan)
+    _validate_neutral_verdict(normalized, scan_findings)
     return normalized
 
 
@@ -366,6 +395,14 @@ def _finding_score(item: dict[str, Any]) -> tuple[int, int]:
     sev_rank = {"high": 0, "medium": 1, "low": 2}.get(sev, 3)
     scope_rank = 0 if item["scope"] == "cross_sheet" else 1
     return (sev_rank, scope_rank)
+
+
+def _visible_scan_findings(scan: dict[str, Any]) -> list[dict[str, Any]]:
+    visible = [
+        item for item in _all_findings(scan)
+        if str(item["finding"].get("profile_action") or "").lower() != "hidden"
+    ]
+    return sorted(visible, key=_finding_score)
 
 
 def _finding_matches_ref(item: dict[str, Any], ref: dict[str, Any]) -> bool:
@@ -793,15 +830,13 @@ def render_adjudicated_report(
     ``finding_refs``) are folded by :func:`_normalize_verdict` into one findings
     list, then rendered as a paper header + per-finding blocks with evidence.
     """
-    verdict = _normalized_verdict_copy(scan, verdict)
+    scan_findings = _visible_scan_findings(scan)
+    verdict = _normalized_verdict_copy(
+        scan,
+        verdict,
+        scan_findings=scan_findings,
+    )
     title = _scan_title(scan, verdict)
-    # Mirror the deterministic report: findings the active profile suppressed as
-    # likely false positives must not resurface as key evidence here.
-    visible = [
-        item for item in _all_findings(scan)
-        if str(item["finding"].get("profile_action") or "").lower() != "hidden"
-    ]
-    scan_findings = sorted(visible, key=_finding_score)
     paper, findings, summary = _normalize_verdict(verdict)
     return _render_unified(
         scan, verdict, title, scan_findings, findings, paper, summary, artifact_dir
@@ -816,6 +851,28 @@ def write_adjudicated_report(
     artifact_dir: str | None = None,
 ) -> None:
     """Write an adjudicated PaperConan HTML report."""
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(render_adjudicated_report(scan, verdict, artifact_dir=artifact_dir))
+    rendered = render_adjudicated_report(scan, verdict, artifact_dir=artifact_dir)
+    absolute_out = os.path.abspath(out_path)
+    destination_dir = os.path.dirname(absolute_out) or "."
+    os.makedirs(destination_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".paperconan-adjudicated-",
+        suffix=".html",
+        dir=destination_dir,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(rendered)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, absolute_out)
+        temp_path = ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass

@@ -5,9 +5,11 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 from build_fixture import build
 
-from paperconan import scan_dir, write_adjudicated_report
+from paperconan import _adjudicated_html, scan_dir, write_adjudicated_report
 from paperconan._adjudicated_html import _render_md, render_adjudicated_report
 
 
@@ -114,6 +116,46 @@ def test_write_adjudicated_report_accepts_artifact_dir(tmp_path):
     write_adjudicated_report(scan, _image_verdict(), str(out), artifact_dir=str(audit))
 
     assert "data:image/png;base64," in out.read_text(encoding="utf-8")
+
+
+def test_write_adjudicated_report_validation_failure_preserves_existing_output(
+    tmp_path,
+):
+    out = tmp_path / "adjudication.html"
+    out.write_text("existing-report", encoding="utf-8")
+    blocked = "mis" + "conduct"
+
+    with pytest.raises(ValueError, match="neutral-language policy"):
+        write_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            {"verdict": "NEEDS_HUMAN", "report_md": blocked},
+            str(out),
+        )
+
+    assert out.read_text(encoding="utf-8") == "existing-report"
+
+
+def test_write_adjudicated_report_publication_failure_preserves_existing_output(
+    tmp_path,
+    monkeypatch,
+):
+    out = tmp_path / "adjudication.html"
+    out.write_text("existing-report", encoding="utf-8")
+
+    def reject_publication(*args, **kwargs):
+        raise OSError("synthetic publication failure")
+
+    monkeypatch.setattr(_adjudicated_html.os, "replace", reject_publication)
+
+    with pytest.raises(OSError, match="synthetic publication failure"):
+        write_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            {"verdict": "NEEDS_HUMAN", "report_md": "Contextual review required."},
+            str(out),
+        )
+
+    assert out.read_text(encoding="utf-8") == "existing-report"
+    assert not list(tmp_path.glob(".paperconan-adjudicated-*"))
 
 
 def test_report_subcommand_writes_adjudicated_html(tmp_path):
@@ -325,6 +367,64 @@ def test_findings_array_renders_per_finding_blocks_with_own_evidence():
     assert html.count('class="ev"') == 2
     # a findings index summarises them
     assert "findings-index" in html
+
+
+@pytest.mark.parametrize("selector", ["sheet", "file", "rows", "kind"])
+def test_multi_finding_unmatched_visible_selector_is_neutral_validated(selector):
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": "The signals require contextual review.",
+        "findings": [
+            {
+                "title": "Unmatched signal",
+                "finding_ref": {selector: blocked},
+                "report_md": "The signal requires contextual review.",
+            },
+            {
+                "title": "Matched signal",
+                "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+                "report_md": "The signal requires contextual review.",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError) as exc:
+        render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert blocked not in str(exc.value).casefold()
+    assert "neutral-language policy" in str(exc.value)
+
+
+def test_multi_finding_non_rendered_selector_metadata_is_ignored():
+    blocked = "mis" + "conduct"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "paper_conclusion": "The signals require contextual review.",
+        "findings": [
+            {
+                "title": "Unmatched signal",
+                "finding_ref": {
+                    "sheet": "Unmatched",
+                    "file": blocked,
+                    "finding_id": blocked,
+                    "rule": blocked,
+                    "private_note": blocked,
+                },
+                "report_md": "The signal requires contextual review.",
+            },
+            {
+                "title": "Matched signal",
+                "finding_ref": {"sheet": "Alpha", "kind": "constant_offset"},
+                "report_md": "The signal requires contextual review.",
+            },
+        ],
+    }
+
+    html = render_adjudicated_report(_scan_two_findings(), verdict)
+
+    assert blocked not in html.casefold()
+    assert "Unmatched" in html
 
 
 def test_hero_shows_highest_tier_across_findings():

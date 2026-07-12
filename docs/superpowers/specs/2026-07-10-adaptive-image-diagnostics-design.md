@@ -374,7 +374,11 @@ all = [
 - `PAPERCONAN_MAX_IMAGE_MB`：单图最大读取大小。
 - `PAPERCONAN_MAX_IMAGE_PIXELS`：单图解码像素上限。
 - `PAPERCONAN_MAX_IMAGE_ASSETS`：单次扫描资产上限。
+- `PAPERCONAN_MAX_IMAGE_TOTAL_MB`：单次扫描图像产物总磁盘预算，默认 `1500` MiB，
+  覆盖原图副本、预览、PDF 渲染暂存、诊断原始裁剪和拼图证据；确定性替换抵扣已有最终
+  文件体积。
 - `PAPERCONAN_MAX_IMAGE_FINDINGS`：确定性图像信号上限。
+- `PAPERCONAN_MAX_IMAGE_COMPARISONS`：整次扫描最多尝试的区域比较数，默认 `100000`。
 - `PAPERCONAN_MAX_IMAGE_EVIDENCE_MB`：报告内嵌预览总上限。
 
 达到上限时必须写入 `scan_errors` 或 coverage 状态，不能静默丢弃。

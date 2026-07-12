@@ -6,14 +6,20 @@ import json
 import math
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import stat
-import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
 from . import ImageDependencyError
+from ._budget import (
+    ImageArtifactBudget,
+    ImageArtifactBudgetExceeded,
+    regular_file_size,
+)
+from ._dependencies import preflight_image_dependencies
 
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
@@ -110,7 +116,7 @@ def _secure_dirfd_capability_error() -> str | None:
         if not hasattr(os, name):
             missing.append(f"os.{name}")
     supports_dir_fd = getattr(os, "supports_dir_fd", frozenset())
-    for name in ("open", "mkdir", "stat", "unlink"):
+    for name in ("open", "mkdir", "rmdir", "stat", "unlink"):
         function = getattr(os, name, None)
         if function is None or function not in supports_dir_fd:
             missing.append(f"os.{name}(dir_fd=...)")
@@ -142,10 +148,30 @@ def _require_secure_dirfd_publication() -> None:
 
 
 def _secure_dirfd_runtime_error(exc: Exception) -> ValueError:
+    detail = _sanitized_exception_context(exc)
     return ValueError(
         "secure image asset publication is unavailable on this platform; "
-        "required dir_fd/no-follow operation failed"
+        f"required dir_fd/no-follow operation failed ({detail})"
     )
+
+
+def _sanitized_exception_context(exc: Exception) -> str:
+    message = str(exc) or "no detail"
+    message = re.sub(
+        r"(?i)\b(?:token|password|secret|signature|key)=[^\s,;]+",
+        "[credential]",
+        message,
+    )
+    message = re.sub(r"https?://[^\s,;]+", "[url]", message)
+    message = re.sub(
+        r"(?<!\w)(?:[A-Za-z]:)?[/\\][^\s,;]+",
+        "[path]",
+        message,
+    )
+    message = " ".join(message.split())
+    if len(message) > 180:
+        message = message[:177] + "..."
+    return f"{exc.__class__.__name__}: {message}"
 
 
 def _probe_replace_dirfd(directory_fd: int) -> None:
@@ -203,11 +229,15 @@ def _open_child_directory(parent_fd: int, name: str, display_path: Path) -> int:
 @contextmanager
 def _asset_output_directories(output_root: Path):
     _require_secure_dirfd_publication()
-    flags = os.O_RDONLY | os.O_DIRECTORY
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
         root_fd = os.open(output_root, flags)
     except (AttributeError, NotImplementedError, TypeError) as exc:
         raise _secure_dirfd_runtime_error(exc) from exc
+    except OSError as exc:
+        raise ValueError(
+            "image artifact root is not a stable no-follow directory"
+        ) from exc
     images_fd = native_fd = preview_fd = None
     try:
         images_fd = _open_child_directory(
@@ -261,6 +291,18 @@ def _verify_asset_directories(
     native_fd: int,
     preview_fd: int,
 ) -> None:
+    opened_root = os.fstat(root_fd)
+    try:
+        current_root = os.stat(output_root, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("image artifact root changed during asset publication") from exc
+    if (
+        not stat.S_ISDIR(opened_root.st_mode)
+        or not stat.S_ISDIR(current_root.st_mode)
+        or current_root.st_dev != opened_root.st_dev
+        or current_root.st_ino != opened_root.st_ino
+    ):
+        raise ValueError("image artifact root changed during asset publication")
     images = output_root / "images"
     _verify_directory_entry(root_fd, "images", images_fd, images)
     _verify_directory_entry(images_fd, "native", native_fd, images / "native")
@@ -301,6 +343,32 @@ def _asset_temp_path(directory_fd: int, *, suffix: str) -> tuple[str, int]:
     raise FileExistsError("could not allocate image staging file")
 
 
+@contextmanager
+def _pdf_staging_directory(root_fd: int):
+    name = f".paperconan-rendered-{secrets.token_hex(8)}"
+    directory_fd = None
+    os.mkdir(name, 0o700, dir_fd=root_fd)
+    try:
+        directory_fd = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        yield directory_fd
+    finally:
+        if directory_fd is not None:
+            for entry in os.listdir(directory_fd):
+                try:
+                    os.unlink(entry, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            os.close(directory_fd)
+        try:
+            os.rmdir(name, dir_fd=root_fd)
+        except FileNotFoundError:
+            pass
+
+
 def _unlink_at(name: str | None, directory_fd: int) -> None:
     if name is None:
         return
@@ -310,9 +378,19 @@ def _unlink_at(name: str | None, directory_fd: int) -> None:
         pass
 
 
-def _copy_source_to_fd(source: Path, destination_fd: int) -> None:
+def _copy_source_to_fd(
+    source: Path,
+    destination_fd: int,
+    *,
+    source_fd: int | None = None,
+) -> None:
     os.lseek(destination_fd, 0, os.SEEK_SET)
-    with source.open("rb") as source_fh:
+    if source_fd is None:
+        source_context = source.open("rb")
+    else:
+        source_context = os.fdopen(os.dup(source_fd), "rb")
+    with source_context as source_fh:
+        source_fh.seek(0)
         with os.fdopen(os.dup(destination_fd), "wb") as destination_fh:
             shutil.copyfileobj(source_fh, destination_fh, length=1024 * 1024)
 
@@ -385,13 +463,21 @@ def _publish_asset_pair(
     native = output_root / "images" / "native" / native_name
     preview = output_root / "images" / "preview" / preview_name
     entries = [
-        (native_fd, native_temp_name, native_temp_fd, native_name, native),
+        (
+            native_fd,
+            native_temp_name,
+            native_temp_fd,
+            native_name,
+            native,
+            f"images/native/{native_name}",
+        ),
         (
             preview_fd,
             preview_temp_name,
             preview_temp_fd,
             preview_name,
             preview,
+            f"images/preview/{preview_name}",
         ),
     ]
     backups: list[str | None] = [None, None]
@@ -406,7 +492,7 @@ def _publish_asset_pair(
             native_fd,
             preview_fd,
         )
-        for index, (directory_fd, _, _, final_name, _) in enumerate(entries):
+        for index, (directory_fd, _, _, final_name, _, _) in enumerate(entries):
             backups[index] = _move_existing_to_backup(directory_fd, final_name)
             prepared[index] = True
         _verify_asset_directories(
@@ -417,7 +503,7 @@ def _publish_asset_pair(
             preview_fd,
         )
         for index, entry in enumerate(entries):
-            directory_fd, temp_name, temp_fd, final_name, final_path = entry
+            directory_fd, temp_name, temp_fd, final_name, final_path, _ = entry
             _verify_regular_file_entry(
                 directory_fd,
                 temp_name,
@@ -447,13 +533,13 @@ def _publish_asset_pair(
         publication_succeeded = True
     except Exception as publication_error:
         rollback_error = None
-        for index, (directory_fd, _, _, final_name, _) in enumerate(entries):
+        for index, (directory_fd, _, _, final_name, _, _) in enumerate(entries):
             if installed[index]:
                 try:
                     _unlink_at(final_name, directory_fd)
                 except Exception as exc:
                     rollback_error = rollback_error or exc
-        for index, (directory_fd, _, _, final_name, _) in enumerate(entries):
+        for index, (directory_fd, _, _, final_name, _, _) in enumerate(entries):
             backup_name = backups[index]
             if prepared[index] and backup_name is not None:
                 try:
@@ -467,14 +553,22 @@ def _publish_asset_pair(
                 except Exception as exc:
                     rollback_error = rollback_error or exc
         if rollback_error is not None:
+            retained = [
+                f"{relative_name} -> {backup_name}"
+                for backup_name, entry in zip(backups, entries)
+                if backup_name is not None
+                for relative_name in (entry[5].rsplit("/", 1)[0] + "/" + backup_name,)
+            ]
+            retained_text = ", ".join(retained) or "none"
             raise _AssetPublicationRollbackError(
                 "image asset publication rollback failed; "
-                "recovery backup retained"
+                f"retained recovery backup(s): {retained_text}; "
+                f"rollback cause: {_sanitized_exception_context(rollback_error)}"
             ) from publication_error
         raise
     finally:
         if publication_succeeded:
-            for index, (directory_fd, _, _, _, _) in enumerate(entries):
+            for index, (directory_fd, _, _, _, _, _) in enumerate(entries):
                 _unlink_at(backups[index], directory_fd)
 
 
@@ -488,13 +582,38 @@ def _record_image(
     page: int | None = None,
     render_dpi: int | None = None,
     digest: str | None = None,
+    directory_fds: tuple[int, int, int, int] | None = None,
+    artifact_budget: ImageArtifactBudget | None = None,
+    source_fd: int | None = None,
 ) -> dict:
+    if directory_fds is None:
+        budget = artifact_budget or ImageArtifactBudget.from_environment()
+        with _asset_output_directories(output_root) as opened_directories:
+            budget.initialize_from_images_fd(opened_directories[1])
+            return _record_image(
+                source,
+                output_root,
+                source_type=source_type,
+                source_url=source_url,
+                parent_file=parent_file,
+                page=page,
+                render_dpi=render_dpi,
+                digest=digest,
+                directory_fds=opened_directories,
+                artifact_budget=budget,
+                source_fd=source_fd,
+            )
+    if artifact_budget is None:
+        raise ValueError("image artifact budget is required")
     Image, ImageOps = _load_pillow()
-    if source.stat().st_size > _MAX_IMAGE_BYTES:
+    source_stat = os.fstat(source_fd) if source_fd is not None else source.stat()
+    if source_stat.st_size > _MAX_IMAGE_BYTES:
         raise ValueError(
             f"{source.name}: exceeds PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
         )
-    digest = digest or _sha256(source)
+    digest = digest or (
+        _sha256_fd(source_fd) if source_fd is not None else _sha256(source)
+    )
     asset_id = _asset_id(digest)
     suffix = source.suffix.lower() or ".png"
     stem = asset_id.replace(":", "-")
@@ -502,10 +621,17 @@ def _record_image(
     preview = output_root / "images" / "preview" / f"{stem}.jpg"
     native_name = native.name
     preview_name = preview.name
-    with _asset_output_directories(output_root) as directory_fds:
-        root_fd, images_fd, native_fd, preview_fd = directory_fds
-        native_temp_name = preview_temp_name = None
-        native_temp_fd = preview_temp_fd = None
+    root_fd, images_fd, native_fd, preview_fd = directory_fds
+    native_temp_name = preview_temp_name = None
+    native_temp_fd = preview_temp_fd = None
+    try:
+        _verify_asset_directories(
+            output_root,
+            root_fd,
+            images_fd,
+            native_fd,
+            preview_fd,
+        )
         try:
             native_temp_name, native_temp_fd = _asset_temp_path(
                 native_fd,
@@ -515,7 +641,11 @@ def _record_image(
                 preview_fd,
                 suffix=".jpg",
             )
-            _copy_source_to_fd(source, native_temp_fd)
+            _copy_source_to_fd(
+                source,
+                native_temp_fd,
+                source_fd=source_fd,
+            )
             if _sha256_fd(native_temp_fd) != digest:
                 raise ValueError(
                     f"{source.name}: source changed while preparing image asset"
@@ -548,6 +678,18 @@ def _record_image(
                         Image.MIME.get(image.format)
                         or mimetypes.guess_type(native.name)[0]
                     )
+            existing_size = (
+                regular_file_size(native_fd, native_name)
+                + regular_file_size(preview_fd, preview_name)
+            )
+            staged_size = (
+                os.fstat(native_temp_fd).st_size
+                + os.fstat(preview_temp_fd).st_size
+            )
+            artifact_budget.require_replacement(
+                existing_size=existing_size,
+                staged_size=staged_size,
+            )
             _publish_asset_pair(
                 output_root=output_root,
                 root_fd=root_fd,
@@ -561,6 +703,10 @@ def _record_image(
                 native_name=native_name,
                 preview_name=preview_name,
             )
+            artifact_budget.commit_replacement(
+                existing_size=existing_size,
+                staged_size=staged_size,
+            )
         except _AssetPublicationRollbackError:
             raise
         except Exception:
@@ -571,13 +717,13 @@ def _record_image(
                 preview_name,
             )
             raise
-        finally:
-            if native_temp_fd is not None:
-                os.close(native_temp_fd)
-            if preview_temp_fd is not None:
-                os.close(preview_temp_fd)
-            _unlink_at(native_temp_name, native_fd)
-            _unlink_at(preview_temp_name, preview_fd)
+    finally:
+        if native_temp_fd is not None:
+            os.close(native_temp_fd)
+        if preview_temp_fd is not None:
+            os.close(preview_temp_fd)
+        _unlink_at(native_temp_name, native_fd)
+        _unlink_at(preview_temp_name, preview_fd)
     return {
         "asset_id": asset_id,
         "file": source.name,
@@ -603,7 +749,7 @@ def _exception_text(exc: Exception) -> str:
     return str(exc) or exc.__class__.__name__
 
 
-def _render_pdf_pages(pdf_path: Path, temp_dir: Path):
+def _render_pdf_pages(pdf_path: Path, temp_dir_fd: int):
     try:
         import pypdfium2 as pdfium
     except ImportError as exc:
@@ -618,7 +764,8 @@ def _render_pdf_pages(pdf_path: Path, temp_dir: Path):
             page = None
             bitmap = None
             image = None
-            dest = None
+            dest_name = None
+            dest_fd = None
             page_error = None
             try:
                 page = doc[index]
@@ -632,8 +779,16 @@ def _render_pdf_pages(pdf_path: Path, temp_dir: Path):
                     )
                 bitmap = page.render(scale=scale)
                 image = bitmap.to_pil()
-                dest = temp_dir / f"{pdf_path.stem}.p{index + 1}.png"
-                image.save(dest, format="PNG")
+                dest_name = f"{pdf_path.stem}.p{index + 1}.png"
+                dest_fd = os.open(
+                    dest_name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=temp_dir_fd,
+                )
+                with os.fdopen(os.dup(dest_fd), "wb") as destination:
+                    image.save(destination, format="PNG")
+                    destination.flush()
             except Exception as exc:
                 page_error = _exception_text(exc)
             finally:
@@ -645,21 +800,32 @@ def _render_pdf_pages(pdf_path: Path, temp_dir: Path):
                     except Exception as exc:
                         if page_error is None:
                             page_error = _exception_text(exc)
-                if page_error is not None and dest is not None:
+                if page_error is not None and dest_name is not None:
                     try:
-                        dest.unlink(missing_ok=True)
+                        if dest_fd is not None:
+                            os.close(dest_fd)
+                            dest_fd = None
+                        _unlink_at(dest_name, temp_dir_fd)
                     except Exception as exc:
                         cleanup_error = _exception_text(exc)
                         page_error = (
                             f"{page_error}; partial page cleanup failed: "
                             f"{cleanup_error}"
                         )
-            yield (
-                index + 1,
-                page_count,
-                None if page_error is not None else dest,
-                page_error,
-            )
+            if page_error is not None:
+                yield index + 1, page_count, None, None, page_error
+                continue
+            try:
+                yield (
+                    index + 1,
+                    page_count,
+                    Path(dest_name),
+                    dest_fd,
+                    None,
+                )
+            finally:
+                os.close(dest_fd)
+                _unlink_at(dest_name, temp_dir_fd)
     finally:
         doc.close()
 
@@ -681,10 +847,14 @@ def prepare_image_assets(
     *,
     provenance: dict | None = None,
     render_pdf: bool = True,
+    artifact_budget: ImageArtifactBudget | None = None,
 ) -> tuple[list[dict], list[dict]]:
     source_root = Path(in_dir)
     output_root = Path(out_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
+    try:
+        budget = artifact_budget or ImageArtifactBudget.from_environment()
+    except ValueError as exc:
+        return [], [{"error": str(exc)}]
     downloads = _source_provenance(source_root)
     downloads.update(_provided_provenance(provenance))
     candidates = sorted(
@@ -701,17 +871,44 @@ def prepare_image_assets(
         ],
         key=lambda path: _stable_name_key(path.name),
     )
+    if candidates or (render_pdf and pdfs):
+        preflight_image_dependencies(
+            render_pdf=bool(render_pdf and pdfs),
+            diagnostics=False,
+        )
+    output_root.mkdir(parents=True, exist_ok=True)
     assets_by_digest: dict[str, dict] = {}
     errors: list[dict] = []
     pdf_page_attempts = 0
+    output_context = _asset_output_directories(output_root)
+    try:
+        directory_fds = output_context.__enter__()
+    except ImageDependencyError:
+        raise
+    except Exception as exc:
+        return [], [{"error": str(exc)}]
+    try:
+        budget.initialize_from_images_fd(directory_fds[1])
+    except ValueError as exc:
+        output_context.__exit__(None, None, None)
+        return [], [{"error": str(exc)}]
 
-    def add(path: Path, **metadata):
+    def add(path: Path, *, source_fd: int | None = None, **metadata):
         try:
-            if path.stat().st_size > _MAX_IMAGE_BYTES:
+            source_stat = (
+                os.fstat(source_fd)
+                if source_fd is not None
+                else path.stat()
+            )
+            if source_stat.st_size > _MAX_IMAGE_BYTES:
                 raise ValueError(
                     f"{path.name}: exceeds PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
                 )
-            digest = _sha256(path)
+            digest = (
+                _sha256_fd(source_fd)
+                if source_fd is not None
+                else _sha256(path)
+            )
         except Exception as exc:
             errors.append({"file": path.name, "error": str(exc)})
             return "error"
@@ -730,88 +927,125 @@ def prepare_image_assets(
                 path,
                 output_root,
                 digest=digest,
+                directory_fds=directory_fds,
+                artifact_budget=budget,
+                source_fd=source_fd,
                 **metadata,
             )
+        except ImageDependencyError:
+            raise
         except Exception as exc:
             errors.append({"file": path.name, "error": str(exc)})
             return "error"
         assets_by_digest[digest] = asset
         return "added"
 
-    for path in candidates:
-        prov = downloads.get(path.name) or {}
-        add(
-            path,
-            source_type="fetched_image" if prov.get("source_url") else "local_image",
-            source_url=prov.get("source_url"),
-        )
-    if render_pdf:
-        with tempfile.TemporaryDirectory(
-            prefix=".paperconan-rendered-",
-            dir=output_root,
-        ) as temp_dir_name:
-            temp_dir = Path(temp_dir_name)
-            for pdf in pdfs:
-                try:
-                    if pdf.stat().st_size > _MAX_IMAGE_BYTES:
-                        raise ValueError(
-                            f"{pdf.name}: exceeds "
-                            f"PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
-                        )
-                except Exception as exc:
-                    errors.append({"file": pdf.name, "error": str(exc)})
-                    continue
-                if pdf_page_attempts >= _MAX_IMAGE_ASSETS:
-                    errors.append({
-                        "file": pdf.name,
-                        "page": 1,
-                        "error": _asset_limit_error(),
-                    })
-                    continue
-                if len(assets_by_digest) >= _MAX_IMAGE_ASSETS:
-                    errors.append({"file": pdf.name, "error": _asset_limit_error()})
-                    continue
-                pages = _render_pdf_pages(pdf, temp_dir)
-                try:
-                    for page_number, page_count, page_path, page_error in pages:
-                        pdf_page_attempts += 1
-                        if page_error is not None:
-                            errors.append({
-                                "file": pdf.name,
-                                "page": page_number,
-                                "error": page_error,
-                            })
-                        else:
-                            try:
-                                add(
-                                    page_path,
-                                    source_type="pdf_page",
-                                    source_url=(
-                                        downloads.get(pdf.name) or {}
-                                    ).get("source_url"),
-                                    parent_file=pdf.name,
-                                    page=page_number,
-                                    render_dpi=_PDF_DPI,
-                                )
-                            finally:
-                                page_path.unlink(missing_ok=True)
-                        if (
-                            (
-                                pdf_page_attempts >= _MAX_IMAGE_ASSETS
-                                or len(assets_by_digest) >= _MAX_IMAGE_ASSETS
+    try:
+        for path in candidates:
+            prov = downloads.get(path.name) or {}
+            add(
+                path,
+                source_type=(
+                    "fetched_image" if prov.get("source_url") else "local_image"
+                ),
+                source_url=prov.get("source_url"),
+            )
+        if render_pdf:
+            with _pdf_staging_directory(directory_fds[0]) as temp_dir_fd:
+                for pdf in pdfs:
+                    try:
+                        if pdf.stat().st_size > _MAX_IMAGE_BYTES:
+                            raise ValueError(
+                                f"{pdf.name}: exceeds "
+                                f"PAPERCONAN_MAX_IMAGE_MB={_MAX_IMAGE_MB:g}"
                             )
-                            and page_number < page_count
-                        ):
-                            errors.append({
-                                "file": pdf.name,
-                                "page": page_number + 1,
-                                "error": _asset_limit_error(),
-                            })
-                            break
-                except Exception as exc:
-                    errors.append({"file": pdf.name, "error": str(exc)})
-                finally:
-                    pages.close()
+                    except ImageDependencyError:
+                        raise
+                    except Exception as exc:
+                        errors.append({"file": pdf.name, "error": str(exc)})
+                        continue
+                    if pdf_page_attempts >= _MAX_IMAGE_ASSETS:
+                        errors.append({
+                            "file": pdf.name,
+                            "page": 1,
+                            "error": _asset_limit_error(),
+                        })
+                        continue
+                    if len(assets_by_digest) >= _MAX_IMAGE_ASSETS:
+                        errors.append({
+                            "file": pdf.name,
+                            "error": _asset_limit_error(),
+                        })
+                        continue
+                    pages = _render_pdf_pages(pdf, temp_dir_fd)
+                    try:
+                        for (
+                            page_number,
+                            page_count,
+                            page_path,
+                            page_fd,
+                            page_error,
+                        ) in pages:
+                            pdf_page_attempts += 1
+                            if page_error is not None:
+                                errors.append({
+                                    "file": pdf.name,
+                                    "page": page_number,
+                                    "error": page_error,
+                                })
+                            else:
+                                staged_size = 0
+                                try:
+                                    staged_size = os.fstat(page_fd).st_size
+                                    budget.reserve_temporary(staged_size)
+                                    try:
+                                        add(
+                                            page_path,
+                                            source_fd=page_fd,
+                                            source_type="pdf_page",
+                                            source_url=(
+                                                downloads.get(pdf.name) or {}
+                                            ).get("source_url"),
+                                            parent_file=pdf.name,
+                                            page=page_number,
+                                            render_dpi=_PDF_DPI,
+                                        )
+                                    finally:
+                                        budget.release_temporary(staged_size)
+                                except ImageArtifactBudgetExceeded as exc:
+                                    errors.append({
+                                        "file": pdf.name,
+                                        "page": page_number,
+                                        "error": str(exc),
+                                    })
+                            if (
+                                (
+                                    pdf_page_attempts >= _MAX_IMAGE_ASSETS
+                                    or len(assets_by_digest) >= _MAX_IMAGE_ASSETS
+                                )
+                                and page_number < page_count
+                            ):
+                                errors.append({
+                                    "file": pdf.name,
+                                    "page": page_number + 1,
+                                    "error": _asset_limit_error(),
+                                })
+                                break
+                    except ImageDependencyError:
+                        raise
+                    except Exception as exc:
+                        errors.append({"file": pdf.name, "error": str(exc)})
+                    finally:
+                        pages.close()
+        try:
+            _verify_asset_directories(
+                output_root,
+                *directory_fds,
+            )
+        except Exception as exc:
+            errors.append({"error": str(exc)})
+    finally:
+        output_context.__exit__(None, None, None)
     assets = sorted(
         assets_by_digest.values(),
         key=lambda asset: (asset["asset_id"], asset["file"]),

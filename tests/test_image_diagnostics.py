@@ -68,7 +68,7 @@ def _install_synthetic_panel_grid(monkeypatch, *, rows: int, cols: int):
         def cvtColor(self, image, mode):
             return SyntheticGray()
 
-        def imread(self, path, mode):
+        def imdecode(self, payload, mode):
             return np.zeros((*SyntheticGray.shape, 3), dtype=np.uint8)
 
     run_sets = iter([
@@ -241,7 +241,32 @@ def test_raw_pair_preview_uses_stable_open_file_object(
     with original_open(io.BytesIO(payload)) as montage:
         red, _, blue = montage.getpixel((2, 2))
     assert red > blue
-    assert budget.used_bytes == len(payload)
+    assert budget.used_bytes == len(base64.b64encode(payload))
+
+
+def test_raw_pair_preview_charges_encoded_payload_length(tmp_path):
+    item, _ = _raw_pair_preview_item(tmp_path)
+    first = _evidence.EvidenceBudget(1024 * 1024)
+    uri = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        first,
+    )
+    assert uri is not None
+    encoded_size = len(uri.split(",", 1)[1])
+    raw_size = len(base64.b64decode(uri.split(",", 1)[1]))
+    assert encoded_size > raw_size
+    assert first.used_bytes == encoded_size
+
+    insufficient = _evidence.EvidenceBudget(encoded_size - 1)
+    rejected = _html._registered_pair_preview_data_uri(
+        item,
+        str(tmp_path),
+        insufficient,
+    )
+
+    assert rejected is None
+    assert insufficient.used_bytes == 0
 
 
 @pytest.mark.parametrize("swap_kind", ["parent", "final"])
@@ -360,6 +385,160 @@ def test_diagnostics_find_transform_related_panels_and_keep_assets(tmp_path):
     assert finding["transform"] == "flip"
     assert finding["score"] >= 0.92
     assert len(finding["regions"]) == 2
+
+
+def test_diagnostics_decode_registered_bytes_with_imdecode(tmp_path, monkeypatch):
+    out, assets = _diagnostic_asset(tmp_path)
+    cv2 = _diagnostics._cv2()
+    real_imdecode = cv2.imdecode
+    decoded = False
+
+    def reject_imread(*args, **kwargs):
+        raise AssertionError("diagnostics must not reopen a pathname with imread")
+
+    def track_imdecode(payload, flags):
+        nonlocal decoded
+        decoded = True
+        return real_imdecode(payload, flags)
+
+    monkeypatch.setattr(cv2, "imread", reject_imread)
+    monkeypatch.setattr(cv2, "imdecode", track_imdecode)
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert errors == []
+    assert decoded
+
+
+def test_diagnostics_reject_file_size_before_imdecode(tmp_path, monkeypatch):
+    out, assets = _diagnostic_asset(tmp_path)
+    cv2 = _diagnostics._cv2()
+    decoded = False
+
+    def track_imdecode(*args, **kwargs):
+        nonlocal decoded
+        decoded = True
+        raise AssertionError("oversized registered image must not be decoded")
+
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_MB", "0")
+    monkeypatch.setattr(cv2, "imdecode", track_imdecode)
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert not decoded
+    assert errors == [{
+        "file": "Fig1.png",
+        "error": "registered image exceeds PAPERCONAN_MAX_IMAGE_MB",
+    }]
+
+
+def test_diagnostics_reject_full_image_pixels_before_imdecode(
+    tmp_path,
+    monkeypatch,
+):
+    out, assets = _diagnostic_asset(tmp_path)
+    cv2 = _diagnostics._cv2()
+    decoded = False
+
+    def track_imdecode(*args, **kwargs):
+        nonlocal decoded
+        decoded = True
+        raise AssertionError("over-pixel registered image must not be decoded")
+
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "100")
+    monkeypatch.setattr(cv2, "imdecode", track_imdecode)
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert not decoded
+    assert errors == [{
+        "file": "Fig1.png",
+        "error": "registered image exceeds PAPERCONAN_MAX_IMAGE_PIXELS",
+    }]
+
+
+@pytest.mark.parametrize("swap_kind", ["parent", "final"])
+def test_diagnostics_fail_closed_on_registered_path_swap(
+    tmp_path,
+    monkeypatch,
+    swap_kind,
+):
+    out, assets = _diagnostic_asset(tmp_path)
+    native = out / assets[0]["path"]
+    native_dir = native.parent
+    outside_dir = tmp_path / "outside-native"
+    outside_dir.mkdir()
+    outside = outside_dir / native.name
+    Image.new("RGB", (16, 16), "black").save(outside)
+    displaced = tmp_path / f"displaced-{swap_kind}"
+    original_os_open = _evidence.os.open
+    cv2 = _diagnostics._cv2()
+    decoded = False
+    swapped = False
+
+    def swap_before_registered_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        path_text = _evidence.os.fspath(path)
+        should_swap = (
+            swap_kind == "parent"
+            and path_text == "native"
+            and kwargs.get("dir_fd") is not None
+        ) or (
+            swap_kind == "final"
+            and path_text == native.name
+            and kwargs.get("dir_fd") is not None
+        )
+        if not swapped and should_swap:
+            if swap_kind == "parent":
+                native_dir.rename(displaced)
+                native_dir.symlink_to(outside_dir, target_is_directory=True)
+            else:
+                native.rename(displaced)
+                native.symlink_to(outside)
+            swapped = True
+        return original_os_open(path, flags, *args, **kwargs)
+
+    def track_imdecode(*args, **kwargs):
+        nonlocal decoded
+        decoded = True
+        raise AssertionError("swapped registered image must not be decoded")
+
+    monkeypatch.setattr(_evidence.os, "open", swap_before_registered_open)
+    monkeypatch.setattr(cv2, "imdecode", track_imdecode)
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert swapped
+    assert findings == []
+    assert not decoded
+    assert errors == [{
+        "file": "Fig1.png",
+        "error": "registered image path is not stable under artifact root",
+    }]
+
+
+def test_bounded_candidates_never_retain_more_than_limit():
+    retained = _diagnostics._BoundedCandidates(2)
+    candidates = [
+        {"finding_id": "image:pair:c", "score": 0.93},
+        {"finding_id": "image:pair:b", "score": 0.99},
+        {"finding_id": "image:pair:a", "score": 0.99},
+        {"finding_id": "image:pair:d", "score": 0.95},
+    ]
+
+    for candidate in candidates:
+        retained.consider(candidate)
+        assert len(retained) <= 2
+
+    assert [item["finding_id"] for item in retained.best()] == [
+        "image:pair:a",
+        "image:pair:b",
+    ]
+    assert retained.qualifying_count == 4
+    assert retained.omitted_count == 2
 
 
 def test_panel_proposal_stops_after_observing_one_candidate_beyond_cap(
@@ -527,6 +706,81 @@ def test_zero_finding_cap_keeps_work_bounds_and_resource_errors(
     assert not (out / "images" / "evidence").exists()
 
 
+def test_scan_wide_comparison_ceiling_stops_across_assets(
+    tmp_path,
+    monkeypatch,
+):
+    out, first_assets = _diagnostic_asset(tmp_path)
+    second = out / "images" / "native" / "Fig2.png"
+    Image.new("RGB", (16, 16), "black").save(second)
+    assets = first_assets + [{
+        "asset_id": "img:fig2",
+        "file": "Fig2.png",
+        "path": second.relative_to(out).as_posix(),
+    }]
+    boxes = [
+        (0, 0, 4, 4),
+        (4, 0, 8, 4),
+        (8, 0, 12, 4),
+    ]
+    comparisons = 0
+
+    def dissimilar(left, right):
+        nonlocal comparisons
+        comparisons += 1
+        return 0.0, "identity"
+
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_COMPARISONS", "4")
+    monkeypatch.setattr(
+        _diagnostics,
+        "_propose_panels_bounded",
+        lambda image: (boxes, False),
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "transform_robust_similarity",
+        dissimilar,
+    )
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert comparisons == 4
+    assert errors == [{
+        "error": (
+            "image comparisons omitted; scan-wide limit is 4 "
+            "(PAPERCONAN_MAX_IMAGE_COMPARISONS)"
+        ),
+    }]
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("PAPERCONAN_MAX_IMAGE_FINDINGS", "-1"),
+        ("PAPERCONAN_MAX_IMAGE_FINDINGS", "not-a-number"),
+        ("PAPERCONAN_MAX_IMAGE_FINDINGS", "9" * 5000),
+        ("PAPERCONAN_MAX_IMAGE_COMPARISONS", "-1"),
+        ("PAPERCONAN_MAX_IMAGE_COMPARISONS", "not-a-number"),
+        ("PAPERCONAN_MAX_IMAGE_COMPARISONS", "9" * 5000),
+    ],
+)
+def test_diagnostics_invalid_scan_limits_fail_closed(
+    tmp_path,
+    monkeypatch,
+    name,
+    value,
+):
+    out, assets = _diagnostic_asset(tmp_path)
+    monkeypatch.setenv(name, value)
+
+    findings, errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert errors == [{"error": f"invalid {name} limit"}]
+    assert not (out / "images" / "evidence").exists()
+
+
 def test_cmyk_scan_diagnostics_never_abort_or_remove_assets(tmp_path):
     from paperconan import scan_dir
 
@@ -569,6 +823,72 @@ def test_candidate_evidence_write_error_is_non_gating(tmp_path, monkeypatch):
         "file": "Fig1.png",
         "error": "image evidence unavailable: synthetic evidence write error",
     }]
+
+
+def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    total = sum(
+        (out / assets[0][key]).stat().st_size
+        for key in ("path", "preview_path")
+    )
+    monkeypatch.setenv(
+        "PAPERCONAN_MAX_IMAGE_TOTAL_MB",
+        str(total / (1024 * 1024)),
+    )
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert len(diagnostic_errors) == 1
+    assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in diagnostic_errors[0]["error"]
+    assert "budget exhausted" in diagnostic_errors[0]["error"]
+    evidence_dir = out / "images" / "evidence"
+    assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
+
+
+def test_scan_records_total_artifact_budget_exhaustion_without_losing_assets(
+    tmp_path,
+    monkeypatch,
+):
+    from paperconan import scan_dir
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    trial = tmp_path / "trial"
+    trial_assets, trial_errors = prepare_image_assets(str(source), str(trial))
+    assert trial_errors == []
+    total = sum(
+        (trial / trial_assets[0][key]).stat().st_size
+        for key in ("path", "preview_path")
+    )
+    monkeypatch.setenv(
+        "PAPERCONAN_MAX_IMAGE_TOTAL_MB",
+        str(total / (1024 * 1024)),
+    )
+
+    scan = scan_dir(
+        str(source),
+        str(tmp_path / "audit"),
+        write_html=False,
+        images=True,
+        image_diagnostics=True,
+    )
+
+    assert len(scan["image_assets"]) == 1
+    assert scan["image_findings"] == []
+    assert any(
+        "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in item["error"]
+        for item in scan["scan_errors"]
+    )
 
 
 def test_scan_catches_unexpected_diagnostic_error(tmp_path, monkeypatch):

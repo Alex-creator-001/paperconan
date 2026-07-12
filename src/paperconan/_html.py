@@ -12,6 +12,7 @@ from typing import Any, Iterable
 
 from .image._evidence import (
     EvidenceBudget,
+    _base64_encoded_size,
     _max_image_bytes,
     _max_image_pixels,
     _open_artifact_regular,
@@ -250,9 +251,12 @@ def _registered_pair_preview_data_uri(
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=88, optimize=True)
     payload = output.getvalue()
-    if not budget.consume(len(payload)):
+    encoded_size = _base64_encoded_size(len(payload))
+    if not budget.can_consume(encoded_size):
         return None
     encoded = base64.b64encode(payload).decode("ascii")
+    if len(encoded) != encoded_size or not budget.consume(len(encoded)):
+        return None
     return f"data:image/jpeg;base64,{encoded}"
 
 
