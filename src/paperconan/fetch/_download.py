@@ -69,6 +69,10 @@ class _SourceSidecarPublicationError(ValueError):
     pass
 
 
+class _PaperDataLimitError(ValueError):
+    pass
+
+
 class _PublicationRecoveryError(OSError):
     pass
 
@@ -561,6 +565,34 @@ def _dir_size_fd(directory_fd: int) -> int:
     return total
 
 
+def _dir_size_fd_excluding_root_entries(
+    directory_fd: int,
+    excluded_entries: dict[str, tuple[int, int]],
+) -> int:
+    total = 0
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    for name in os.listdir(directory_fd):
+        current = os.stat(
+            name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if stat.S_ISREG(current.st_mode):
+            if excluded_entries.get(name) == (
+                current.st_dev,
+                current.st_ino,
+            ):
+                continue
+            total += current.st_size
+        elif stat.S_ISDIR(current.st_mode):
+            child_fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                total += _dir_size_fd_excluding_root_entries(child_fd, {})
+            finally:
+                os.close(child_fd)
+    return total
+
+
 def _dir_size(path):
     if isinstance(path, _PinnedOutputDirectory):
         return _dir_size_fd(path.fd)
@@ -678,6 +710,8 @@ def _write_collision_safe(
     data: bytes,
     *,
     _return_entry: bool = False,
+    max_total_bytes: int | None = None,
+    transient_files: tuple[_DownloadStagingFile, ...] = (),
 ) -> str | _PublishedOutputFile:
     if not isinstance(out_dir, _PinnedOutputDirectory):
         with _pinned_output_directory(out_dir) as output:
@@ -686,6 +720,8 @@ def _write_collision_safe(
                 name,
                 data,
                 _return_entry=_return_entry,
+                max_total_bytes=max_total_bytes,
+                transient_files=transient_files,
             )
 
     def regular_file_matches(filename: str) -> os.stat_result | None:
@@ -759,6 +795,45 @@ def _write_collision_safe(
             return entry
         return entry.display_path(out_dir)
 
+    def require_projected_size(
+        *,
+        private_name: str,
+        private_state: os.stat_result,
+        additional_size: int,
+    ) -> None:
+        if max_total_bytes is None:
+            return
+        excluded_entries = {
+            private_name: (
+                private_state.st_dev,
+                private_state.st_ino,
+            ),
+        }
+        for staging in transient_files:
+            if staging.output.fd != out_dir.fd:
+                raise _UnstableRegularFileError(
+                    "download staging belongs to a different output directory"
+                )
+            _verify_staging_file(staging)
+            current = os.fstat(staging.fd)
+            excluded_entries[staging.name] = (
+                current.st_dev,
+                current.st_ino,
+            )
+        out_dir.verify()
+        projected = (
+            _dir_size_fd_excluding_root_entries(
+                out_dir.fd,
+                excluded_entries,
+            )
+            + additional_size
+        )
+        if projected > max_total_bytes:
+            raise _PaperDataLimitError(
+                "direct file skipped because projected paper data exceeds "
+                "per-paper cap"
+            )
+
     out_dir.verify()
     stem, suffix = os.path.splitext(os.path.basename(name))
     content_sha256 = hashlib.sha256(data).hexdigest()
@@ -808,6 +883,27 @@ def _write_collision_safe(
                 identity=(private.st_dev, private.st_ino),
                 created=True,
             )
+            matched = regular_file_matches(filename)
+            if matched is not None:
+                require_projected_size(
+                    private_name=temp_name,
+                    private_state=private,
+                    additional_size=0,
+                )
+                out_dir.verify()
+                return result(
+                    publication(
+                        filename,
+                        size=matched.st_size,
+                        identity=(matched.st_dev, matched.st_ino),
+                        created=False,
+                    )
+                )
+            require_projected_size(
+                private_name=temp_name,
+                private_state=private,
+                additional_size=private.st_size,
+            )
             try:
                 os.link(
                     temp_name,
@@ -819,6 +915,11 @@ def _write_collision_safe(
             except FileExistsError:
                 matched = regular_file_matches(filename)
                 if matched is not None:
+                    require_projected_size(
+                        private_name=temp_name,
+                        private_state=private,
+                        additional_size=0,
+                    )
                     out_dir.verify()
                     return result(
                         publication(
@@ -1995,7 +2096,15 @@ def download_candidate(
                             f["name"],
                             data,
                             _return_entry=True,
+                            max_total_bytes=_MAX_PAPER_BYTES,
+                            transient_files=(staging,),
                         )
+                    except _PaperDataLimitError as exc:
+                        skipped.append({
+                            "name": f["name"],
+                            "reason": str(exc),
+                        })
+                        continue
                     except (OSError, ValueError) as exc:
                         skipped.append({
                             "name": f["name"],
@@ -2085,7 +2194,8 @@ def download_candidate(
                 return
             reason = (
                 "published output verification required reconciliation "
-                f"{boundary} provenance publication: {error}"
+                f"at the {boundary} reconciliation boundary before "
+                f"provenance publication: {error}"
             )
             if outcomes:
                 reason += "; " + "; ".join(outcomes)
@@ -2094,7 +2204,7 @@ def download_candidate(
                 "reason": reason,
             })
 
-        for boundary in ("before", "after"):
+        for boundary in ("initial", "final"):
             published_outputs, outcomes, boundary_error = _reconcile_publications(
                 output,
                 published_outputs,

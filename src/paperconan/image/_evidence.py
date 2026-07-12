@@ -885,6 +885,7 @@ def write_native_pair_evidence(
             root_fd, images_fd, evidence_fd = directory_fds
             budget.initialize_from_images_fd(images_fd)
             staged: list[tuple[str, int, str]] = []
+            publication_incomplete = False
             try:
                 temp_name, temp_fd = _stage_image(
                     crop_a,
@@ -926,21 +927,29 @@ def write_native_pair_evidence(
                     existing_size=existing_size,
                     staged_size=staged_size,
                 )
-                _publish_staged_images(
-                    root,
-                    root_fd,
-                    images_fd,
-                    evidence_fd,
-                    staged,
-                )
+                try:
+                    _publish_staged_images(
+                        root,
+                        root_fd,
+                        images_fd,
+                        evidence_fd,
+                        staged,
+                    )
+                except _EvidencePublicationRecoveryError:
+                    publication_incomplete = True
+                    raise
                 budget.commit_replacement(
                     existing_size=existing_size,
                     staged_size=staged_size,
                 )
             finally:
-                for temp_name, temp_fd, _ in staged:
-                    os.close(temp_fd)
-                    _unlink_at(temp_name, evidence_fd)
+                try:
+                    for temp_name, temp_fd, _ in staged:
+                        os.close(temp_fd)
+                        _unlink_at(temp_name, evidence_fd)
+                finally:
+                    if publication_incomplete:
+                        budget.resynchronize_from_images_fd(images_fd)
     return {
         "crop_a_path": _relative_path(crop_a_path, root),
         "crop_b_path": _relative_path(crop_b_path, root),

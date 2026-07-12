@@ -1645,7 +1645,6 @@ def test_native_evidence_publication_failure_retains_visible_partial_set(
         )
 
     assert failed
-    assert budget.used_bytes == used_before
     installed_count = failure_step - 1
     assert [
         os.path.lexists(evidence_dir / name)
@@ -1654,6 +1653,11 @@ def test_native_evidence_publication_failure_retains_visible_partial_set(
         index < installed_count
         for index in range(len(final_names))
     ]
+    retained_size = sum(
+        (evidence_dir / name).stat().st_size
+        for name in final_names[:installed_count]
+    )
+    assert budget.used_bytes == used_before + retained_size
     error = str(exc_info.value)
     assert "publication incomplete" in error
     for name in final_names[:installed_count]:
@@ -1664,6 +1668,25 @@ def test_native_evidence_publication_failure_retains_visible_partial_set(
         if path.name.startswith(".paperconan-evidence-")
     ]
     assert hidden_entries == []
+
+    budget.max_bytes = budget.used_bytes
+    later_id = f"{evidence_id}-later"
+    with pytest.raises(
+        ValueError,
+        match="PAPERCONAN_MAX_IMAGE_TOTAL_MB",
+    ):
+        write_native_pair_evidence(
+            str(native),
+            (10, 10, 150, 130),
+            (160, 10, 300, 130),
+            str(out),
+            later_id,
+            artifact_budget=budget,
+        )
+    assert not any(
+        path.name.startswith(later_id)
+        for path in evidence_dir.iterdir()
+    )
 
 
 def test_evidence_publication_retains_concurrent_final_without_backups(

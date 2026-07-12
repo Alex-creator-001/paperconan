@@ -454,6 +454,133 @@ def test_direct_files_with_same_name_publish_distinct_files_and_provenance(
     } == expected_sources
 
 
+def test_direct_download_at_exact_paper_cap_is_published(
+    monkeypatch,
+    tmp_path,
+):
+    payload = b"a,b\n1,2\n"
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "content_type": "text/csv",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload))
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == [str(tmp_path / "data.csv")]
+    assert (tmp_path / "data.csv").read_bytes() == payload
+    assert summary["skipped"] == []
+
+
+def test_direct_download_one_byte_over_projected_paper_cap_is_skipped(
+    monkeypatch,
+    tmp_path,
+):
+    payload = b"a,b\n1,2\n"
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "content_type": "text/csv",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload) - 1)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == []
+    assert not (tmp_path / "data.csv").exists()
+    assert any(
+        "projected paper data exceeds per-paper cap" in item["reason"]
+        for item in summary["skipped"]
+    )
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert sidecar["downloads"] == []
+
+
+def test_direct_exact_content_collision_reuse_is_not_double_counted(
+    monkeypatch,
+    tmp_path,
+):
+    payload = b"a,b\n1,2\n"
+    existing = tmp_path / "data.csv"
+    existing.write_bytes(payload)
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "content_type": "text/csv",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, "_MAX_PAPER_BYTES", len(payload))
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": "data.csv",
+            "download_url": "https://example.test/data.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == [str(existing)]
+    assert existing.read_bytes() == payload
+    assert summary["skipped"] == []
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+    assert sidecar["downloads"] == [{
+        "file": "data.csv",
+        "source_url": "https://example.test/data.csv",
+        "content_type": "text/csv",
+        "asset_type": "tabular",
+        "size": len(payload),
+    }]
+
+
 def test_download_candidate_pins_output_root_across_publications(
     monkeypatch,
     tmp_path,
@@ -1806,7 +1933,7 @@ def _publication_candidate(publication_kind):
     "publication_kind",
     ["direct", "oa", "supplementary"],
 )
-@pytest.mark.parametrize("boundary", ["before", "after"])
+@pytest.mark.parametrize("boundary", ["initial", "final"])
 @pytest.mark.parametrize("failure_mode", ["transient", "persistent"])
 def test_final_verification_reconciles_and_coordinates_sidecar(
     monkeypatch,
@@ -1873,7 +2000,7 @@ def test_final_verification_reconciles_and_coordinates_sidecar(
         if not final_phase:
             return real_reconcile(*args, **kwargs)
         final_boundary_calls += 1
-        active_boundary = "before" if final_boundary_calls == 1 else "after"
+        active_boundary = "initial" if final_boundary_calls == 1 else "final"
         try:
             return real_reconcile(*args, **kwargs)
         finally:
@@ -1934,9 +2061,12 @@ def test_final_verification_reconciles_and_coordinates_sidecar(
     reason = next(
         item["reason"]
         for item in summary["skipped"]
-        if "provenance publication" in item["reason"]
+        if "before provenance publication" in item["reason"]
     )
-    assert f"{boundary} provenance publication" in reason
+    assert (
+        f"{boundary} reconciliation boundary before provenance publication"
+        in reason
+    )
     if failure_mode == "transient":
         assert (
             "recovered stable output after bounded verification retry: data.csv"

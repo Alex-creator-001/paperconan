@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -118,6 +119,128 @@ def test_exact_duplicate_files_are_one_asset_with_all_source_names(tmp_path):
     assert errors == []
     assert len(assets) == 1
     assert assets[0]["source_files"] == ["A.png", "B.png"]
+
+
+def test_source_provenance_does_not_follow_sidecar_symlink(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    outside = tmp_path / "outside-source.json"
+    outside.write_text(
+        json.dumps({
+            "downloads": [{
+                "file": "FigA.png",
+                "source_url": "https://example.test/outside.png",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    (source / "paperconan_source.json").symlink_to(outside)
+
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(tmp_path / "audit"),
+    )
+
+    assert errors == []
+    assert assets[0]["source_type"] == "local_image"
+    assert assets[0]["source_url"] is None
+
+
+def test_source_provenance_rejects_oversized_sidecar(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    sidecar = source / "paperconan_source.json"
+    sidecar.write_text(
+        json.dumps({
+            "downloads": [{
+                "file": "FigA.png",
+                "source_url": "https://example.test/oversized.png",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_assets, "_MAX_SOURCE_PROVENANCE_BYTES", 32)
+
+    assert _assets._source_provenance(source) == {}
+
+
+def test_source_provenance_rejects_non_dictionary_download_items(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "paperconan_source.json").write_text(
+        '{"downloads":["value"]}',
+        encoding="utf-8",
+    )
+
+    assert _assets._source_provenance(source) == {}
+
+
+def test_source_provenance_rejects_sidecar_path_swap(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    sidecar = source / "paperconan_source.json"
+    displaced = source / "paperconan_source.displaced.json"
+    replacement = source / "paperconan_source.replacement.json"
+    sidecar.write_text(
+        '{"downloads":[{"file":"FigA.png","source_url":"original"}]}',
+        encoding="utf-8",
+    )
+    replacement.write_text(
+        '{"downloads":[{"file":"FigA.png","source_url":"swapped!"}]}',
+        encoding="utf-8",
+    )
+    real_open = os.open
+    swapped = False
+
+    def swap_after_sidecar_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        fd = real_open(path, flags, *args, **kwargs)
+        if (
+            not swapped
+            and os.fspath(path) == "paperconan_source.json"
+            and kwargs.get("dir_fd") is not None
+        ):
+            sidecar.rename(displaced)
+            replacement.rename(sidecar)
+            swapped = True
+        return fd
+
+    monkeypatch.setattr(_assets.os, "open", swap_after_sidecar_open)
+
+    assert _assets._source_provenance(source) == {}
+    assert swapped
+
+
+def test_source_provenance_rejects_same_inode_mutation_during_read(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    sidecar = source / "paperconan_source.json"
+    original = b'{"downloads":[{"file":"FigA.png","source_url":"original"}]}'
+    replacement = b'{"downloads":[{"file":"FigA.png","source_url":"mutated!"}]}'
+    assert len(original) == len(replacement)
+    sidecar.write_bytes(original)
+    real_read = os.read
+    mutated = False
+
+    def mutate_after_first_read(fd, size):
+        nonlocal mutated
+        payload = real_read(fd, size)
+        if payload and not mutated:
+            with sidecar.open("r+b") as fh:
+                fh.write(replacement)
+                fh.flush()
+                os.fsync(fh.fileno())
+            mutated = True
+        return payload
+
+    monkeypatch.setattr(_assets.os, "read", mutate_after_first_read)
+
+    assert _assets._source_provenance(source) == {}
+    assert mutated
 
 
 @pytest.mark.parametrize(
@@ -1428,8 +1551,13 @@ def test_second_no_replace_install_failure_retains_first_fresh_asset(
         ),
     )
     output = tmp_path / "audit"
+    budget = _assets.ImageArtifactBudget(1024 * 1024 * 1024)
 
-    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+        artifact_budget=budget,
+    )
 
     assert assets == []
     assert errors
@@ -1437,6 +1565,30 @@ def test_second_no_replace_install_failure_retains_first_fresh_asset(
     assert "retained uncertain visible entry" in errors[0]["error"]
     assert os.path.isfile(output / "images" / "native" / f"{stem}.png")
     assert not os.path.lexists(output / "images" / "preview" / preview_name)
+    retained_bytes = (
+        output / "images" / "native" / f"{stem}.png"
+    ).stat().st_size
+    assert budget.used_bytes == retained_bytes
+
+    budget.max_bytes = retained_bytes
+    _image(source / "FigB.png", color=(180, 60, 20))
+    later_assets, later_errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+        artifact_budget=budget,
+    )
+
+    assert later_assets == []
+    assert later_errors
+    assert all(
+        "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in item["error"]
+        for item in later_errors
+    )
+    assert budget.used_bytes == retained_bytes
+    assert not any(
+        path.name.startswith("img-") and path.name != f"{stem}.png"
+        for path in (output / "images").rglob("*")
+    )
 
 
 def test_rerun_retains_prior_symlink_pair_without_publication(tmp_path):

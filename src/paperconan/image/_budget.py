@@ -110,6 +110,10 @@ class ImageArtifactBudget:
         self.used_bytes = _regular_tree_size(images_fd)
         self._initialized = True
 
+    def resynchronize_from_images_fd(self, images_fd: int) -> None:
+        self.used_bytes = _regular_tree_size(images_fd)
+        self._initialized = True
+
     def initialize_from_root(self, root: Path) -> None:
         if self._initialized:
             return

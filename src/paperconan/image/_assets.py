@@ -27,6 +27,9 @@ _MAX_IMAGE_MB = float(os.environ.get("PAPERCONAN_MAX_IMAGE_MB", "100"))
 _MAX_IMAGE_BYTES = int(_MAX_IMAGE_MB * 1024 * 1024)
 _MAX_IMAGE_PIXELS = int(os.environ.get("PAPERCONAN_MAX_IMAGE_PIXELS", "100000000"))
 _MAX_IMAGE_ASSETS = int(os.environ.get("PAPERCONAN_MAX_IMAGE_ASSETS", "1000"))
+_MAX_SOURCE_PROVENANCE_BYTES = 8 * 1024 * 1024
+_SOURCE_PROVENANCE_NAME = "paperconan_source.json"
+_SOURCE_PROVENANCE_READ_BYTES = 64 * 1024
 _PDF_DPI = 200
 
 
@@ -61,17 +64,131 @@ def _relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
+def _same_entry_identity(
+    first: os.stat_result,
+    second: os.stat_result,
+) -> bool:
+    return (
+        first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and stat.S_IFMT(first.st_mode) == stat.S_IFMT(second.st_mode)
+    )
+
+
+def _stable_provenance_file_state(
+    initial: os.stat_result,
+    opened: os.stat_result,
+    current: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(initial.st_mode)
+        and stat.S_ISREG(opened.st_mode)
+        and stat.S_ISREG(current.st_mode)
+        and _same_entry_identity(initial, opened)
+        and _same_entry_identity(initial, current)
+        and opened.st_size == initial.st_size
+        and current.st_size == initial.st_size
+        and opened.st_mtime_ns == initial.st_mtime_ns
+        and current.st_mtime_ns == initial.st_mtime_ns
+        and opened.st_ctime_ns == initial.st_ctime_ns
+        and current.st_ctime_ns == initial.st_ctime_ns
+    )
+
+
+def _read_exact_provenance_fd(fd: int, size: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    remaining = size
+    chunks = []
+    while remaining:
+        chunk = os.read(
+            fd,
+            min(_SOURCE_PROVENANCE_READ_BYTES, remaining),
+        )
+        if not chunk:
+            raise ValueError("provenance sidecar changed during bounded read")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(fd, 1):
+        raise ValueError("provenance sidecar changed during bounded read")
+    return b"".join(chunks)
+
+
 def _source_provenance(in_dir: Path) -> dict[str, dict]:
-    sidecar = in_dir / "paperconan_source.json"
-    if not sidecar.is_file():
-        return {}
+    root = Path(os.path.abspath(in_dir))
+    root_fd = sidecar_fd = -1
     try:
-        data = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened_root = os.fstat(root_fd)
+        current_root = os.stat(root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or not stat.S_ISDIR(current_root.st_mode)
+            or not _same_entry_identity(opened_root, current_root)
+        ):
+            return {}
+        sidecar_fd = os.open(
+            _SOURCE_PROVENANCE_NAME,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        initial = os.fstat(sidecar_fd)
+        current = os.stat(
+            _SOURCE_PROVENANCE_NAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not _stable_provenance_file_state(initial, initial, current)
+            or initial.st_size > _MAX_SOURCE_PROVENANCE_BYTES
+        ):
+            return {}
+        payload = _read_exact_provenance_fd(sidecar_fd, initial.st_size)
+        opened = os.fstat(sidecar_fd)
+        current = os.stat(
+            _SOURCE_PROVENANCE_NAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        if not _stable_provenance_file_state(initial, opened, current):
+            return {}
+        if hashlib.sha256(
+            _read_exact_provenance_fd(sidecar_fd, initial.st_size)
+        ).digest() != hashlib.sha256(payload).digest():
+            return {}
+        opened = os.fstat(sidecar_fd)
+        current = os.stat(
+            _SOURCE_PROVENANCE_NAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        current_root = os.stat(root, follow_symlinks=False)
+        if (
+            not _stable_provenance_file_state(initial, opened, current)
+            or not _same_entry_identity(opened_root, current_root)
+        ):
+            return {}
+        data = json.loads(payload.decode("utf-8"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return {}
+    finally:
+        if sidecar_fd >= 0:
+            os.close(sidecar_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+    if not isinstance(data, dict):
+        return {}
+    downloads = data.get("downloads")
+    if (
+        not isinstance(downloads, list)
+        or not all(isinstance(item, dict) for item in downloads)
+    ):
         return {}
     return {
         str(item.get("file")): item
-        for item in data.get("downloads", []) or []
+        for item in downloads
         if item.get("file")
     }
 
@@ -704,6 +821,7 @@ def _record_image(
     root_fd, images_fd, native_fd, preview_fd = directory_fds
     native_temp_name = preview_temp_name = None
     native_temp_fd = preview_temp_fd = None
+    publication_incomplete = False
     try:
         _verify_asset_directories(
             output_root,
@@ -770,19 +888,23 @@ def _record_image(
                 existing_size=existing_size,
                 staged_size=staged_size,
             )
-            _publish_asset_pair(
-                output_root=output_root,
-                root_fd=root_fd,
-                images_fd=images_fd,
-                native_fd=native_fd,
-                preview_fd=preview_fd,
-                native_temp_name=native_temp_name,
-                preview_temp_name=preview_temp_name,
-                native_temp_fd=native_temp_fd,
-                preview_temp_fd=preview_temp_fd,
-                native_name=native_name,
-                preview_name=preview_name,
-            )
+            try:
+                _publish_asset_pair(
+                    output_root=output_root,
+                    root_fd=root_fd,
+                    images_fd=images_fd,
+                    native_fd=native_fd,
+                    preview_fd=preview_fd,
+                    native_temp_name=native_temp_name,
+                    preview_temp_name=preview_temp_name,
+                    native_temp_fd=native_temp_fd,
+                    preview_temp_fd=preview_temp_fd,
+                    native_name=native_name,
+                    preview_name=preview_name,
+                )
+            except _AssetPublicationRecoveryError:
+                publication_incomplete = True
+                raise
             artifact_budget.commit_replacement(
                 existing_size=existing_size,
                 staged_size=staged_size,
@@ -792,12 +914,16 @@ def _record_image(
         except Exception:
             raise
     finally:
-        if native_temp_fd is not None:
-            os.close(native_temp_fd)
-        if preview_temp_fd is not None:
-            os.close(preview_temp_fd)
-        _unlink_at(native_temp_name, native_fd)
-        _unlink_at(preview_temp_name, preview_fd)
+        try:
+            if native_temp_fd is not None:
+                os.close(native_temp_fd)
+            if preview_temp_fd is not None:
+                os.close(preview_temp_fd)
+            _unlink_at(native_temp_name, native_fd)
+            _unlink_at(preview_temp_name, preview_fd)
+        finally:
+            if publication_incomplete:
+                artifact_budget.resynchronize_from_images_fd(images_fd)
     return {
         "asset_id": asset_id,
         "file": source.name,
