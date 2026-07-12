@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import os
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ pytest.importorskip("cv2")
 
 from paperconan.image._assets import prepare_image_assets
 from paperconan.image import _diagnostics, _evidence
+from paperconan.image._budget import ImageArtifactBudget
 from paperconan import _html
 from paperconan.image._diagnostics import diagnose_image_assets
 from paperconan.image._evidence import write_native_pair_evidence
@@ -39,6 +42,7 @@ def _diagnostic_asset(root: Path) -> tuple[Path, list[dict]]:
         "asset_id": "img:fig1",
         "file": "Fig1.png",
         "path": native.relative_to(out).as_posix(),
+        "sha256": hashlib.sha256(native.read_bytes()).hexdigest(),
     }]
 
 
@@ -407,6 +411,41 @@ def test_diagnostics_decode_registered_bytes_with_imdecode(tmp_path, monkeypatch
     assert decoded
 
 
+def test_diagnostics_rejects_registered_image_outside_manifest_identity(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(native)
+    proposed = False
+
+    def track_panel_proposal(image):
+        nonlocal proposed
+        proposed = True
+        return [(0, 0, 140, 120), (150, 0, 290, 120)], False
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "_propose_panels_bounded",
+        track_panel_proposal,
+    )
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert not proposed
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "registered image identity does not match asset manifest",
+    }]
+
+
 def test_diagnostics_reject_file_size_before_imdecode(tmp_path, monkeypatch):
     out, assets = _diagnostic_asset(tmp_path)
     cv2 = _diagnostics._cv2()
@@ -713,6 +752,7 @@ def test_scan_wide_comparison_ceiling_stops_across_assets(
         "asset_id": "img:fig2",
         "file": "Fig2.png",
         "path": second.relative_to(out).as_posix(),
+        "sha256": hashlib.sha256(second.read_bytes()).hexdigest(),
     }]
     boxes = [
         (0, 0, 4, 4),
@@ -1073,7 +1113,78 @@ def test_native_evidence_validates_second_crop_before_writing(tmp_path):
     assert not (out / "images" / "evidence").exists()
 
 
-def test_native_evidence_crop_pixel_cap_is_dynamic_and_writes_nothing_on_rejection(
+def test_native_evidence_rejects_oversized_replacement_before_hash_or_decode(
+    tmp_path,
+    monkeypatch,
+):
+    out = tmp_path / "audit"
+    native = out / "images" / "native" / "source.png"
+    native.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(native)
+    expected_sha256 = hashlib.sha256(native.read_bytes()).hexdigest()
+    native.write_bytes(b"replacement" * 32)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_MB", "0.00001")
+
+    def reject_hashing(*args, **kwargs):
+        raise AssertionError("oversized evidence source must not be hashed")
+
+    def reject_decode(*args, **kwargs):
+        raise AssertionError("oversized evidence source must not be decoded")
+
+    monkeypatch.setattr(_evidence.hashlib, "sha256", reject_hashing)
+    monkeypatch.setattr(Image, "open", reject_decode)
+
+    with pytest.raises(
+        ValueError,
+        match="registered image exceeds PAPERCONAN_MAX_IMAGE_MB",
+    ):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 4, 4),
+            (4, 4, 8, 8),
+            str(out),
+            "image-pair-oversized-replacement",
+            expected_sha256=expected_sha256,
+        )
+
+    assert not (out / "images" / "evidence").exists()
+
+
+def test_native_evidence_rejects_full_image_pixels_before_crop_validation(
+    tmp_path,
+    monkeypatch,
+):
+    out = tmp_path / "audit"
+    native = out / "images" / "native" / "source.png"
+    native.parent.mkdir(parents=True)
+    Image.new("RGB", (11, 10), (255, 0, 0)).save(native)
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "100")
+
+    def reject_crop_validation(*args, **kwargs):
+        raise AssertionError("oversized full image must precede crop validation")
+
+    monkeypatch.setattr(
+        _evidence,
+        "_validated_crop_box",
+        reject_crop_validation,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="registered image exceeds PAPERCONAN_MAX_IMAGE_PIXELS",
+    ):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 5, 5),
+            (5, 5, 10, 10),
+            str(out),
+            "image-pair-full-pixel-cap",
+        )
+
+    assert not (out / "images" / "evidence").exists()
+
+
+def test_native_evidence_full_image_pixel_cap_is_dynamic_and_writes_nothing_on_rejection(
     tmp_path,
     monkeypatch,
 ):
@@ -1083,7 +1194,7 @@ def test_native_evidence_crop_pixel_cap_is_dynamic_and_writes_nothing_on_rejecti
     out = tmp_path / "audit"
     assets, _ = prepare_image_assets(str(source), str(out))
     native = out / assets[0]["path"]
-    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "99")
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "43399")
 
     with pytest.raises(ValueError, match="PAPERCONAN_MAX_IMAGE_PIXELS"):
         write_native_pair_evidence(
@@ -1096,7 +1207,7 @@ def test_native_evidence_crop_pixel_cap_is_dynamic_and_writes_nothing_on_rejecti
 
     assert not (out / "images" / "evidence").exists()
 
-    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "100")
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "43400")
     evidence = write_native_pair_evidence(
         str(native),
         (0, 0, 10, 10),
@@ -1450,6 +1561,109 @@ def test_native_evidence_atomically_replaces_final_symlinks_and_reruns(tmp_path)
     with Image.open(final_preview) as preview:
         assert preview.width <= 1600
     assert not any(path.name.startswith(".") for path in evidence_dir.iterdir())
+
+
+@pytest.mark.parametrize("failure_step", [2, 3])
+@pytest.mark.parametrize("rerun", [False, True])
+def test_native_evidence_publication_failure_rolls_back_complete_set(
+    tmp_path,
+    monkeypatch,
+    failure_step,
+    rerun,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    evidence_id = f"image-pair-rollback-{failure_step}-{int(rerun)}"
+    final_names = [
+        f"{evidence_id}-a.png",
+        f"{evidence_id}-b.png",
+        f"{evidence_id}-preview.jpg",
+    ]
+    evidence_dir = out / "images" / "evidence"
+    prior_bytes = None
+    if rerun:
+        write_native_pair_evidence(
+            str(native),
+            (10, 10, 150, 130),
+            (160, 10, 300, 130),
+            str(out),
+            evidence_id,
+        )
+        prior_bytes = {
+            name: (evidence_dir / name).read_bytes()
+            for name in final_names
+        }
+        Image.new("RGB", (310, 140), (20, 180, 70)).save(native)
+
+    budget = ImageArtifactBudget(1024 * 1024 * 1024)
+    budget.initialize_from_root(out)
+    used_before = budget.used_bytes
+    real_replace = os.replace
+    install_calls = 0
+    failed = False
+
+    def fail_selected_install(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+    ):
+        nonlocal install_calls, failed
+        if (
+            not failed
+            and Path(src).name.startswith(".paperconan-evidence-")
+            and Path(dst).name in final_names
+        ):
+            install_calls += 1
+            if install_calls == failure_step:
+                failed = True
+                raise OSError(
+                    f"synthetic evidence install {failure_step} failure"
+                )
+        return real_replace(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(_evidence.os, "replace", fail_selected_install)
+
+    with pytest.raises(
+        OSError,
+        match=f"synthetic evidence install {failure_step} failure",
+    ):
+        write_native_pair_evidence(
+            str(native),
+            (10, 10, 150, 130),
+            (160, 10, 300, 130),
+            str(out),
+            evidence_id,
+            artifact_budget=budget,
+        )
+
+    assert failed
+    assert budget.used_bytes == used_before
+    if prior_bytes is None:
+        assert not any(
+            os.path.lexists(evidence_dir / name)
+            for name in final_names
+        )
+    else:
+        assert {
+            name: (evidence_dir / name).read_bytes()
+            for name in final_names
+        } == prior_bytes
+    assert not any(
+        path.name.startswith(".paperconan-evidence-")
+        for path in evidence_dir.iterdir()
+    )
 
 
 def test_diagnostic_finding_ids_and_order_are_deterministic(tmp_path):

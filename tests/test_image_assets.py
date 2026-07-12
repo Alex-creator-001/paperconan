@@ -1163,27 +1163,108 @@ def test_source_mutation_after_initial_hash_publishes_nothing(
     image_path = source / "FigA.png"
     _image(image_path)
     original_digest = _assets._sha256(image_path)
-    real_sha256 = _assets._sha256
+    original_stat = image_path.stat()
+    original_identity = (original_stat.st_dev, original_stat.st_ino)
+    real_sha256_fd = _assets._sha256_fd
     mutated = False
 
-    def hash_then_mutate(path):
+    def hash_then_mutate(fd):
         nonlocal mutated
-        digest = real_sha256(path)
-        if not mutated and path == image_path:
+        digest = real_sha256_fd(fd)
+        current = os.fstat(fd)
+        if (
+            not mutated
+            and (current.st_dev, current.st_ino) == original_identity
+        ):
             mutated = True
             _image(image_path, color=(1, 2, 3))
         return digest
 
-    monkeypatch.setattr(_assets, "_sha256", hash_then_mutate)
+    monkeypatch.setattr(_assets, "_sha256_fd", hash_then_mutate)
     output = tmp_path / "audit"
 
     assets, errors = _assets.prepare_image_assets(str(source), str(output))
 
-    assert original_digest != real_sha256(image_path)
+    assert original_digest != _assets._sha256(image_path)
     assert assets == []
     assert errors
     assert "source changed while preparing image asset" in errors[0]["error"]
     assert not list((output / "images").rglob("img-*"))
+
+
+def test_local_image_stat_hash_replacement_uses_one_stable_source_handle(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    image_path = source / "FigA.png"
+    _image(image_path)
+    original_bytes = image_path.read_bytes()
+    original_stat = image_path.stat()
+    original_identity = (original_stat.st_dev, original_stat.st_ino)
+    original_digest = _assets._sha256(image_path)
+    replacement_bytes = b"replacement" * (len(original_bytes) + 1)
+    replacement_path = tmp_path / "replacement.png"
+    replacement_path.write_bytes(replacement_bytes)
+    monkeypatch.setattr(_assets, "_MAX_IMAGE_BYTES", len(original_bytes))
+    real_path_stat = Path.stat
+    real_fstat = os.fstat
+    real_sha256 = _assets._sha256
+    real_image_open = PIL.open
+    path_stat_calls = 0
+    source_fstat_calls = 0
+    swapped = False
+    pathname_hashed = False
+    decoded_identities = []
+
+    def replace_after_path_stat(path, *args, **kwargs):
+        nonlocal path_stat_calls, swapped
+        current = real_path_stat(path, *args, **kwargs)
+        if path == image_path:
+            path_stat_calls += 1
+            if path_stat_calls == 2 and not swapped:
+                replacement_path.replace(image_path)
+                swapped = True
+        return current
+
+    def replace_after_descriptor_size(fd):
+        nonlocal source_fstat_calls, swapped
+        current = real_fstat(fd)
+        if (current.st_dev, current.st_ino) == original_identity:
+            source_fstat_calls += 1
+            if source_fstat_calls == 2 and not swapped:
+                replacement_path.replace(image_path)
+                swapped = True
+        return current
+
+    def track_pathname_hash(path):
+        nonlocal pathname_hashed
+        pathname_hashed = True
+        return real_sha256(path)
+
+    def track_decode(fp, *args, **kwargs):
+        if hasattr(fp, "fileno"):
+            current = real_fstat(fp.fileno())
+            decoded_identities.append((current.st_dev, current.st_ino))
+        return real_image_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", replace_after_path_stat)
+    monkeypatch.setattr(_assets.os, "fstat", replace_after_descriptor_size)
+    monkeypatch.setattr(_assets, "_sha256", track_pathname_hash)
+    monkeypatch.setattr(PIL, "open", track_decode)
+    output = tmp_path / "audit"
+
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+
+    assert swapped
+    assert not pathname_hashed
+    assert errors == []
+    assert len(assets) == 1
+    assert assets[0]["sha256"] == original_digest
+    assert decoded_identities == [original_identity]
+    assert (output / assets[0]["path"]).read_bytes() == original_bytes
+    assert image_path.read_bytes() == replacement_bytes
 
 
 def test_second_temp_allocation_failure_cleans_first_temp(tmp_path, monkeypatch):

@@ -409,7 +409,7 @@ def _sha256_fd(fd: int) -> str:
 def _open_stable_source_regular(path: Path):
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
-        raise ValueError("secure PDF source opening is unavailable")
+        raise ValueError("secure image source opening is unavailable")
     fd = -1
     try:
         try:
@@ -418,7 +418,7 @@ def _open_stable_source_regular(path: Path):
             current = os.stat(path, follow_symlinks=False)
         except (OSError, TypeError, NotImplementedError) as exc:
             raise ValueError(
-                f"{path.name}: PDF source is not a stable no-follow regular file"
+                f"{path.name}: image source is not a stable no-follow regular file"
             ) from exc
         if (
             not stat.S_ISREG(opened.st_mode)
@@ -427,7 +427,7 @@ def _open_stable_source_regular(path: Path):
             or opened.st_ino != current.st_ino
         ):
             raise ValueError(
-                f"{path.name}: PDF source is not a stable no-follow regular file"
+                f"{path.name}: image source is not a stable no-follow regular file"
             )
         with os.fdopen(fd, "rb") as fh:
             fd = -1
@@ -683,9 +683,10 @@ def _record_image(
                 raise ValueError(
                     f"{source.name}: source changed while preparing image asset"
                 )
-            os.lseek(native_temp_fd, 0, os.SEEK_SET)
-            with os.fdopen(os.dup(native_temp_fd), "rb") as native_fh:
-                with Image.open(native_fh) as image:
+            decode_fd = source_fd if source_fd is not None else native_temp_fd
+            os.lseek(decode_fd, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(decode_fd), "rb") as source_fh:
+                with Image.open(source_fh) as image:
                     frame_count = int(getattr(image, "n_frames", 1))
                     if frame_count != 1:
                         raise ValueError(
@@ -1003,13 +1004,22 @@ def prepare_image_assets(
     try:
         for path in candidates:
             prov = downloads.get(path.name) or {}
-            add(
-                path,
-                source_type=(
-                    "fetched_image" if prov.get("source_url") else "local_image"
-                ),
-                source_url=prov.get("source_url"),
-            )
+            try:
+                with _open_stable_source_regular(path) as source_fh:
+                    add(
+                        path,
+                        source_fd=source_fh.fileno(),
+                        source_type=(
+                            "fetched_image"
+                            if prov.get("source_url")
+                            else "local_image"
+                        ),
+                        source_url=prov.get("source_url"),
+                    )
+            except ImageDependencyError:
+                raise
+            except Exception as exc:
+                errors.append({"file": path.name, "error": str(exc)})
         if render_pdf:
             with _pdf_staging_directory(directory_fds[0]) as temp_dir_fd:
                 for pdf in pdfs:

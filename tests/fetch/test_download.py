@@ -808,6 +808,83 @@ def test_archive_download_staging_stays_on_pinned_root_during_replacement(
 
 
 @pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_result_rejects_post_extraction_output_root_replacement(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    out_dir = tmp_path / "out"
+    displaced = tmp_path / "displaced-out"
+    payload = _archive_bytes(archive_kind)
+    extraction_complete = False
+    root_replaced = False
+
+    def fake_download(url, destination, **kwargs):
+        os.ftruncate(destination.fd, 0)
+        os.lseek(destination.fd, 0, os.SEEK_SET)
+        os.write(destination.fd, payload)
+        return {
+            "ok": True,
+            "path": destination,
+            "size": len(payload),
+            "source_url": url,
+        }
+
+    extract_name = (
+        "_extract_selected_tar"
+        if archive_kind == "oa"
+        else "_extract_selected_zip"
+    )
+    real_extract = getattr(_download, extract_name)
+    real_verify = _download._PinnedOutputDirectory.verify
+
+    def track_extraction(*args, **kwargs):
+        nonlocal extraction_complete
+        extracted = real_extract(*args, **kwargs)
+        extraction_complete = True
+        return extracted
+
+    def verify_then_replace_root(output):
+        nonlocal root_replaced
+        real_verify(output)
+        if extraction_complete and not root_replaced:
+            out_dir.rename(displaced)
+            out_dir.mkdir()
+            (out_dir / "data.csv").write_bytes(b"replacement,root\n")
+            root_replaced = True
+
+    monkeypatch.setattr(_download, "download_file", fake_download)
+    monkeypatch.setattr(_download, extract_name, track_extraction)
+    monkeypatch.setattr(
+        _download._PinnedOutputDirectory,
+        "verify",
+        verify_then_replace_root,
+    )
+    archive = {
+        "url": f"https://example.test/{archive_kind}",
+        "name": f"{archive_kind}.archive",
+    }
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+    if archive_kind == "oa":
+        candidate["oa_package"] = archive
+    else:
+        candidate["supplementary_archive"] = archive
+
+    summary = _download.download_candidate(candidate, str(out_dir))
+
+    assert root_replaced
+    assert summary["downloaded"] == []
+    assert len(summary["skipped"]) == 1
+    assert "output directory changed" in summary["skipped"][0]["reason"]
+    assert (out_dir / "data.csv").read_bytes() == b"replacement,root\n"
+    assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
 @pytest.mark.parametrize("metadata_kind", ["symlink", "absolute", "parent"])
 def test_archive_download_staging_ignores_unsafe_metadata_paths(
     monkeypatch,

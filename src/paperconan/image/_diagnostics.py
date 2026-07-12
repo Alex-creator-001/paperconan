@@ -306,6 +306,14 @@ def diagnose_image_assets(
                 "error": str(exc),
             })
             continue
+        if source_sha256 != asset.get("sha256"):
+            errors.append({
+                "file": asset.get("file"),
+                "error": (
+                    "registered image identity does not match asset manifest"
+                ),
+            })
+            continue
         boxes, panels_omitted = _propose_panels_bounded(image)
         if panels_omitted:
             errors.append({

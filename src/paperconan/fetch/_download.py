@@ -2,6 +2,7 @@
 content-type sniffing so an HTML error page is never saved as data."""
 from __future__ import annotations
 from contextlib import contextmanager
+from dataclasses import dataclass
 import hashlib
 import io
 import json
@@ -36,6 +37,16 @@ _MAX_PAPER_BYTES = int(_MAX_PAPER_MB * 1024 * 1024)
 
 class _UnstableRegularFileError(OSError):
     pass
+
+
+@dataclass(frozen=True)
+class _PublishedOutputFile:
+    filename: str
+    size: int
+    identity: tuple[int, int]
+
+    def display_path(self, output: _PinnedOutputDirectory) -> str:
+        return os.path.join(output.path, self.filename)
 
 
 class _PinnedOutputDirectory:
@@ -357,15 +368,22 @@ def _write_collision_safe(
     out_dir: str | _PinnedOutputDirectory,
     name: str,
     data: bytes,
-) -> str:
+    *,
+    _return_entry: bool = False,
+) -> str | _PublishedOutputFile:
     if not isinstance(out_dir, _PinnedOutputDirectory):
         with _pinned_output_directory(out_dir) as output:
-            return _write_collision_safe(output, name, data)
+            return _write_collision_safe(
+                output,
+                name,
+                data,
+                _return_entry=_return_entry,
+            )
 
-    def regular_file_matches(filename: str) -> bool:
+    def regular_file_matches(filename: str) -> os.stat_result | None:
         nofollow = getattr(os, "O_NOFOLLOW", None)
         if nofollow is None:
-            return False
+            return None
         try:
             fd = os.open(
                 filename,
@@ -373,16 +391,16 @@ def _write_collision_safe(
                 dir_fd=out_dir.fd,
             )
         except OSError:
-            return False
+            return None
         try:
             opened = os.fstat(fd)
             if not stat.S_ISREG(opened.st_mode):
-                return False
+                return None
             with os.fdopen(fd, "rb") as fh:
                 fd = -1
                 matches = fh.read() == data
             if not matches:
-                return False
+                return None
             try:
                 current = os.stat(
                     filename,
@@ -390,15 +408,30 @@ def _write_collision_safe(
                     follow_symlinks=False,
                 )
             except FileNotFoundError:
-                return False
-            return (
+                return None
+            if (
                 stat.S_ISREG(current.st_mode)
                 and current.st_dev == opened.st_dev
                 and current.st_ino == opened.st_ino
-            )
+            ):
+                return current
+            return None
         finally:
             if fd >= 0:
                 os.close(fd)
+
+    def result(
+        filename: str,
+        current: os.stat_result,
+    ) -> str | _PublishedOutputFile:
+        entry = _PublishedOutputFile(
+            filename=filename,
+            size=current.st_size,
+            identity=(current.st_dev, current.st_ino),
+        )
+        if _return_entry:
+            return entry
+        return entry.display_path(out_dir)
 
     out_dir.verify()
     stem, suffix = os.path.splitext(os.path.basename(name))
@@ -440,17 +473,30 @@ def _write_collision_safe(
                     follow_symlinks=False,
                 )
             except FileExistsError:
-                if regular_file_matches(filename):
+                matched = regular_file_matches(filename)
+                if matched is not None:
                     out_dir.verify()
-                    return os.path.join(out_dir.path, filename)
+                    return result(filename, matched)
                 collision_index += 1
                 continue
             try:
+                current = os.stat(
+                    filename,
+                    dir_fd=out_dir.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_size != len(data)
+                ):
+                    raise _UnstableRegularFileError(
+                        "published output entry is not a stable regular file"
+                    )
                 out_dir.verify()
             except Exception:
                 os.unlink(filename, dir_fd=out_dir.fd)
                 raise
-            return os.path.join(out_dir.path, filename)
+            return result(filename, current)
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
@@ -478,6 +524,7 @@ def _extract_selected_zip(
     *,
     include_images=False,
     max_member_bytes=_DEFAULT_MAX,
+    return_entries=False,
 ):
     extracted = []
     written = _dir_size(out_dir)
@@ -502,7 +549,12 @@ def _extract_selected_zip(
                 data = src.read(max_member_bytes + 1)
                 if len(data) > max_member_bytes:
                     continue
-            dest = _write_collision_safe(out_dir, name, data)
+            dest = _write_collision_safe(
+                out_dir,
+                name,
+                data,
+                _return_entry=return_entries,
+            )
             written += len(data)
             extracted.append(dest)
     return extracted
@@ -514,6 +566,7 @@ def _extract_selected_tar(
     *,
     include_images=False,
     max_member_bytes=_DEFAULT_MAX,
+    return_entries=False,
 ):
     extracted = []
     written = _dir_size(out_dir)
@@ -544,7 +597,12 @@ def _extract_selected_tar(
             data = src.read(max_member_bytes + 1)
             if len(data) > max_member_bytes:
                 continue
-            dest = _write_collision_safe(out_dir, name, data)
+            dest = _write_collision_safe(
+                out_dir,
+                name,
+                data,
+                _return_entry=return_entries,
+            )
             written += len(data)
             extracted.append(dest)
     return extracted
@@ -557,6 +615,30 @@ def _extract_tabular_tar(tar_path, out_dir, max_member_bytes=_DEFAULT_MAX):
         out_dir,
         max_member_bytes=max_member_bytes,
     )
+
+
+def _verify_published_output_file(
+    output: _PinnedOutputDirectory,
+    entry: _PublishedOutputFile,
+) -> None:
+    try:
+        current = os.stat(
+            entry.filename,
+            dir_fd=output.fd,
+            follow_symlinks=False,
+        )
+    except (OSError, TypeError, NotImplementedError) as exc:
+        raise _UnstableRegularFileError(
+            "extracted archive entry is unavailable"
+        ) from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_size != entry.size
+        or (current.st_dev, current.st_ino) != entry.identity
+    ):
+        raise _UnstableRegularFileError(
+            "extracted archive entry is not a stable regular file"
+        )
 
 
 def _download_oa_package(
@@ -583,6 +665,7 @@ def _download_oa_package(
                     out_dir,
                     include_images=include_images,
                     max_member_bytes=max_bytes,
+                    return_entries=True,
                 )
         except _UnstableRegularFileError as e:
             skipped.append({
@@ -590,7 +673,10 @@ def _download_oa_package(
                 "reason": f"downloaded archive is not a stable regular file: {e}",
             })
             return []
-        downloaded.extend(extracted)
+        for entry in extracted:
+            _verify_published_output_file(out_dir, entry)
+        out_dir.verify()
+        downloaded.extend(entry.display_path(out_dir) for entry in extracted)
         return extracted
     except (tarfile.TarError, OSError, ValueError) as e:
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
@@ -627,6 +713,7 @@ def _download_supplementary_archive(
                     out_dir,
                     include_images=include_images,
                     max_member_bytes=max_bytes,
+                    return_entries=True,
                 )
         except _UnstableRegularFileError as e:
             skipped.append({
@@ -634,7 +721,10 @@ def _download_supplementary_archive(
                 "reason": f"downloaded archive is not a stable regular file: {e}",
             })
             return []
-        downloaded.extend(extracted)
+        for entry in extracted:
+            _verify_published_output_file(out_dir, entry)
+        out_dir.verify()
+        downloaded.extend(entry.display_path(out_dir) for entry in extracted)
         return extracted
     except (zipfile.BadZipFile, ValueError) as exc:
         reason = (
@@ -834,8 +924,12 @@ def download_candidate(
                 include_images=include_images,
             )
             provenance_files.extend(
-                _provenance_entry(path, pkg.get("url"), size=os.path.getsize(path))
-                for path in extracted
+                _provenance_entry(
+                    entry.filename,
+                    pkg.get("url"),
+                    size=entry.size,
+                )
+                for entry in extracted
             )
         arch = cand.get("supplementary_archive")
         needs_archive = not downloaded
@@ -854,8 +948,12 @@ def download_candidate(
                 include_images=include_images,
             )
             provenance_files.extend(
-                _provenance_entry(path, arch.get("url"), size=os.path.getsize(path))
-                for path in extracted
+                _provenance_entry(
+                    entry.filename,
+                    arch.get("url"),
+                    size=entry.size,
+                )
+                for entry in extracted
             )
         downloaded = list(dict.fromkeys(downloaded))
         by_file = {}

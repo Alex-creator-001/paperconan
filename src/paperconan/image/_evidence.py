@@ -294,6 +294,28 @@ def _stage_image(
         raise
 
 
+def _move_evidence_final_to_backup(
+    evidence_fd: int,
+    final_name: str,
+) -> str | None:
+    backup_name, backup_fd = _stage_file(evidence_fd)
+    os.close(backup_fd)
+    try:
+        os.replace(
+            final_name,
+            backup_name,
+            src_dir_fd=evidence_fd,
+            dst_dir_fd=evidence_fd,
+        )
+    except FileNotFoundError:
+        _unlink_at(backup_name, evidence_fd)
+        return None
+    except Exception:
+        _unlink_at(backup_name, evidence_fd)
+        raise
+    return backup_name
+
+
 def _publish_staged_images(
     root: Path,
     root_fd: int,
@@ -301,35 +323,90 @@ def _publish_staged_images(
     evidence_fd: int,
     staged: list[tuple[str, int, str]],
 ) -> None:
-    _verify_evidence_directories(
-        root,
-        root_fd,
-        images_fd,
-        evidence_fd,
-    )
-    for temp_name, temp_fd, final_name in staged:
-        _verify_regular_file_entry(
+    backups: list[str | None] = [None] * len(staged)
+    prepared = [False] * len(staged)
+    publication_succeeded = False
+    try:
+        _verify_evidence_directories(
+            root,
+            root_fd,
+            images_fd,
             evidence_fd,
-            temp_name,
-            temp_fd,
         )
-        os.replace(
-            temp_name,
-            final_name,
-            src_dir_fd=evidence_fd,
-            dst_dir_fd=evidence_fd,
-        )
-        _verify_regular_file_entry(
+        for temp_name, temp_fd, _ in staged:
+            _verify_regular_file_entry(
+                evidence_fd,
+                temp_name,
+                temp_fd,
+            )
+        for index, (_, _, final_name) in enumerate(staged):
+            backups[index] = _move_evidence_final_to_backup(
+                evidence_fd,
+                final_name,
+            )
+            prepared[index] = True
+        _verify_evidence_directories(
+            root,
+            root_fd,
+            images_fd,
             evidence_fd,
-            final_name,
-            temp_fd,
         )
-    _verify_evidence_directories(
-        root,
-        root_fd,
-        images_fd,
-        evidence_fd,
-    )
+        for temp_name, temp_fd, final_name in staged:
+            _verify_regular_file_entry(
+                evidence_fd,
+                temp_name,
+                temp_fd,
+            )
+            os.replace(
+                temp_name,
+                final_name,
+                src_dir_fd=evidence_fd,
+                dst_dir_fd=evidence_fd,
+            )
+            _verify_regular_file_entry(
+                evidence_fd,
+                final_name,
+                temp_fd,
+            )
+        _verify_evidence_directories(
+            root,
+            root_fd,
+            images_fd,
+            evidence_fd,
+        )
+        publication_succeeded = True
+    except Exception as publication_error:
+        rollback_error = None
+        for index, (_, _, final_name) in enumerate(staged):
+            if not prepared[index]:
+                continue
+            try:
+                _unlink_at(final_name, evidence_fd)
+            except Exception as exc:
+                rollback_error = rollback_error or exc
+        for index, (_, _, final_name) in enumerate(staged):
+            backup_name = backups[index]
+            if not prepared[index] or backup_name is None:
+                continue
+            try:
+                os.replace(
+                    backup_name,
+                    final_name,
+                    src_dir_fd=evidence_fd,
+                    dst_dir_fd=evidence_fd,
+                )
+                backups[index] = None
+            except Exception as exc:
+                rollback_error = rollback_error or exc
+        if rollback_error is not None:
+            raise RuntimeError(
+                "image evidence publication rollback failed"
+            ) from publication_error
+        raise
+    finally:
+        if publication_succeeded:
+            for backup_name in backups:
+                _unlink_at(backup_name, evidence_fd)
 
 
 def _max_image_bytes() -> int:
@@ -673,6 +750,10 @@ def write_native_pair_evidence(
             source_relative,
             verify_stable=expected_sha256 is not None,
         ) as source_fh:
+            if os.fstat(source_fh.fileno()).st_size > _max_image_bytes():
+                raise ValueError(
+                    "registered image exceeds PAPERCONAN_MAX_IMAGE_MB"
+                )
             if expected_sha256 is not None:
                 digest = hashlib.sha256()
                 for chunk in iter(lambda: source_fh.read(1024 * 1024), b""):
@@ -682,6 +763,15 @@ def write_native_pair_evidence(
                 source_fh.seek(0)
             with Image.open(source_fh) as image:
                 max_pixels = _max_image_pixels()
+                if (
+                    image.width <= 0
+                    or image.height <= 0
+                    or image.width * image.height > max_pixels
+                ):
+                    raise ValueError(
+                        "registered image exceeds "
+                        "PAPERCONAN_MAX_IMAGE_PIXELS"
+                    )
                 validated_a = _validated_crop_box(
                     box_a,
                     width=image.width,
