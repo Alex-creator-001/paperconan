@@ -7,8 +7,8 @@ Use this reference when deciding how strongly to surface a paperconan finding or
 - `needs human context`: the finding could matter, but the agent cannot confirm a key premise from the available data.
 - `Tier 1/2/3`: optional batch/formal-review labels for follow-up priority and difficulty of innocent explanation; see [adjudication-tiers.md](adjudication-tiers.md).
 
-Do not present any label as author intent, misconduct probability, or proof of
-fabrication.
+Do not present any label as author intent, a responsibility conclusion, or
+proof about how the data were produced.
 
 ## First-Pass Ordering
 
@@ -112,7 +112,7 @@ Before reporting them as strong:
 - confirm the mean/SD columns refer to integer data;
 - confirm `SD` is not actually `SEM`;
 - surface the `likely_benign` reminder if present;
-- avoid saying the data was fabricated. Say the reported summary is inconsistent with the stated integer-data premise.
+- avoid making an author-intent claim. Say the reported summary is inconsistent with the stated integer-data premise.
 
 ## PubPeer-Ready Chinese Template
 
@@ -137,7 +137,7 @@ should be shorter.
 
 说明独立性前提。示例句：
 
-> 如果这些是独立测量，数字末位本该像随机抽签一样分散；现在大量不同数值却共享同一末尾，更像它们是从同一个公式、分母或处理流程里生成的。所以重点不是断言造假，而是请作者说明这些数值如何从原始测量得到。
+> 如果这些是独立测量，数字末位本该像随机抽签一样分散；现在大量不同数值却共享同一末尾，更像它们是从同一个公式、分母或处理流程里生成的。所以重点不是判断作者意图，而是请作者说明这些数值如何从原始测量得到。
 
 ### 5. 影响判断
 

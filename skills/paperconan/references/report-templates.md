@@ -14,7 +14,7 @@ Use this for normal interactive audits.
 
 ```text
 I scanned <input>. <N> files were read; <M> files failed to parse.
-These are numerical signals, not misconduct conclusions.
+These are numerical signals, not author-intent conclusions.
 
 Highest-priority finding:
 - Location: <file> :: <sheet>, rows <range>, columns <labels>
@@ -104,6 +104,149 @@ Close with:
 
 ```text
 以上是可复核的数据模式问题，不构成对作者意图或学术不端的判断。
+```
+
+## Adaptive Numeric And Image Report
+
+Use one paper-level verdict and one `paperconan report` invocation for mixed
+numeric and image review. PaperConan registers assets and may provide
+deterministic hints; an external multimodal Agent performs semantic review and
+coverage accounting. PaperConan does not configure model APIs, keys, or
+provider SDKs.
+
+The scan-side `image_assets[]` record used by the Agent is:
+
+```json
+{
+  "asset_id": "img:0123456789abcdef0123",
+  "file": "Fig3.png",
+  "source_files": ["Fig3.png"],
+  "path": "images/native/img-0123456789abcdef0123.png",
+  "preview_path": "images/preview/img-0123456789abcdef0123.jpg",
+  "preview_mime": "image/jpeg",
+  "source_type": "local_image",
+  "source_url": null,
+  "parent_file": null,
+  "page": null,
+  "render_dpi": null,
+  "figure_label": null,
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "width": 2480,
+  "height": 1760,
+  "exif_orientation": 1,
+  "mime": "image/png"
+}
+```
+
+An optional deterministic `image_findings[]` hint has this complete shape:
+
+```json
+{
+  "finding_id": "image:pair:stable-id",
+  "kind": "image_pair_similarity_signal",
+  "severity": "medium",
+  "rule": "two registered image regions retain high structural similarity under flip",
+  "asset_ids": ["img:a"],
+  "regions": [
+    {"asset_id": "img:a", "box": [120, 80, 740, 610]},
+    {"asset_id": "img:a", "box": [820, 80, 1440, 610]}
+  ],
+  "method": "panel_pair_similarity",
+  "score": 0.94,
+  "transform": "flip",
+  "evidence": {
+    "crop_a_path": "images/evidence/image-pair-stable-id-a.png",
+    "crop_b_path": "images/evidence/image-pair-stable-id-b.png",
+    "preview_path": "images/evidence/image-pair-stable-id-preview.jpg"
+  },
+  "profile_action": "kept"
+}
+```
+
+The current deterministic helper compares two native-coordinate regions within
+one registered asset. It does not emit cross-asset comparisons.
+
+`image_findings` are optional hints, not the complete review set. Review every
+registered asset even when this list is empty. Start with the whole image, then
+use a native-pixel crop for small panels or unresolved detail.
+
+Put the Agent judgment in the same `verdict.json findings[]` as numeric
+judgments:
+
+```json
+{
+  "title": "Synthetic mixed review",
+  "verdict": "NEEDS_HUMAN",
+  "paper_conclusion": "The numeric and image material require contextual review.",
+  "findings": [
+    {
+      "finding_type": "numeric",
+      "title": "Numeric relation",
+      "finding_ref": {"kind": "constant_offset"},
+      "review_status": "needs_human",
+      "impact_scope": "supporting",
+      "report_md": "The numeric relation requires source context."
+    },
+    {
+      "finding_type": "image",
+      "title": "Fig. 3 panel pair requires clarification",
+      "finding_ref": {"finding_id": "image:pair:stable-id"},
+      "image_refs": [
+        {"asset_id": "img:a", "box": [120, 80, 740, 610], "label": "A"},
+        {"asset_id": "img:a", "box": [820, 80, 1440, 610], "label": "B"}
+      ],
+      "review_status": "needs_human",
+      "impact_scope": "supporting",
+      "report_md": "The registered regions retain high similarity and require source context."
+    }
+  ],
+  "image_review": {
+    "status": "completed",
+    "reviewed_asset_ids": [],
+    "unresolved_asset_ids": ["img:a"],
+    "unreadable_asset_ids": [],
+    "deferred_asset_ids": [],
+    "note": "coverage accounting completed by a multimodal Agent"
+  }
+}
+```
+
+`finding_ref` is optional for Agent-only image observations; use `image_refs`
+alone when no deterministic hint exists. Image `review_status` accepts
+`needs_human`, `explained`, `different`, or `unresolved`, and unknown values
+become `unresolved`.
+
+An external Agent may create a cross-asset observation that is not
+deterministic `image_findings` output. Label it as Agent-created and omit
+`finding_ref` when no deterministic finding matches:
+
+```json
+{
+  "finding_type": "image",
+  "title": "Agent-created cross-asset observation",
+  "image_refs": [
+    {"asset_id": "img:a", "box": [120, 80, 740, 610], "label": "Fig. 3A"},
+    {"asset_id": "img:b", "box": [40, 55, 660, 585], "label": "Fig. 4B"}
+  ],
+  "review_status": "needs_human",
+  "impact_scope": "supporting",
+  "report_md": "The Agent-registered comparison requires source context."
+}
+```
+
+Every asset must appear in exactly one `image_review` coverage list:
+`reviewed_asset_ids`, `unresolved_asset_ids`, `unreadable_asset_ids`, or
+`deferred_asset_ids`. `image_review.status: "completed"` means coverage
+accounting completed, not that every image question was explained. Use
+`partial` when review is deferred, `unavailable_no_multimodal` when the Agent
+cannot open local images, and `not_requested` only when image review was not
+requested. Unknown `image_review.status` values normalize to `partial`, while
+unknown image finding `review_status` values normalize to `unresolved`.
+
+Render the single unified report with:
+
+```bash
+paperconan report audit/scan.json --verdict verdict.json --out adjudication.html
 ```
 
 ## Batch Verdict Record

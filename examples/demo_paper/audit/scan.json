@@ -1,11 +1,13 @@
 {
   "tool": "paperconan",
   "tool_version": "0.8.3",
-  "scanned_at": "2026-07-12T14:06:49+00:00",
+  "scanned_at": "2026-07-13T06:00:40+00:00",
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
   "n_files": 2,
+  "n_image_source_files": 0,
+  "n_image_assets": 0,
   "n_blocks_with_findings": 3,
   "findings_omitted": 0,
   "scan_errors": [],
@@ -15,13 +17,13 @@
         "file": "ED_Fig2_tumor_volume.xlsx",
         "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
         "n_sheets": 1,
-        "elapsed_ms": 11.753
+        "elapsed_ms": 9.532
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
         "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
         "n_sheets": 2,
-        "elapsed_ms": 0.387
+        "elapsed_ms": 0.361
       }
     ],
     "sheets": [
@@ -32,7 +34,7 @@
         "n_cols": 6,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.132
+        "elapsed_ms": 0.125
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -41,7 +43,7 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.091
+        "elapsed_ms": 0.086
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -50,10 +52,10 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.08
+        "elapsed_ms": 0.079
       }
     ],
-    "elapsed_ms": 21.104
+    "elapsed_ms": 18.541
   },
   "relations_blocks": [
     {
@@ -1211,7 +1213,7 @@
           ],
           "prefilter": "drop",
           "prefilter_reason": "normalized_or_fold_change",
-          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than a fabricated measurement repeat"
+          "likely_benign": "within_col prefilter matched normalized_or_fold_change; this column pattern is usually categorical/integer-coded, an axis/index, a normalized or derived column, or a large-matrix flood rather than an unexplained measurement repeat"
         },
         {
           "kind": "within_col_decimal_repetition",
@@ -2181,5 +2183,7 @@
       "profile_action": "kept",
       "false_positive_context": []
     }
-  ]
+  ],
+  "image_assets": [],
+  "image_findings": []
 }

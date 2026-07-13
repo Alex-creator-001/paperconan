@@ -44,6 +44,11 @@ def fetch_main(argv):
     ap.add_argument("--force", action="store_true",
                     help="download even a candidate with no DOI/title match (--download)")
     ap.add_argument("--all", action="store_true", help="download non-tabular files too")
+    ap.add_argument(
+        "--images",
+        action="store_true",
+        help="also download public image files and PDFs for image review",
+    )
     ap.add_argument("--per-source", type=int, default=5, help="max results per repository (default: 5)")
     args = ap.parse_args(argv)
 
@@ -94,12 +99,20 @@ def fetch_main(argv):
         return 0
 
     out_dir = args.out or "paperconan_data"
-    summary = download_candidate(target, out_dir, tabular_only=not args.all)
+    summary = download_candidate(
+        target,
+        out_dir,
+        tabular_only=not args.all,
+        include_images=args.images,
+    )
     print(f"downloaded {len(summary['downloaded'])} file(s) from {target['cand_id']} -> {out_dir}")
     for p in summary["downloaded"]:
         print(f"  {p}")
     for s in summary["skipped"]:
         print(f"  skipped {s['name']}: {s['reason']}")
     if summary["downloaded"]:
-        print(f"\n  → now run: paperconan {out_dir}")
+        command = f"paperconan {out_dir}"
+        if args.images:
+            command += " --images"
+        print(f"\n  → now run: {command}")
     return 0

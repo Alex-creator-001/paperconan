@@ -1,8 +1,8 @@
 """Extract tabular data locked inside supplementary PDF / Word files.
 
-A great deal of fabrication is visible in numbers that are presented *in the
+Many data inconsistencies are visible in numbers that are presented *in the
 paper itself* — supplementary PDF tables, Word appendix tables — rather than in
-a downloadable .xlsx source-data file. This module pulls those real tables out
+a downloadable .xlsx source-data file. This module pulls those tables out
 and normalizes them into the same ``{sheet_name: rows}`` shape the rest of
 paperconan already consumes, so every existing numeric detector applies with no
 change.

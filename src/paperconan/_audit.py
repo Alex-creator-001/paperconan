@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-paper_audit.py — scan a paper's published source data (xlsx) for data-fabrication red flags.
+paper_audit.py — scan a paper's published source data (xlsx) for statistical signals.
 
 Usage:
     python3 paper_audit.py <dir-with-xlsx-files> [--out OUT_DIR]
@@ -9,7 +9,7 @@ Outputs to <OUT_DIR or <dir>/audit>:
   - scan.json   structured findings (every block, every detector)
   - REPORT.md   ranked top-5 + supporting evidence in markdown
 
-What it detects (red flags for fabricated numeric data):
+What it detects (numeric patterns requiring contextual review):
   1. Identical / constant-offset / constant-ratio / exact-linear column relations
   2. Arithmetic-progression columns (constant first difference)
   3. Repeated last-two-decimal endings beyond chance
@@ -32,6 +32,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from fractions import Fraction
+from pathlib import Path
 
 import openpyxl
 import numpy as np
@@ -1157,7 +1158,7 @@ def _demote_dense_sheets(report_blocks, cap=RELATION_FLOOD_CAP):
 def _demote_reused_progressions(report_blocks):
     """A perfect arithmetic progression that is REUSED — the identical (step, n, first)
     appears in >=2 numeric blocks/sheets — is an independent-variable axis re-plotted across
-    panels (magnetic-field / 2-theta / time / dose / wavelength sweep), not fabricated data.
+    panels (magnetic-field / 2-theta / time / dose / wavelength sweep), not a data inconsistency.
     Real measured data is never a perfect progression; a reused perfect progression is an axis.
     Demote these out of the high/medium review priority (kept in scan.json, reversible via
     forensic). A ONE-OFF perfect progression keeps its severity — that is the genuinely
@@ -1959,7 +1960,7 @@ def _decimal_tail_constant_transform(pairs):
     """True if the matched value pairs share a constant additive offset (vb = va + k) or a constant
     ratio (vb = va * r). That is a benign linear/derived relationship between the two sheets (a shift,
     rescale, or baseline correction that incidentally preserves the fractional tail), NOT the
-    leading-digit fabrication the detector targets (which produces *irregular* per-pair differences)."""
+    irregular leading-digit edit pattern the detector targets."""
     vp = [(va, vb) for _ka, _kb, va, vb, _sig in pairs if va is not None and vb is not None]
     if len(vp) < 3:
         return False
@@ -2284,7 +2285,7 @@ def _shared_cross_sheet_context(ctx_a, ctx_b, pattern, fraction):
 
 def detect_collisions(grids, profile="review", sheets=None):
     """Find pairs of tables (sheets and/or flat files) with many bit-identical decimal
-    values at the SAME (row, col). Catches "copy a table, then tweak a few values" fraud,
+    values at the SAME (row, col). Catches copy-then-edit data inconsistencies,
     whether the copy lives in another sheet of the same workbook or in a separate file.
 
     `grids` maps (file, sheet) -> grid (from _grid_from_rows). Returns one dict per
@@ -3006,20 +3007,41 @@ def _cap_block_findings(groups, cap):
     return omitted
 
 
+def _optional_image_error(prefix, exc):
+    detail = " ".join((str(exc) or exc.__class__.__name__).split())
+    if len(detail) > 500:
+        detail = detail[:497] + "..."
+    return {"error": f"{prefix}: {detail}"}
+
+
 def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
-             profile="review", write_json=True, evidence=True):
+             profile="review", write_json=True, evidence=True, images=False,
+             image_diagnostics=False):
     profile = normalize_profile(profile)
     # The HTML report renders the evidence snippets, so it requires them.
     if write_html:
         evidence = True
-    files = sorted({p for pat in ("*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
-                                  "*.csv", "*.tsv", "*.pdf", "*.docx")
-                    for p in glob.glob(os.path.join(in_dir, pat))})
-    if not files:
+    table_files = sorted({
+        p for pattern in (
+            "*.xlsx", "*.xls", "*.xlsm", "*.xlsb",
+            "*.csv", "*.tsv", "*.pdf", "*.docx",
+        )
+        for p in glob.glob(os.path.join(in_dir, pattern))
+    })
+    from .fetch._files import is_image
+    local_images = sorted(
+        (
+            path for path in glob.glob(os.path.join(in_dir, "*"))
+            if os.path.isfile(path) and is_image(os.path.basename(path))
+        ),
+        key=lambda path: (os.path.basename(path).casefold(), os.path.basename(path)),
+    )
+    if not table_files and not (images and local_images):
+        supported = ".xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx"
+        if images:
+            supported += " / .png / .jpg / .jpeg / .tif / .tiff / .webp"
         raise PaperconanInputError(
-            f"no .xlsx / .xls / .xlsm / .xlsb / .csv / .tsv / .pdf / .docx files in {in_dir}\n"
-            f"(paperconan reads .xlsx via openpyxl, legacy .xls / .xlsm / .xlsb via calamine, "
-            f".csv / .tsv, and tables inside .pdf / .docx)"
+            f"no {supported} files in {in_dir}"
         )
 
     report_blocks = []
@@ -3032,7 +3054,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     scan_stats = {"files": [], "sheets": []}
     scan_start = time.perf_counter()
 
-    for f in files:
+    for f in table_files:
         file_start = time.perf_counter()
         file_stat = {"file": os.path.basename(f), "path": f}
         # Memory guard: a large workbook expands to many GB of Python objects when fully
@@ -3196,13 +3218,74 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
             d["p_adj"] = a
             d["fdr_significant"] = bool(s)
 
+    image_assets = []
+    image_findings = []
+    if images:
+        from .image import ImageDependencyError
+        from .image._assets import prepare_image_assets
+        from .image._budget import ImageArtifactBudget
+        try:
+            image_budget = ImageArtifactBudget.from_environment()
+        except ValueError as exc:
+            scan_errors.append({"error": str(exc)})
+        else:
+            inventory_ready = False
+            try:
+                from .image._dependencies import preflight_image_dependencies
+                preflight_image_dependencies(
+                    render_pdf=False,
+                    diagnostics=False,
+                )
+                image_assets, image_errors = prepare_image_assets(
+                    in_dir,
+                    out_dir,
+                    artifact_budget=image_budget,
+                )
+                scan_errors.extend(image_errors)
+                inventory_ready = True
+            except ImageDependencyError as exc:
+                scan_errors.append(_optional_image_error(
+                    "optional image inventory unavailable",
+                    exc,
+                ))
+            except Exception as exc:
+                scan_errors.append(_optional_image_error(
+                    "optional image inventory unavailable",
+                    exc,
+                ))
+            if image_diagnostics and inventory_ready:
+                try:
+                    preflight_image_dependencies(
+                        render_pdf=False,
+                        diagnostics=True,
+                    )
+                    from .image._diagnostics import diagnose_image_assets
+                    image_findings, diagnostic_errors = diagnose_image_assets(
+                        image_assets,
+                        out_dir,
+                        artifact_budget=image_budget,
+                    )
+                    scan_errors.extend(diagnostic_errors)
+                except ImageDependencyError as exc:
+                    scan_errors.append(_optional_image_error(
+                        "optional image diagnostics unavailable",
+                        exc,
+                    ))
+                except Exception as exc:
+                    scan_errors.append(_optional_image_error(
+                        "optional image diagnostics unavailable",
+                        exc,
+                    ))
+
     out = dict(tool="paperconan",
                tool_version=_version(),
                scanned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                profile=profile,
                input_dir=in_dir,
                paper=_load_provenance(in_dir, paper),
-               n_files=len(files),
+               n_files=len(table_files),
+               n_image_source_files=len(local_images),
+               n_image_assets=len(image_assets),
                n_blocks_with_findings=len(report_blocks),
                findings_omitted=findings_omitted_total,
                scan_errors=scan_errors,
@@ -3212,7 +3295,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
                decimal_tail_clusters=tail_cluster_reports,
-               cross_sheet_findings=cross_sheet_findings)
+               cross_sheet_findings=cross_sheet_findings,
+               image_assets=image_assets,
+               image_findings=image_findings)
     os.makedirs(out_dir, exist_ok=True)
     if write_json:
         with open(os.path.join(out_dir, "scan.json"), "w") as fh:
@@ -3322,14 +3407,27 @@ def main():
         rp.add_argument("--verdict", required=True, help="Path to verdict JSON")
         rp.add_argument("--out", required=True, help="Output HTML path")
         rargs = rp.parse_args(sys.argv[2:])
-        with open(rargs.scan_json, encoding="utf-8") as fh:
-            scan = json.load(fh)
-        with open(rargs.verdict, encoding="utf-8") as fh:
-            verdict = json.load(fh)
-        write_adjudicated_report(scan, verdict, rargs.out)
+        try:
+            with open(rargs.scan_json, encoding="utf-8") as fh:
+                scan = json.load(fh)
+            with open(rargs.verdict, encoding="utf-8") as fh:
+                verdict = json.load(fh)
+            write_adjudicated_report(
+                scan,
+                verdict,
+                rargs.out,
+                artifact_dir=os.path.dirname(os.path.abspath(rargs.scan_json)),
+            )
+        except ValueError as exc:
+            sys.exit(str(exc))
         print(f"wrote {rargs.out}")
         return
-    ap = argparse.ArgumentParser(description="Scan a paper's source data (xlsx/csv/tsv, or tables inside pdf/docx) for fabrication red flags")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Scan a paper's source data (xlsx/csv/tsv, or tables inside "
+            "pdf/docx) for statistical signals and data inconsistencies"
+        )
+    )
     ap.add_argument("in_dir", help="Directory with the paper's source data (*.xlsx/*.csv/*.tsv, or *.pdf/*.docx supplements)")
     ap.add_argument("--out", default=None, help="Output directory (default: <in_dir>/audit)")
     ap.add_argument("--md", action="store_true",
@@ -3343,17 +3441,33 @@ def main():
     ap.add_argument("--profile", choices=("review", "forensic", "triage"),
                     default="review",
                     help="False-positive handling profile: review (default), forensic, or triage")
+    ap.add_argument(
+        "--images",
+        action="store_true",
+        help="inventory local/fetched images and render PDF pages into scan.json image_assets",
+    )
+    ap.add_argument(
+        "--image-diagnostics",
+        action="store_true",
+        help="also run optional non-gating deterministic image similarity helpers",
+    )
     ap.add_argument("--version", action="version", version=f"paperconan {_version()}")
     args = ap.parse_args()
+    if args.image_diagnostics and not args.images:
+        ap.error("--image-diagnostics requires --images")
     out_dir = args.out or os.path.join(args.in_dir, "audit")
     write_html = not args.no_html
     paper = None
     if args.doi or args.title:
         paper = {"doi": args.doi, "title": args.title}
+    from .image import ImageDependencyError
     try:
         res = scan_dir(args.in_dir, out_dir, write_md=args.md, write_html=write_html,
-                       paper=paper, profile=args.profile)
+                       paper=paper, profile=args.profile, images=args.images,
+                       image_diagnostics=args.image_diagnostics)
     except PaperconanInputError as e:
+        sys.exit(str(e))
+    except ImageDependencyError as e:
         sys.exit(str(e))
     outputs = [f"{out_dir}/scan.json"]
     if write_html:

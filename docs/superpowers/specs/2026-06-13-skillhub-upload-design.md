@@ -64,7 +64,7 @@ run there.
 2. **Keep `fetch` as secondary.** One line noting it needs outbound network and
    may be unavailable in restricted runtimes.
 3. **Framing = technical, with strengthened guardrails.** Keep the forensic
-   framing; surface the existing "signal, not verdict / 不是实锤" red-lines near
+   framing; surface the existing "signal, not verdict / 不是最终结论" red-lines near
    the top to stay review-friendly.
 4. **Edit `skills/paperconan/SKILL.md` in place** (single source of truth; the
    changes improve the skill for every consumer). An isolated copy under
@@ -95,7 +95,7 @@ run there.
 
 ## Non-goals
 
-- No fabricated/eyeballed results passed off as real tool output.
+- No invented or eyeballed results passed off as real tool output.
 - No repo-root or pre-made-zip upload; no bypassing the binary rules.
 - No auto-submit without the user's explicit go.
 - Not bundling Python deps (impossible under the binary ban anyway).

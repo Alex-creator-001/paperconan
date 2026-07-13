@@ -1,18 +1,22 @@
 ---
 name: paperconan
 version: 0.8.2
-description: Use when auditing paper source-data tables for numerical integrity signals, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, fabrication red flags, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv and tables in .pdf/.docx; not image forensics or chart digitization.
+description: Use when auditing paper source-data tables and registered image assets for statistical signals or data inconsistencies, interpreting paperconan scan.json/report.html, preparing cautious PubPeer or research-integrity notes, or finding open supplementary data from a DOI/title. Trigger on 论文数据检查, source data audit, paper data audit, suspicious numeric tables, figure review, multimodal image review, PubPeer prep, research integrity, DOI/title data fetch. Covers .xlsx/.csv/.tsv, tables in .pdf/.docx, and adaptive image review by an external multimodal Agent; not chart digitization or autonomous semantic judgment.
 ---
 
 # paperconan
 
-paperconan scans paper source-data tables for numerical anomaly signals. Treat every hit as **signal, not verdict**: report locations and patterns, never intent or misconduct.
+paperconan scans paper source-data tables and can register local image assets
+for external Agent review. Treat every hit as **signal, not verdict**: report
+locations and patterns, never intent or personal accusation. PaperConan does
+not manage model keys or provider SDKs and does not perform autonomous semantic
+judgment.
 
 Tool repository: https://github.com/zixixr/paperconan
 
 ## Core Workflow
 
-0. Ensure the CLI is available before scanning: run `paperconan --version`. If it is missing and pip works, install once with `pip install "paperconan[all]"` (ask first if a virtualenv or non-global install is preferred). If Python/pip is unavailable, ask the user to install and run locally — never fabricate output.
+0. Ensure the CLI is available before scanning: run `paperconan --version`. If it is missing and pip works, install once with `pip install "paperconan[all]"` (ask first if a virtualenv or non-global install is preferred). If Python/pip is unavailable, ask the user to install and run locally — never invent output.
 1. Confirm what the user supplied:
    - Local source-data directory: run `paperconan <input-dir>`.
    - DOI or title: run `paperconan fetch "<DOI or title>"`, choose a matched tabular dataset, download it, then scan the downloaded directory.
@@ -21,6 +25,42 @@ Tool repository: https://github.com/zixixr/paperconan
 3. Parse `scan.json`, then load the reference file needed for the task.
 4. Open the original table when describing a serious finding as worth follow-up. If the original data is unavailable, say the finding is unverified.
 5. Answer cautiously: explain the anomaly, plausible benign explanations, and what human context is needed.
+
+## Adaptive Image Review
+
+Use this workflow when the user requests image review or the source directory
+contains figures that should be reviewed with the numeric material:
+
+1. Run `paperconan <input-dir> --images`; add `--image-diagnostics` only when
+   deterministic hints are useful.
+2. Read every entry in `image_assets`; deterministic `image_findings` are hints
+   and never the complete review set. An empty `image_findings` list does not
+   mean that every image question was resolved. Deterministic pair hints compare
+   two regions within one registered asset only; they do not compare assets.
+3. Confirm the current Agent can open local images.
+   - If yes, inspect the whole image first, then use a native-pixel crop for
+     small panels or unresolved detail.
+   - If no, set `image_review.status` to
+     `unavailable_no_multimodal`, continue numeric review, and state that image
+     semantic review was not completed.
+4. For every asset, record exactly one coverage outcome in
+   `reviewed_asset_ids`, `unresolved_asset_ids`, `unreadable_asset_ids`, or
+   `deferred_asset_ids`. `image_review.status: "completed"` means coverage
+   accounting is complete; it does not mean every image question was explained.
+5. Check figure labels, channels, processing steps, shared controls, insets,
+   before/after layouts, figure legends, and Methods before escalating an image
+   similarity signal.
+6. The external multimodal Agent is responsible for cross-asset comparison and
+   may create an image finding using `image_refs` even when `image_findings` is
+   empty. Such Agent-only image findings belong in the verdict, not in
+   deterministic `scan.json`.
+7. Put numeric and image findings in the same `verdict.json findings[]`, then
+   generate a single unified report with `paperconan report`.
+
+PaperConan supplies registered local assets, bounded report previews, and
+optional deterministic hints. The external multimodal Agent is responsible for
+capability detection, semantic review, coverage accounting, and cautious
+contextual interpretation.
 
 ## Review Modes
 
@@ -34,7 +74,7 @@ Choose the lightest mode that satisfies the user request:
   load [references/adjudication-tiers.md](references/adjudication-tiers.md) and
   [references/report-templates.md](references/report-templates.md). Use Tier
   labels only as review priority / innocent-explanation difficulty, never as
-  misconduct probability.
+  author-intent conclusions.
 - **Batch review**: use [references/batch-workflow.md](references/batch-workflow.md).
   Keep deterministic paperconan output separate from agent judgment. Preserve
   DROP reasons because repeated false positives can guide future filters.
@@ -71,6 +111,7 @@ tell them the findings still need human/agent triage before they mean anything.
 
 ```bash
 pip install paperconan
+pip install "paperconan[image]" # image assets, PDF page rendering, optional hints
 pip install "paperconan[all]"   # includes PDF / Word table extraction
 paperconan --version
 paperconan <input-dir>
@@ -90,6 +131,8 @@ paperconan <input-dir> --out /tmp/audit-X
 paperconan <input-dir> --md
 paperconan <input-dir> --no-html
 paperconan <input-dir> --profile forensic
+paperconan <input-dir> --images
+paperconan <input-dir> --images --image-diagnostics
 paperconan report /tmp/audit-X/scan.json --verdict verdict.json --out adjudication.html
 ```
 
@@ -103,7 +146,9 @@ Use fetch only when the user gives a DOI/title instead of local files:
 paperconan fetch "<DOI or title>"
 paperconan fetch "<DOI or title>" --json
 paperconan fetch "<DOI>" --download <id> --out data/
+paperconan fetch "<DOI or title>" --auto --images --out data/
 paperconan data/
+paperconan data/ --images
 ```
 
 Prefer candidates with `doi_in_related: true`. Repository search can return unrelated deposits, so report weak matches honestly and do not imply "no data found" means "paper is clean". Do not bypass paywalls or scrape publisher sites.
@@ -117,6 +162,10 @@ Prefer candidates with `doi_in_related: true`. Repository search can return unre
 - `triage` hides likely false positives.
 
 When a finding has `profile_action: "demoted"` or `profile_action: "hidden"`, the active profile changed the visible severity. Use `prefilter_reason`, `prefilter_flags`, and `false_positive_context` to explain why, then decide whether the filter reason actually fits the table context.
+
+For deterministic image hints, `profile_action: "kept"` is informational.
+Image hints do not pass through the numeric prefilter and are not demoted or
+hidden by `review`, `forensic`, or `triage`.
 
 ## Reference Routing
 
@@ -134,13 +183,13 @@ Load references only when needed:
 
 ## Judgment Discipline
 
-- Never convert `severity` into a misconduct conclusion. Severity means anomaly strength after the active profile, not author intent.
-- Never convert `Tier 1/2/3` into a misconduct probability. Tier means follow-up priority and difficulty of innocent explanation after context review.
+- Never convert `severity` into an author-intent conclusion. Severity means anomaly strength after the active profile, not author intent.
+- Never convert `Tier 1/2/3` into an author-intent conclusion. Tier means follow-up priority and difficulty of innocent explanation after context review.
 - Inspect cross-sheet reuse and cross-column transforms before weaker single-column patterns.
 - Prefer benign structural explanations first: shared controls, re-plots, unit conversions, formulas, indices, ratios, normalized values, model outputs, detection floors, and bounded scoring scales.
 - Treat `within_col_*` findings as false-positive-heavy by default. Do not strongly report `n < 10`, categorical/index labels, derived columns, fixed-denominator ratios, rounded grids, floors/ceilings, or repeated fill values.
 - Use "needs human context" when you cannot confirm row independence, raw measurement status, formula generation, Methods/legend meaning, or original-table provenance.
-- For PubPeer-style writing, provide concrete file/sheet/column evidence and questions for the authors; do not say "fake", "fraud", "fabricated", "实锤", or name authors as wrongdoers.
+- For PubPeer-style writing, provide concrete file/sheet/column evidence and questions for the authors; do not accuse authors or state an intent conclusion.
 - Do not use real papers as public calibration examples unless the user has
   explicitly asked to prepare a specific public note and the evidence has been
   checked against source data and paper context.
@@ -166,10 +215,18 @@ array (each entry adjudicated on its own tier/status with its own
 See [references/adjudication-tiers.md](references/adjudication-tiers.md) and
 [references/report-templates.md](references/report-templates.md).
 
+For adaptive image review, `scan.json image_assets[]` is the complete registered
+asset inventory while `image_findings[]` contains only optional deterministic
+hints. Add Agent conclusions as `finding_type: "image"` entries with
+`image_refs`, and add top-level `image_review` coverage. Numeric and image
+entries, including Agent-only cross-asset observations, all remain in the same
+`findings[]` and the single unified report; do not create a separate image
+verdict or a second user-facing report.
+
 When a verdict JSON already exists, `paperconan report <scan.json> --verdict
 <verdict.json> --out <html>` renders a separate adjudicated report. Do not
 confuse this with the default deterministic `audit/report.html`; the
 adjudicated report is only as reliable as the human/AI verdict and source
 context behind it.
 
-If the user asks "is this fraud?", answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.
+If the user asks for an author-intent conclusion, answer that paperconan cannot determine that. The next step is to verify the original data and, if concerns remain, ask for clarification through PubPeer, the journal, or a research integrity office.
