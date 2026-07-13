@@ -19,11 +19,29 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 
 from ._files import asset_type
 
 # Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
 SOURCE_SIDECAR = "paperconan_source.json"
+_ZIP_PROCESSING_EXCEPTIONS = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    zlib.error,
+    RuntimeError,
+    NotImplementedError,
+    OSError,
+    ValueError,
+)
+_TAR_PROCESSING_EXCEPTIONS = (
+    tarfile.TarError,
+    gzip.BadGzipFile,
+    EOFError,
+    zlib.error,
+    OSError,
+    ValueError,
+)
 
 _UA = "paperconan-fetch/0.6 (+https://github.com/zixixr/paperconan)"
 _DEFAULT_MAX = 50 * 1024 * 1024     # 50 MB — per individual file / per extracted table
@@ -1746,7 +1764,7 @@ def _download_oa_package(
                             pending_entries=pending,
                             transient_files=(tmp,),
                         )
-                    except (tarfile.TarError, OSError, ValueError) as exc:
+                    except _TAR_PROCESSING_EXCEPTIONS as exc:
                         processing_error = exc
             except _UnstableRegularFileError as exc:
                 staging_error = exc
@@ -1775,7 +1793,7 @@ def _download_oa_package(
                     reason += "; " + "; ".join(outcomes)
                 skipped.append({"name": pkg.get("name"), "reason": reason})
                 return reconciled
-        except (tarfile.TarError, OSError, ValueError) as e:
+        except _TAR_PROCESSING_EXCEPTIONS as e:
             reason = (
                 f"archive publication unavailable: {e}"
                 if isinstance(e, OSError)
@@ -1788,7 +1806,7 @@ def _download_oa_package(
             for reason in limit_reasons
         )
         return reconciled
-    except (tarfile.TarError, OSError, ValueError) as e:
+    except _TAR_PROCESSING_EXCEPTIONS as e:
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
         return []
     finally:
@@ -1851,7 +1869,7 @@ def _download_supplementary_archive(
                                 pending_entries=pending,
                                 transient_files=(tmp_zip,),
                             )
-                    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+                    except _ZIP_PROCESSING_EXCEPTIONS as exc:
                         processing_error = exc
             except _UnstableRegularFileError as exc:
                 staging_error = exc
@@ -1884,7 +1902,7 @@ def _download_supplementary_archive(
                     reason += "; " + "; ".join(outcomes)
                 skipped.append({"name": arch.get("name"), "reason": reason})
                 return reconciled
-        except (zipfile.BadZipFile, OSError, ValueError) as exc:
+        except _ZIP_PROCESSING_EXCEPTIONS as exc:
             reason = (
                 "not a valid zip archive"
                 if isinstance(exc, zipfile.BadZipFile)
@@ -1901,7 +1919,7 @@ def _download_supplementary_archive(
             for reason in limit_reasons
         )
         return reconciled
-    except (zipfile.BadZipFile, OSError, ValueError) as exc:
+    except _ZIP_PROCESSING_EXCEPTIONS as exc:
         reason = (
             "not a valid zip archive"
             if isinstance(exc, zipfile.BadZipFile)
@@ -2188,6 +2206,12 @@ def download_candidate(
             max_archive_members=_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE,
         )
         for f in files:
+            if os.path.basename(f["name"]) == SOURCE_SIDECAR:
+                skipped.append({
+                    "name": f["name"],
+                    "reason": "reserved provenance sidecar basename",
+                })
+                continue
             if not cardinality.can_publish():
                 skipped.append({
                     "name": f["name"],
@@ -2370,7 +2394,7 @@ def download_candidate(
             if entry.filename in by_file
         ]
         try:
-            _write_source_sidecar(
+            sidecar_published = _write_source_sidecar(
                 cand,
                 output,
                 downloads=downloads,
@@ -2383,6 +2407,12 @@ def download_candidate(
                 "name": SOURCE_SIDECAR,
                 "reason": str(exc),
             })
+        else:
+            if sidecar_published is None:
+                skipped.append({
+                    "name": SOURCE_SIDECAR,
+                    "reason": "provenance sidecar publication unavailable",
+                })
         downloaded = [
             entry.display_path(output)
             for entry in published_outputs

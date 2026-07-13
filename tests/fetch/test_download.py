@@ -749,8 +749,12 @@ def test_download_candidate_rejects_root_replacement_after_direct_publication(
 
     assert root_replaced
     assert summary["downloaded"] == []
-    assert len(summary["skipped"]) == 1
+    assert len(summary["skipped"]) == 2
     assert "output directory changed" in summary["skipped"][0]["reason"]
+    assert summary["skipped"][1] == {
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "provenance sidecar publication unavailable",
+    }
     assert (out_dir / "data.csv").read_bytes() == replacement
     assert (displaced / "data.csv").read_bytes() == payload
 
@@ -1668,6 +1672,90 @@ def _install_archive_payload(monkeypatch, payload):
     monkeypatch.setattr(_download, "download_file", stub_download)
 
 
+def _zip_processing_failure_bytes(failure_kind):
+    compression = (
+        zipfile.ZIP_DEFLATED
+        if failure_kind == "corrupt"
+        else zipfile.ZIP_STORED
+    )
+    payload = bytearray(
+        _archive_bytes_with_members(
+            "supplementary",
+            [("tables/data.csv", b"a,b\n1,2\n" * 100)],
+        )
+    )
+    if compression == zipfile.ZIP_DEFLATED:
+        compressed = io.BytesIO()
+        with zipfile.ZipFile(
+            compressed,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            archive.writestr("tables/data.csv", b"a,b\n1,2\n" * 100)
+        payload = bytearray(compressed.getvalue())
+
+    central_offset = payload.index(b"PK\x01\x02")
+    if failure_kind == "unsupported":
+        struct.pack_into("<H", payload, 8, 99)
+        struct.pack_into("<H", payload, central_offset + 10, 99)
+    elif failure_kind == "encrypted":
+        local_flags = struct.unpack_from("<H", payload, 6)[0] | 1
+        central_flags = struct.unpack_from("<H", payload, central_offset + 8)[0] | 1
+        struct.pack_into("<H", payload, 6, local_flags)
+        struct.pack_into("<H", payload, central_offset + 8, central_flags)
+    elif failure_kind == "corrupt":
+        name_length, extra_length = struct.unpack_from("<HH", payload, 26)
+        compressed_size = struct.unpack_from("<I", payload, 18)[0]
+        data_offset = 30 + name_length + extra_length
+        for offset in range(min(compressed_size, 5)):
+            payload[data_offset + offset] ^= 0xFF
+    else:
+        raise AssertionError(f"unknown ZIP failure kind: {failure_kind}")
+    return bytes(payload)
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["unsupported", "encrypted", "corrupt"],
+)
+def test_supplementary_zip_processing_failures_are_skipped(
+    monkeypatch,
+    tmp_path,
+    failure_kind,
+):
+    candidate, archive = _archive_candidate("supplementary")
+    _install_archive_payload(
+        monkeypatch,
+        _zip_processing_failure_bytes(failure_kind),
+    )
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == []
+    assert any(
+        item["name"] == archive["name"]
+        and "archive processing unavailable" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+def test_truncated_oa_gzip_processing_is_skipped(monkeypatch, tmp_path):
+    candidate, archive = _archive_candidate("oa")
+    payload = _archive_bytes("oa")
+    _install_archive_payload(monkeypatch, payload[:-20])
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == []
+    assert any(
+        item["name"] == archive["name"]
+        and "archive processing unavailable" in item["reason"]
+        for item in summary["skipped"]
+    )
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
 def _fail_download_staging_unlink(monkeypatch):
     real_unlink = _download.os.unlink
 
@@ -2258,6 +2346,9 @@ def test_archive_retains_new_output_after_output_root_verification_failure(
             "fetch output directory changed during publication; "
             "retained visible output for recovery without reporting it: data.csv"
         ),
+    }, {
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "provenance sidecar publication unavailable",
     }]
     assert list(out_dir.iterdir()) == []
     assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
@@ -3874,8 +3965,12 @@ def test_archive_result_rejects_post_extraction_output_root_replacement(
 
     assert root_replaced
     assert summary["downloaded"] == []
-    assert len(summary["skipped"]) == 1
+    assert len(summary["skipped"]) == 2
     assert "output directory changed" in summary["skipped"][0]["reason"]
+    assert summary["skipped"][1] == {
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "provenance sidecar publication unavailable",
+    }
     assert (out_dir / "data.csv").read_bytes() == b"replacement,root\n"
     assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
 
@@ -3939,8 +4034,12 @@ def test_download_candidate_rejects_root_replacement_after_archive_helper(
 
     assert root_replaced
     assert summary["downloaded"] == []
-    assert len(summary["skipped"]) == 1
+    assert len(summary["skipped"]) == 2
     assert "output directory changed" in summary["skipped"][0]["reason"]
+    assert summary["skipped"][1] == {
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "provenance sidecar publication unavailable",
+    }
     assert (out_dir / "data.csv").read_bytes() == replacement
     assert (displaced / "data.csv").read_bytes() == b"a,b\n1,2\n"
 
@@ -4690,3 +4789,54 @@ def test_sidecar_publication_retains_concurrent_no_replace_creation(
     )
     assert sidecar.read_bytes() == concurrent_bytes
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
+
+
+def test_remote_reserved_sidecar_basename_is_skipped_before_download(
+    monkeypatch,
+    tmp_path,
+):
+    def reject_download(*args, **kwargs):
+        raise AssertionError("reserved provenance basename must not be downloaded")
+
+    monkeypatch.setattr(_download, "download_file", reject_download)
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [{
+            "name": f"remote/{_download.SOURCE_SIDECAR}",
+            "download_url": "https://example.test/paperconan_source.json",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert summary["downloaded"] == []
+    assert summary["skipped"] == [{
+        "name": f"remote/{_download.SOURCE_SIDECAR}",
+        "reason": "reserved provenance sidecar basename",
+    }]
+    assert sidecar["downloads"] == []
+
+
+def test_unavailable_sidecar_publication_is_reported(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        _download,
+        "_write_source_sidecar",
+        lambda *args, **kwargs: None,
+    )
+    candidate = {
+        "cand_id": "source:1",
+        "source": "source",
+        "tabular_files": [],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == []
+    assert summary["skipped"] == [{
+        "name": _download.SOURCE_SIDECAR,
+        "reason": "provenance sidecar publication unavailable",
+    }]
