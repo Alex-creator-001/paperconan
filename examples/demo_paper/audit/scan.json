@@ -1,11 +1,13 @@
 {
   "tool": "paperconan",
-  "tool_version": "0.8.2",
-  "scanned_at": "2026-07-07T02:48:43+00:00",
+  "tool_version": "0.8.3",
+  "scanned_at": "2026-07-13T06:00:40+00:00",
   "profile": "review",
   "input_dir": "examples/demo_paper",
   "paper": null,
   "n_files": 2,
+  "n_image_source_files": 0,
+  "n_image_assets": 0,
   "n_blocks_with_findings": 3,
   "findings_omitted": 0,
   "scan_errors": [],
@@ -15,13 +17,13 @@
         "file": "ED_Fig2_tumor_volume.xlsx",
         "path": "examples/demo_paper/ED_Fig2_tumor_volume.xlsx",
         "n_sheets": 1,
-        "elapsed_ms": 7.945
+        "elapsed_ms": 9.532
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
         "path": "examples/demo_paper/ED_Fig4_qPCR.xlsx",
         "n_sheets": 2,
-        "elapsed_ms": 0.338
+        "elapsed_ms": 0.361
       }
     ],
     "sheets": [
@@ -32,7 +34,7 @@
         "n_cols": 6,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.128
+        "elapsed_ms": 0.125
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -41,7 +43,7 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.08
+        "elapsed_ms": 0.086
       },
       {
         "file": "ED_Fig4_qPCR.xlsx",
@@ -50,10 +52,10 @@
         "n_cols": 5,
         "numeric_cells": 48,
         "n_blocks": 1,
-        "elapsed_ms": 0.08
+        "elapsed_ms": 0.079
       }
     ],
-    "elapsed_ms": 16.435
+    "elapsed_ms": 18.541
   },
   "relations_blocks": [
     {
@@ -1016,6 +1018,7 @@
         }
       ],
       "row_pairs": [],
+      "row_relations": [],
       "within_col": [],
       "identical_after_rounding": [],
       "grim": [],
@@ -1038,6 +1041,7 @@
       "progressions": [],
       "equal_pairs": [],
       "row_pairs": [],
+      "row_relations": [],
       "within_col": [
         {
           "kind": "within_col_value_duplication",
@@ -1587,11 +1591,6 @@
             ],
             "col_offset": 1,
             "highlight_cols": [
-              3,
-              3,
-              3,
-              3,
-              3,
               3
             ],
             "highlight_rows": [
@@ -1760,6 +1759,7 @@
       "progressions": [],
       "equal_pairs": [],
       "row_pairs": [],
+      "row_relations": [],
       "within_col": [],
       "identical_after_rounding": [
         {
@@ -1812,10 +1812,6 @@
             ],
             "col_offset": 1,
             "highlight_cols": [
-              3,
-              3,
-              3,
-              3,
               3,
               1
             ],
@@ -2074,6 +2070,7 @@
     }
   ],
   "decimal_endings": [],
+  "decimal_tail_clusters": [],
   "cross_sheet_findings": [
     {
       "kind": "cross_sheet_position_identical",
@@ -2186,5 +2183,7 @@
       "profile_action": "kept",
       "false_positive_context": []
     }
-  ]
+  ],
+  "image_assets": [],
+  "image_findings": []
 }

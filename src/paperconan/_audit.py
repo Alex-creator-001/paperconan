@@ -48,7 +48,7 @@ from .schema import PaperconanInputError
 # paperconan-watch severity counters / triage gate all iterate this set, so a
 # HIGH finding in ANY group (notably row_pairs) is counted and can reach review.
 BLOCK_FINDING_GROUPS = (
-    "relations", "equal_pairs", "progressions", "row_pairs",
+    "relations", "equal_pairs", "progressions", "row_pairs", "row_relations",
     "within_col", "identical_after_rounding", "grim",
 )
 
@@ -531,6 +531,26 @@ def _block_evidence(sheet, r0, r1, c0, c1, header, highlight_cols, highlight_row
     return out
 
 
+def _norm_label(s):
+    """Normalize a row label for equality: lowercased, whitespace-collapsed; '' for
+    None or a synthetic 'row N' placeholder (two unlabeled rows are not 'same-named')."""
+    if not s:
+        return ""
+    t = " ".join(str(s).split()).strip().lower()
+    return "" if re.fullmatch(r"row \d+", t) else t
+
+
+def _is_round_power_of_ten(ratio):
+    """True if `ratio` is (approximately) 10**k for some non-zero integer k — the
+    fingerprint of a unit conversion or a percent/fraction restatement (x10, x100,
+    x0.01, ...). Arbitrary ratios (1.14, 1.042) are NOT, and stay unexplained."""
+    r = abs(float(ratio))
+    if r <= 0 or r == 1.0:
+        return False
+    exp = math.log10(r)
+    return abs(exp - round(exp)) < 1e-9 and round(exp) != 0
+
+
 def benign_reason(f):
     """Return a common innocent explanation for a finding kind, or None.
 
@@ -554,6 +574,23 @@ def benign_reason(f):
     if kind == "identical_after_rounding":
         return ("cells share a rounded value but differ at full precision — usually "
                 "display rounding, not duplication")
+    if kind in ("constant_ratio_row", "scaled_row_reuse", "identical_row_reuse"):
+        # A same-named row reused across two PANELS of one figure (different sheet, same
+        # figure number) is the classic shared control/baseline replot — benign. A
+        # same-sheet cross-block pair (e.g. a DMSO vs MMS arm) or a DIFFERENT-named row
+        # is NOT a shared control and stays unexplained.
+        if (f.get("same_figure") and not f.get("same_sheet")
+                and _norm_label(f.get("row_a")) == _norm_label(f.get("row_b"))
+                and _norm_label(f.get("row_a"))):
+            return ("the same-named row reused across two panels of one figure is usually "
+                    "a shared control/baseline replot — confirm the legend discloses the reuse")
+        if kind != "identical_row_reuse":
+            ratio = f.get("ratio")
+            if ratio is not None and _is_round_power_of_ten(float(ratio)):
+                return ("a whole power-of-ten ratio between two rows is usually a unit "
+                        "conversion or percentage-vs-fraction restatement of the same row, "
+                        "not two independent measurements")
+        return None
     if kind in ("cross_sheet_value_overlap", "cross_sheet_position_identical"):
         if f.get("same_figure"):
             return f.get("context")
@@ -805,6 +842,32 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
                                                f"{n_real_frac}/{n} rows ({distinct_hp} distinct high-precision "
                                                f"fractions) but differ by whole numbers")))
                     continue
+                # B5b: the same shared-fraction + integer-difference signal that B5 above
+                # requires >=4 fraction digits for, admitted at lower precision ONLY when
+                # every non-zero integer difference is a multiple of 10. Shifting a value
+                # by a round number while keeping its decimals has no benign additive
+                # transform, so that constraint compensates for a less-distinctive 2-digit
+                # fraction. The evidence floor counts rows that are BOTH a round-shift AND
+                # carry a genuine (non-.0) fraction — so a mostly-integer column with a few
+                # stray decimals cannot satisfy it on thin fractional evidence.
+                nz = diff_is_int & (np.abs(np.round(diff)) >= 1)
+                round10 = nz & (np.abs(np.round(diff) - np.round(diff / 10.0) * 10.0) < 0.5)
+                shared_frac = diff_is_int & (np.abs(frac_x) > 1e-6)
+                rs_frac = round10 & shared_frac
+                distinct_frac = len({round(float(v), 6) for v in frac_x[rs_frac]})
+                if (int(rs_frac.sum()) >= max(5, int(round(0.7 * n)))
+                        and int(round10.sum()) == int(nz.sum())
+                        and distinct_frac >= 3):
+                    findings.append(dict(kind="round_shift_shared_fraction",
+                                         col_a=header[ci - c0], col_b=header[cj - c0],
+                                         col_a_idx=ci, col_b_idx=cj, n=n,
+                                         n_shared_fraction=int(rs_frac.sum()),
+                                         severity="high",
+                                         col_a_sample=sa, col_b_sample=sb,
+                                         rule=(f"col[{cj}] and col[{ci}] share the same decimal fraction on "
+                                               f"{int(rs_frac.sum())}/{n} rows and differ only by non-zero "
+                                               f"integer multiples of 10")))
+                    continue
             # small discrete diff set
             if n >= 8:
                 diff_rounded = np.round(diff, 4)
@@ -822,6 +885,27 @@ def detect_relations(sheet, r0, r1, c0, c1, header):
 _ROW_PAIR_MAX_ROWS = 80
 _ROW_PAIR_MAX_COLS = 200
 _ROW_PAIR_MAX_FINDINGS_PER_BLOCK = 25
+
+# `detect_row_relations` gates: it compares every ROW PAIR across all columns, so it
+# is bounded to few-rows/many-columns (condition-in-rows, measurement-in-columns)
+# layouts — the ones the column-oriented `detect_relations` is blind to. Capping the
+# row count keeps the O(rows^2) pair loop cheap on tall entity-in-rows tables (which
+# are not this orientation anyway); the column floor keeps a proportional pair from
+# firing on too few cells to be distinctive.
+_ROW_REL_MAX_ROWS = int(os.environ.get("PAPERCONAN_ROW_REL_MAX_ROWS", "60"))
+_ROW_REL_MIN_COLS = int(os.environ.get("PAPERCONAN_ROW_REL_MIN_COLS", "12"))
+# Ratio-run membership tolerance (relative). A genuine exact scaling read back from
+# stored source data wobbles by ~2x the per-cell rounding: ~1e-6 at 6 sig figs but
+# ~1e-4 for the very common 2-3 sig-fig bench readouts (percent, viability, OD). 1e-3
+# absorbs all of these while staying 2+ orders below the ~0.1-0.3 spread of ratios
+# between genuinely independent rows — at >=12 consecutive columns, random-chance FP
+# is still ~(1e-3/0.3)**11 ≈ 1e-27, so it cannot manufacture a run.
+_ROW_REL_RTOL = float(os.environ.get("PAPERCONAN_ROW_REL_RTOL", "1e-3"))
+# Per-call column-op budget for detect_row_relations. rows are capped, but each row
+# pair runs a pure-Python O(cols) scan, so a very wide block (e.g. 60x160000, still
+# under _MAX_CELLS) would otherwise cost ~minutes. Bound total pair*cols work; a
+# starved run stops early (stderr note) rather than hanging.
+_ROW_REL_BUDGET = int(os.environ.get("PAPERCONAN_ROW_REL_BUDGET", "6000000"))
 
 
 def _row_label(sheet, r, c0):
@@ -1100,6 +1184,119 @@ def _demote_reused_progressions(report_blocks):
             if note:
                 f["likely_benign"] = note
     return report_blocks
+
+
+def detect_row_relations(sheet, r0, r1, c0, c1, header):
+    """Row-oriented mirror of `detect_relations`: flag two ROWS that hold an exact
+    relationship across many columns.
+
+    Source data with experimental CONDITIONS in rows and per-cell MEASUREMENTS in
+    columns hides "row B == row A" and "row B == row A * k" relationships from the
+    column-pair detector entirely (they never touch a single column pair). Two
+    DIFFERENT conditions that are bit-identical, or an exact constant multiple of
+    each other cell-for-cell across dozens of columns, is a data-inconsistency
+    signal worth an author's explanation — not a verdict.
+
+    Called on every block and SELF-GATES on row/col counts (not the `wide` flag), so
+    it covers precisely the wide blocks the column detectors skip. The row-count cap
+    plus a per-call column-op budget keep the O(rows^2 * cols) pure-Python scan bounded
+    even on genome-scale wide blocks.
+    """
+    findings = []
+    n_rows = r1 - r0
+    n_cols = c1 - c0
+    if n_rows < 2 or n_cols < _ROW_REL_MIN_COLS or n_rows > _ROW_REL_MAX_ROWS:
+        return findings
+
+    budget = _ROW_REL_BUDGET
+    labels = {r: _row_label(sheet, r, c0) for r in range(r0, r1)}
+    for i, ra in enumerate(range(r0, r1)):
+        label_a = labels[ra]
+        if _AXIS_CONTEXT_LABEL_RE.search(label_a):
+            continue
+        a = sheet.numeric[ra, c0:c1]
+        for rb in range(ra + 1, r1):
+            budget -= n_cols
+            if budget <= 0:
+                print(f"[paperconan] detect_row_relations: column-op budget exhausted on a "
+                      f"{n_rows}x{n_cols} block — coverage bounded", file=sys.stderr)
+                return findings
+            label_b = labels[rb]
+            if _AXIS_CONTEXT_LABEL_RE.search(label_b):
+                continue
+            b = sheet.numeric[rb, c0:c1]
+            mask = ~np.isnan(a) & ~np.isnan(b)
+            n = int(mask.sum())
+            if n < _ROW_REL_MIN_COLS:
+                continue
+            xm = a[mask].astype(float)
+            # Too few DISTINCT values and a "constant ratio" is unremarkable
+            # (e.g. two low-cardinality integer score rows). Require real spread.
+            if np.ptp(xm) <= 0 or len(np.unique(xm)) < 6:
+                continue
+            sa, sb = _sample(xm), _sample(b[mask].astype(float))
+
+            # identical rows (a bit-identical data group under two different labels)
+            if _allclose_rowwise(xm, b[mask].astype(float)):
+                findings.append(dict(kind="identical_row",
+                                     row_a=label_a, row_b=label_b,
+                                     row_a_idx=ra, row_b_idx=rb, n=n, severity="high",
+                                     row_a_sample=sa, row_b_sample=sb,
+                                     rule=f"row[{rb + 1}] == row[{ra + 1}] over {n} columns"))
+                continue
+
+            # constant ratio over the longest CONTIGUOUS run of columns where
+            # row B == row A * k (k != 1). The real fingerprint scales only PART of a
+            # row (a copy-then-scale of a column range), so requiring the whole row
+            # would miss it — mirror the column detector's partial_constant_offset run.
+            run = _longest_constant_ratio_run(a, b, c0, c1)
+            if run is not None:
+                k, run_len, x_run = run
+                if run_len >= _ROW_REL_MIN_COLS and len(np.unique(x_run)) >= 6:
+                    findings.append(dict(kind="constant_ratio_row",
+                                         row_a=label_a, row_b=label_b,
+                                         row_a_idx=ra, row_b_idx=rb, n=int(run_len),
+                                         ratio=k, run_length=int(run_len), severity="high",
+                                         row_a_sample=sa, row_b_sample=sb,
+                                         rule=f"row[{rb + 1}] = row[{ra + 1}] * {k:.6g} over a run of "
+                                              f"{int(run_len)}/{n} columns"))
+    return findings
+
+
+def _longest_constant_ratio_run(a, b, c0, c1):
+    """Longest contiguous column run where b[c] == k * a[c] for a fixed k != 1.
+
+    `a`, `b` are the two full row slices (may contain NaN). A column breaks the run
+    if either cell is NaN or a[c] is ~0. Membership is anchored to the run's first
+    ratio within `_ROW_REL_RTOL` (rounding-tolerant); the returned k is the run MEAN
+    for a clean reported value. Only NON-unity runs compete for the longest — a
+    near-unity (identical) prefix must not win and mask a shorter genuine scaling
+    suffix (that identical part is caught separately). Returns (k, run_length,
+    x_values_in_run) for the longest qualifying scaling run, or None."""
+    best_len, best_start = 0, 0
+    cur_len, cur_k, cur_start = 0, None, 0
+    for idx in range(c1 - c0):
+        av, bv = a[idx], b[idx]
+        if math.isnan(av) or math.isnan(bv) or abs(av) <= 1e-12:
+            cur_len, cur_k = 0, None
+            continue
+        r = bv / av
+        if cur_k is None or abs(r - cur_k) > _ROW_REL_RTOL * max(abs(cur_k), 1e-300):
+            cur_k, cur_len, cur_start = r, 1, idx
+        else:
+            cur_len += 1
+        # Only a genuinely-scaled run (ratio distinct from 1) may set the best; a long
+        # identical run is not a scaling and must not shadow a real one elsewhere.
+        if cur_len > best_len and abs(cur_k - 1.0) > _ROW_REL_RTOL:
+            best_len, best_start = cur_len, cur_start
+    if best_len == 0:
+        return None
+    x_run = a[best_start:best_start + best_len].astype(float)
+    y_run = b[best_start:best_start + best_len].astype(float)
+    k = float(np.mean(y_run / x_run))
+    if abs(k - 1.0) <= _ROW_REL_RTOL or abs(k) <= 1e-9:
+        return None
+    return k, best_len, x_run
 
 
 def detect_arithmetic_progression(sheet, r0, r1, c0, c1, header):
@@ -1457,6 +1654,61 @@ def detect_repeated_decimals(values, label):
     n = len(endings)
     flags = [(e, c) for e, c in counts.most_common(15) if c >= max(5, 5 * n / 100)]
     return dict(label=label, n=n, n_unique=len(counts), top=flags)
+
+
+_TAIL_CLUSTER_MIN_N = int(os.environ.get("PAPERCONAN_TAIL_CLUSTER_MIN_N", "100"))
+_TAIL_CLUSTER_SHARE = float(os.environ.get("PAPERCONAN_TAIL_CLUSTER_SHARE", "0.40"))
+
+
+def detect_decimal_tail_clustering(values, label, top_k=6):
+    """A few multi-digit fractional TAILS recurring far above chance across many
+    INDEPENDENT high-precision values — a fingerprint of numbers drawn from a small set
+    of fractional parts (copied/derived) rather than independently measured.
+
+    Distinct from detect_last_digit (a single last digit), detect_repeated_decimals
+    (2-digit endings, no concentration test) and within_col_value_duplication (repeated
+    whole VALUES, not shared tails). Gated hard: only values with >=3 fractional digits
+    (at read precision) count; needs >=_TAIL_CLUSTER_MIN_N of them; the top-`top_k`
+    3-digit tails must cover >=_TAIL_CLUSTER_SHARE of them; AND the full fractional parts
+    must be MOSTLY DISTINCT — otherwise a quantized / common-denominator column (values
+    like k/7 or eighths) trivially shares tails and would false-positive. Large-magnitude
+    values (>=1e7) are skipped: read-precision noise there reaches the captured digits."""
+    tails, full = [], []
+    for v in values:
+        av = abs(float(v))
+        if av >= 1e7:
+            continue
+        s = f"{av:.10f}".rstrip("0")
+        if "." not in s:
+            continue
+        frac = s.split(".")[1]
+        if len(frac) >= 3:
+            tails.append(frac[-3:])
+            full.append(frac)
+    n = len(tails)
+    if n < _TAIL_CLUSTER_MIN_N:
+        return None
+    # Quantized / common-denominator data (few distinct fractions) shares tails trivially.
+    # The genuine fingerprint is MANY independent values that nonetheless collide on a few
+    # tails, so require the full fractional parts to be mostly distinct.
+    if len(set(full)) < max(50, n // 2):
+        return None
+    counts = Counter(tails)
+    top = counts.most_common(top_k)
+    top_sum = sum(c for _, c in top)
+    share = top_sum / n
+    if share < _TAIL_CLUSTER_SHARE:
+        return None
+    top_tails = [t for t, _ in top]
+    # complementary pairs (t + t' = 1000) among the dominant tails — a stronger sub-signal
+    comp = sum(1 for t in top_tails if int(t) < 500 and f"{1000 - int(t):03d}" in top_tails)
+    return dict(label=label, n=n, n_unique=len(counts), n_distinct_fraction=len(set(full)),
+                top=[[t, c] for t, c in top], top_share=round(share, 4),
+                complementary_pairs=comp, severity="high",
+                rule=(f"the {top_k} most common 3-digit fractional tails cover "
+                      f"{top_sum}/{n} ({share:.0%}) of the high-precision values "
+                      f"(uniform expectation ~{100 * top_k / 1000:.1f}%), which have "
+                      f"{len(set(full))} distinct fractional parts"))
 
 
 def benjamini_hochberg(pvals, alpha=0.05):
@@ -2523,6 +2775,157 @@ def detect_within_sheet_fraction_reuse(grid_sheets, profile="review", min_cells=
     return findings
 
 
+def _longest_identical_run(a, b, c0, c1):
+    """Longest contiguous column run where a[c] == b[c] (bit-identical to a tight
+    relative tolerance). `a`, `b` are full row slices (may contain NaN); a NaN in
+    either breaks the run. Returns (run_length, x_values_in_run) or None."""
+    best_len, best_start = 0, 0
+    cur_len, cur_start = 0, 0
+    for idx in range(c1 - c0):
+        av, bv = a[idx], b[idx]
+        if math.isnan(av) or math.isnan(bv) or abs(av - bv) > 1e-9 * max(abs(av), abs(bv), 1e-300):
+            cur_len = 0
+            continue
+        if cur_len == 0:
+            cur_start = idx
+        cur_len += 1
+        if cur_len > best_len:
+            best_len, best_start = cur_len, cur_start
+    if best_len == 0:
+        return None
+    return best_len, a[best_start:best_start + best_len].astype(float)
+
+
+def _row_bands(sheet):
+    """Maximal runs of consecutive DATA rows (>= _ROW_REL_MIN_COLS finite cells),
+    split by header/blank rows. A 'band' is one cohort/condition block laid out with
+    conditions in rows. Yields (r_start, r_end) half-open row ranges."""
+    is_data = []
+    for r in range(sheet.nrows):
+        finite = int(np.count_nonzero(~np.isnan(sheet.numeric[r, :])))
+        is_data.append(finite >= _ROW_REL_MIN_COLS)
+    bands, start = [], None
+    for r, d in enumerate(is_data):
+        if d and start is None:
+            start = r
+        elif not d and start is not None:
+            bands.append((start, r))
+            start = None
+    if start is not None:
+        bands.append((start, sheet.nrows))
+    return bands
+
+
+def _scaled_row_candidates(grid_sheets):
+    """Collect high-information data-rows from row-oriented bands, tagged by band so
+    same-band pairs (detect_row_relations' job) are excluded downstream."""
+    cands = []
+    for (fname, sname), sheet in grid_sheets.items():
+        for bi, (r0, r1) in enumerate(_row_bands(sheet)):
+            if (r1 - r0) < 2 or (r1 - r0) > _ROW_REL_MAX_ROWS:
+                continue                                  # tall matrices are not this orientation
+            for r in range(r0, r1):
+                a = sheet.numeric[r, :]
+                finite = a[~np.isnan(a)]
+                if len(finite) < _ROW_REL_MIN_COLS or np.ptp(finite) <= 0 or len(np.unique(finite)) < 6:
+                    continue
+                if _vector_is_patterned(list(finite)):
+                    continue                              # ladders / round-number rows recur benignly
+                label = _row_label(sheet, r, 1)
+                if _AXIS_CONTEXT_LABEL_RE.search(label):
+                    continue
+                cands.append(dict(file=fname, sheet=sname, band=(fname, sname, bi),
+                                  rows=(r0, r1), row=r, label=label, a=a))
+    return cands
+
+
+def detect_scaled_row_reuse(grid_sheets, profile="review", max_candidates=1500,
+                            max_findings=40):
+    """Two DATA ROWS in DIFFERENT blocks (cross-block within a sheet) or different
+    sheets that hold `row_B == row_A * k` over a long contiguous run of positionally-
+    aligned columns — the scalar-multiple case (k != 1, `scaled_row_reuse`) and its
+    k == 1 special case, a bit-identical data group reappearing under another cohort
+    (`identical_row_reuse`).
+
+    The Extended Data Fig. 5B pattern: the same condition measured under two
+    treatments, where one cohort's row is an exact scalar multiple of the other's
+    across ~200 cells. detect_row_relations only compares rows inside ONE block, so
+    this cross-block reuse has no other detector. A whole power-of-ten ratio is a
+    unit/percentage restatement (benign); an arbitrary constant is unexplained. An
+    identical row across cohorts/figures may be a disclosed shared control — confirm
+    against the legend.
+    """
+    cands = _scaled_row_candidates(grid_sheets)
+    truncated = len(cands) > max_candidates
+    if truncated:
+        cands = cands[:max_candidates]
+    findings = []
+    budget = 4_000_000
+    for i in range(len(cands)):
+        A = cands[i]
+        for j in range(i + 1, len(cands)):
+            B = cands[j]
+            if A["band"] == B["band"]:
+                continue                                  # same block → detect_row_relations
+            a, b = A["a"], B["a"]
+            m = min(len(a), len(b))
+            budget -= m
+            if budget <= 0:
+                break
+            # Prefer the identical run (k==1) when it is at least as long as the best
+            # scaling run — an exact duplicate is a cleaner statement than a ratio.
+            ident = _longest_identical_run(a[:m], b[:m], 0, m)
+            ratio = _longest_constant_ratio_run(a[:m], b[:m], 0, m)
+            ident_ok = ident is not None and ident[0] >= _ROW_REL_MIN_COLS and len(np.unique(ident[1])) >= 6
+            ratio_ok = ratio is not None and ratio[1] >= _ROW_REL_MIN_COLS and len(np.unique(ratio[2])) >= 6
+            if ident_ok and (not ratio_ok or ident[0] >= ratio[1]):
+                kind, k, run_len, x_run = "identical_row_reuse", 1.0, ident[0], ident[1]
+            elif ratio_ok:
+                kind, k, run_len, x_run = "scaled_row_reuse", ratio[0], ratio[1], ratio[2]
+            else:
+                continue
+            fa, fb = A["file"], B["file"]
+            sa_name, sb_name = A["sheet"], B["sheet"]
+            fig_a, fig_b = figure_key(sa_name), figure_key(sb_name)
+            same_file = fa == fb
+            same_sheet = same_file and sa_name == sb_name
+            scope = "blocks" if same_sheet else ("sheets" if same_file else "files")
+            rel = (f"== row '{B['label']}'" if kind == "identical_row_reuse"
+                   else f"= row '{B['label']}' ({sb_name}) * {k:.6g}")
+            findings.append(dict(
+                kind=kind,
+                file=fa if same_file else f"{fa} + {fb}",
+                file_a=fa, file_b=fb, same_file=same_file, same_sheet=same_sheet,
+                sheet_a=sa_name, sheet_b=sb_name,
+                row_a=A["label"], row_b=B["label"],
+                size_a=run_len, size_b=run_len,
+                same_position_count=run_len,
+                fraction_of_smaller=1.0,
+                ratio=k, run_length=run_len,
+                figure_a=fig_a, figure_b=fig_b,
+                same_figure=(fig_a is not None and fig_a == fig_b),
+                delta={"pattern": "identical_row" if kind == "identical_row_reuse" else "scaled_row"},
+                block_a=f"rows {A['rows'][0] + 1}-{A['rows'][1]}",
+                block_b=f"rows {B['rows'][0] + 1}-{B['rows'][1]}",
+                examples=[{"row": A["label"], "col": None, "value": float(v)}
+                          for v in x_run[:5]],
+                severity="high",
+                rule=(f"row '{A['label']}' ({sa_name}) {rel} over a run of {run_len} "
+                      f"positionally-aligned columns across 2 {scope}")))
+            if len(findings) >= max_findings:
+                break
+        if budget <= 0 or len(findings) >= max_findings:
+            break
+    if truncated or budget <= 0:
+        # Never silently cap coverage — say what was bounded (stderr only; scan.json stays
+        # deterministic). Real condition-layout papers stay far under these limits.
+        print(f"[paperconan] detect_scaled_row_reuse: coverage bounded "
+              f"(candidates={len(cands)}{'+truncated' if truncated else ''}, "
+              f"budget_exhausted={budget <= 0})", file=sys.stderr)
+    apply_profile_to_findings(findings, profile)
+    return findings
+
+
 def _load_provenance(in_dir, paper):
     """Resolve scan provenance: an explicit `paper` override wins; otherwise read a
     paperconan_source.json sidecar left by `fetch`; otherwise None."""
@@ -2723,11 +3126,15 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                 ap = detect_arithmetic_progression(sheet, r0, r1, c0, c1, header)
                 eq = [] if wide else detect_equal_pairs(sheet, r0, r1, c0, c1, header)
                 rp = [] if wide else detect_row_pair_digit_coupling(sheet, r0, r1, c0, c1, header)
+                # Runs UNCONDITIONALLY (not gated by `wide`): row-oriented condition/measurement
+                # layouts are exactly the wide blocks the column detectors skip, and this is
+                # where a "row B = row A * k" relationship lives. Self-gates on rows/cols.
+                rr = detect_row_relations(sheet, r0, r1, c0, c1, header)
                 wc = detect_within_column_patterns(sheet, r0, r1, c0, c1, header)
                 wc = wc + detect_dispersed_repeats(sheet, r0, r1, c0, c1, header)
                 iar = detect_identical_after_rounding(sheet, r0, r1, c0, c1, header)
                 gg = detect_grim_grimmer(sheet, r0, r1, c0, c1, header)
-                if rel or ap or eq or rp or wc or iar or gg:
+                if rel or ap or eq or rp or rr or wc or iar or gg:
                     sheet_context = " ".join([os.path.basename(f), sn, *[str(h) for h in header]])
                     # Bound this block's finding count BEFORE attaching evidence, so trimmed
                     # findings never pay the (large) embedded-snippet cost. The per-block cap is
@@ -2740,7 +3147,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                     # protects exactly the findings demotion targets). Capping after demotion would
                     # require attaching evidence to every finding first, re-introducing the GH#15 OOM.
                     groups = {"relations": rel, "progressions": ap, "equal_pairs": eq,
-                              "row_pairs": rp, "within_col": wc,
+                              "row_pairs": rp, "row_relations": rr, "within_col": wc,
                               "identical_after_rounding": iar, "grim": gg}
                     # Effective cap = the tighter of the per-block limit and the remaining global
                     # budget; None means unlimited (both caps disabled). A spent global budget
@@ -2765,6 +3172,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                                               relations=groups["relations"], progressions=groups["progressions"],
                                               equal_pairs=groups["equal_pairs"],
                                               row_pairs=groups["row_pairs"],
+                                              row_relations=groups["row_relations"],
                                               within_col=groups["within_col"],
                                               identical_after_rounding=groups["identical_after_rounding"],
                                               grim=groups["grim"],
@@ -2785,9 +3193,12 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
     cross_sheet_findings += detect_within_sheet_fraction_reuse(grid_sheets, profile=profile)
     # B2: a fixed high-information row-vector recurring across >=2 figures.
     cross_sheet_findings += detect_recurring_row_vectors(grid_sheets, profile=profile)
+    # B6: a condition ROW that is an exact scalar multiple of a row in another block /
+    # sheet (cross-block sibling of detect_row_relations; the Extended Data Fig. 5B case).
+    cross_sheet_findings += detect_scaled_row_reuse(grid_sheets, profile=profile)
     _attach_benign(cross_sheet_findings)
 
-    digit_reports, decimal_reports = [], []
+    digit_reports, decimal_reports, tail_cluster_reports = [], [], []
     for key, nums in per_sheet_numbers.items():
         d = detect_last_digit(nums, label=f"{key[0]}::{key[1]}")
         if d:
@@ -2795,6 +3206,9 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
         dec = detect_repeated_decimals(nums, label=f"{key[0]}::{key[1]}")
         if dec:
             decimal_reports.append(dec)
+        tc = detect_decimal_tail_clustering(nums, label=f"{key[0]}::{key[1]}")
+        if tc:
+            tail_cluster_reports.append(tc)
 
     # Multiple-testing control: dozens of per-sheet χ² tests run at once, so a raw
     # p-threshold over-reports. Attach a BH-adjusted q-value + significance flag.
@@ -2880,6 +3294,7 @@ def scan_dir(in_dir, out_dir, *, write_md=False, write_html=True, paper=None,
                relations_blocks=report_blocks,
                digit_distribution=digit_reports,
                decimal_endings=decimal_reports,
+               decimal_tail_clusters=tail_cluster_reports,
                cross_sheet_findings=cross_sheet_findings,
                image_assets=image_assets,
                image_findings=image_findings)
