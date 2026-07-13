@@ -94,10 +94,12 @@ class _RedirectTransport(_http.urllib.request.BaseHandler):
         final_content_type,
         location="//cdn.example.net/final",
         redirect_close_error=False,
+        redirect_status=302,
     ):
         self.final_body = final_body
         self.final_content_type = final_content_type
         self.location = location
+        self.redirect_status = redirect_status
         self.redirect_body = _UnreadableRedirectBody(
             close_error=redirect_close_error,
         )
@@ -114,9 +116,15 @@ class _RedirectTransport(_http.urllib.request.BaseHandler):
                 self.redirect_body,
                 headers,
                 req.full_url,
-                302,
+                self.redirect_status,
             )
-            response.msg = "Found"
+            response.msg = {
+                301: "Moved Permanently",
+                302: "Found",
+                303: "See Other",
+                307: "Temporary Redirect",
+                308: "Permanent Redirect",
+            }[self.redirect_status]
             self.redirect_response = response
             return response
         assert self.redirect_body.was_closed
@@ -138,12 +146,14 @@ def _install_redirect_transport(
     final_content_type,
     location="//cdn.example.net/final",
     redirect_close_error=False,
+    redirect_status=302,
 ):
     transport = _RedirectTransport(
         final_body,
         final_content_type,
         location=location,
         redirect_close_error=redirect_close_error,
+        redirect_status=redirect_status,
     )
     real_build_opener = _http.urllib.request.build_opener
 
@@ -463,6 +473,133 @@ def test_same_origin_redirect_retains_request_authorization():
     )
 
 
+@pytest.mark.parametrize(
+    ("location", "close_error"),
+    [
+        (None, False),
+        ("", True),
+    ],
+    ids=["missing", "empty-close-failure"],
+)
+def test_http_redirect_without_location_closes_before_default_http_error(
+    location,
+    close_error,
+):
+    handler = _http.ValidatedHTTPRedirectHandler()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/start",
+    )
+    headers = email.message.Message()
+    if location is not None:
+        headers["Location"] = location
+    redirect_body = _UnreadableRedirectBody(close_error=close_error)
+
+    try:
+        assert handler.http_error_302(
+            request,
+            redirect_body,
+            302,
+            "Found",
+            headers,
+        ) is None
+
+        assert redirect_body.read_sizes == []
+        assert redirect_body.was_closed
+        default_handler = _http.urllib.request.HTTPDefaultErrorHandler()
+        with pytest.raises(_http.urllib.error.HTTPError) as exc:
+            default_handler.http_error_default(
+                request,
+                redirect_body,
+                302,
+                "Found",
+                headers,
+            )
+
+        assert exc.value.code == 302
+        assert exc.value.fp is redirect_body
+        exc.value.close()
+    finally:
+        try:
+            redirect_body.close()
+        except OSError:
+            redirect_body.close()
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_redirect_308_preserves_modern_request_semantics(method):
+    handler = _http.ValidatedHTTPRedirectHandler()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/start",
+        headers={
+            "Authorization": "Bearer repository-secret",
+            "Content-Length": "123",
+            "Content-Type": "application/json",
+            "Cookie": "session=repository-secret",
+            "X-Request-Id": "request-123",
+        },
+        method=method,
+        origin_req_host="origin.example",
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        None,
+        308,
+        "Permanent Redirect",
+        {},
+        "https://cdn.example.net/final",
+    )
+
+    redirected_headers = {
+        name.lower(): value
+        for name, value in redirected.header_items()
+    }
+    assert redirected.get_method() == method
+    assert redirected.origin_req_host == "origin.example"
+    assert redirected.unverifiable is True
+    assert "authorization" not in redirected_headers
+    assert "content-length" not in redirected_headers
+    assert "content-type" not in redirected_headers
+    assert "cookie" not in redirected_headers
+    assert redirected_headers["x-request-id"] == "request-123"
+
+
+@pytest.mark.parametrize(
+    ("code", "method"),
+    [
+        (304, "GET"),
+        (307, "POST"),
+        (308, "POST"),
+    ],
+)
+def test_redirect_compatibility_does_not_expand_other_parent_behavior(
+    code,
+    method,
+):
+    handler = _http.ValidatedHTTPRedirectHandler()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/start",
+        data=b"payload" if method == "POST" else None,
+        method=method,
+    )
+    redirect_body = _UnreadableRedirectBody()
+
+    with pytest.raises(_http.urllib.error.HTTPError) as exc:
+        handler.redirect_request(
+            request,
+            redirect_body,
+            code,
+            "Redirect",
+            {},
+            "https://cdn.example.net/final",
+        )
+
+    assert exc.value.code == code
+    assert exc.value.fp is redirect_body
+    assert redirect_body.read_sizes == []
+    exc.value.close()
+
+
 @pytest.mark.parametrize("limit", ["repeat", "total"])
 def test_http_redirect_handler_preserves_redirect_limits(limit):
     class Parent:
@@ -598,6 +735,29 @@ def test_redirect_following_does_not_read_large_30x_body(
         assert result["ok"] is True
         assert destination.read_bytes() == final_body
 
+    assert transport.requests == [
+        "https://repository.example.org/start",
+        "https://cdn.example.net/final",
+    ]
+    assert transport.redirect_body.read_sizes == []
+    assert transport.redirect_body.was_closed
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_get_json_accepted_redirect_statuses_do_not_read_large_body(
+    monkeypatch,
+    status,
+):
+    transport = _install_redirect_transport(
+        monkeypatch,
+        final_body=b'{"ok":true}',
+        final_content_type="application/json",
+        redirect_status=status,
+    )
+
+    assert _http.get_json("https://repository.example.org/start") == {
+        "ok": True,
+    }
     assert transport.requests == [
         "https://repository.example.org/start",
         "https://cdn.example.net/final",
@@ -758,6 +918,114 @@ def test_get_text_allowed_origins_checks_redirect_destination(monkeypatch):
         )
 
     assert str(exc.value) == "text response origin is not allowed"
+
+
+def test_get_text_allowed_redirect_does_not_read_large_30x_body(monkeypatch):
+    transport = _install_redirect_transport(
+        monkeypatch,
+        final_body=b"<html>ok</html>",
+        final_content_type="text/html",
+        location="/final",
+    )
+
+    text = _http.get_text(
+        "https://repository.example.org/start",
+        max_bytes=1024,
+        allowed_origins={"https://repository.example.org"},
+    )
+
+    assert text == "<html>ok</html>"
+    assert transport.requests == [
+        "https://repository.example.org/start",
+        "https://repository.example.org/final",
+    ]
+    assert transport.redirect_body.read_sizes == []
+    assert transport.redirect_body.was_closed
+
+
+@pytest.mark.parametrize(
+    ("location", "redirect_close_error"),
+    [
+        ("//cdn.example.net/final", False),
+        ("https://[::1/final", True),
+    ],
+    ids=["disallowed-origin", "malformed-target-close-failure"],
+)
+def test_get_text_origin_rejection_closes_unread_30x_body(
+    monkeypatch,
+    location,
+    redirect_close_error,
+):
+    transport = _install_redirect_transport(
+        monkeypatch,
+        final_body=b"unexpected",
+        final_content_type="text/html",
+        location=location,
+        redirect_close_error=redirect_close_error,
+    )
+
+    try:
+        with pytest.raises(ValueError) as exc:
+            _http.get_text(
+                "https://repository.example.org/start",
+                max_bytes=1024,
+                allowed_origins={"https://repository.example.org"},
+            )
+
+        assert str(exc.value) == "text response origin is not allowed"
+        assert transport.requests == [
+            "https://repository.example.org/start",
+        ]
+        assert transport.redirect_body.read_sizes == []
+        assert transport.redirect_body.was_closed
+    finally:
+        if transport.redirect_response is not None:
+            try:
+                transport.redirect_response.close()
+            except OSError:
+                transport.redirect_response.close()
+
+
+def test_get_text_origin_close_failure_preserves_policy_error_identity(
+    monkeypatch,
+):
+    policy_error = ValueError("text response origin is not allowed")
+    target = "https://cdn.example.net/final"
+
+    def require_allowed_origin(url, allowed_origin_keys):
+        if url == target:
+            raise policy_error
+
+    monkeypatch.setattr(
+        _http,
+        "_require_allowed_origin",
+        require_allowed_origin,
+    )
+    handler = _http._AllowedOriginRedirectHandler({
+        ("https", "repository.example.org", 443),
+    })
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/start",
+    )
+    headers = email.message.Message()
+    headers["Location"] = target
+    redirect_body = _UnreadableRedirectBody(close_error=True)
+
+    try:
+        with pytest.raises(ValueError) as exc:
+            handler.http_error_302(
+                request,
+                redirect_body,
+                302,
+                "Found",
+                headers,
+            )
+
+        assert exc.value is policy_error
+        assert redirect_body.read_sizes == []
+        assert redirect_body.was_closed
+    finally:
+        redirect_body.close()
 
 
 @pytest.mark.parametrize(

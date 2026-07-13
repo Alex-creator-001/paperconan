@@ -178,14 +178,33 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
             newurl,
             "HTTP redirect URL is invalid",
         )
-        redirected = super().redirect_request(
-            req,
-            fp,
-            code,
-            msg,
-            headers,
-            target,
-        )
+        parts = urllib.parse.urlsplit(target)
+        if not parts.path and parts.netloc:
+            target = urllib.parse.urlunsplit(
+                (parts.scheme, parts.netloc, "/", parts.query, parts.fragment)
+            )
+        method = req.get_method()
+        if code == 308 and method in {"GET", "HEAD"}:
+            redirected = urllib.request.Request(
+                target,
+                method=method,
+                headers={
+                    name: value
+                    for name, value in req.headers.items()
+                    if name.lower() not in {"content-length", "content-type"}
+                },
+                origin_req_host=req.origin_req_host,
+                unverifiable=True,
+            )
+        else:
+            redirected = super().redirect_request(
+                req,
+                fp,
+                code,
+                msg,
+                headers,
+                target,
+            )
         if redirected is not None:
             _strip_cross_origin_sensitive_headers(
                 redirected,
@@ -197,12 +216,16 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
     def http_error_302(self, req, fp, code, msg, headers):
         location = headers.get("location") or headers.get("uri")
         if location is None:
+            _close_http_response(fp)
             return None
         try:
-            target = resolve_http_url(
-                req.full_url,
+            new = self.redirect_request(
+                req,
+                fp,
+                code,
+                msg,
+                headers,
                 _normalize_redirect_location(location),
-                "HTTP redirect URL is invalid",
             )
         except URLPolicyError:
             try:
@@ -210,14 +233,9 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
             except Exception:
                 pass
             raise
-        parts = urllib.parse.urlsplit(target)
-        if not parts.path and parts.netloc:
-            target = urllib.parse.urlunsplit(
-                (parts.scheme, parts.netloc, "/", parts.query, parts.fragment)
-            )
-        new = self.redirect_request(req, fp, code, msg, headers, target)
         if new is None:
             return None
+        target = new.full_url
         if hasattr(req, "redirect_dict"):
             visited = new.redirect_dict = req.redirect_dict
             if (
@@ -326,13 +344,16 @@ def _require_allowed_origin(url, allowed_origin_keys):
         raise ValueError("text response origin is not allowed")
 
 
-class _AllowedOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+class _AllowedOriginRedirectHandler(ValidatedHTTPRedirectHandler):
     def __init__(self, allowed_origin_keys):
         super().__init__()
         self.allowed_origin_keys = allowed_origin_keys
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        target = urllib.parse.urljoin(req.full_url, newurl)
+        try:
+            target = urllib.parse.urljoin(req.full_url, newurl)
+        except ValueError:
+            raise ValueError("text response origin is not allowed") from None
         _require_allowed_origin(target, self.allowed_origin_keys)
         return super().redirect_request(
             req,
@@ -344,14 +365,11 @@ class _AllowedOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
         )
 
     def http_error_302(self, req, fp, code, msg, headers):
-        location = headers.get("location") or headers.get("uri")
-        if location is not None:
-            try:
-                target = urllib.parse.urljoin(req.full_url, location)
-            except ValueError:
-                raise ValueError("text response origin is not allowed") from None
-            _require_allowed_origin(target, self.allowed_origin_keys)
-        return super().http_error_302(req, fp, code, msg, headers)
+        try:
+            return super().http_error_302(req, fp, code, msg, headers)
+        except ValueError:
+            _close_http_response(fp)
+            raise
 
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = (
         http_error_302
