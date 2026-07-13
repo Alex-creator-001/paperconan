@@ -1487,6 +1487,115 @@ def test_source_change_rolls_back_partial_evidence_publication(
     assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
 
 
+def test_source_change_rolls_back_evidence_after_post_link_verification_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(replacement)
+    real_verify = _evidence._verify_regular_file_entry
+    post_link_verifications = 0
+
+    def fail_first_post_link_verification(evidence_fd, name, file_fd):
+        nonlocal post_link_verifications
+        if not name.startswith(".paperconan-evidence-"):
+            post_link_verifications += 1
+            installed = os.stat(
+                name,
+                dir_fd=evidence_fd,
+                follow_symlinks=False,
+            )
+            staged = os.fstat(file_fd)
+            assert (installed.st_dev, installed.st_ino) == (
+                staged.st_dev,
+                staged.st_ino,
+            )
+            replacement.replace(native)
+            raise ValueError("synthetic post-link verification failure")
+        return real_verify(evidence_fd, name, file_fd)
+
+    monkeypatch.setattr(
+        _evidence,
+        "_verify_regular_file_entry",
+        fail_first_post_link_verification,
+    )
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert post_link_verifications == 1
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+    evidence_dir = out / "images" / "evidence"
+    assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
+
+
+def test_post_link_failure_rollback_retains_concurrent_final_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    source_replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(source_replacement)
+    concurrent_bytes = b"external regular evidence replacement"
+    concurrent_source = tmp_path / "concurrent-evidence.bin"
+    concurrent_source.write_bytes(concurrent_bytes)
+    real_verify = _evidence._verify_regular_file_entry
+    concurrent_final = None
+
+    def replace_final_then_fail_verification(evidence_fd, name, file_fd):
+        nonlocal concurrent_final
+        if not name.startswith(".paperconan-evidence-"):
+            installed = os.stat(
+                name,
+                dir_fd=evidence_fd,
+                follow_symlinks=False,
+            )
+            staged = os.fstat(file_fd)
+            assert (installed.st_dev, installed.st_ino) == (
+                staged.st_dev,
+                staged.st_ino,
+            )
+            concurrent_final = out / "images" / "evidence" / name
+            concurrent_final.unlink()
+            concurrent_source.replace(concurrent_final)
+            source_replacement.replace(native)
+            raise ValueError("synthetic post-link verification failure")
+        return real_verify(evidence_fd, name, file_fd)
+
+    monkeypatch.setattr(
+        _evidence,
+        "_verify_regular_file_entry",
+        replace_final_then_fail_verification,
+    )
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+    assert concurrent_final is not None
+    assert concurrent_final.read_bytes() == concurrent_bytes
+    assert list((out / "images" / "evidence").iterdir()) == [concurrent_final]
+
+
 def _owned_evidence_rollback_state(tmp_path):
     out = tmp_path / "audit"
     evidence_dir = out / "images" / "evidence"

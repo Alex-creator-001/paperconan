@@ -509,8 +509,10 @@ def _publish_staged_images(
                 temp_fd,
                 final_name,
             )
+            relative_path = f"images/evidence/{final_name}"
             if was_installed:
-                installed.append(f"images/evidence/{final_name}")
+                receipt[relative_path] = expected_identity
+                installed.append(relative_path)
                 _verify_regular_file_entry(
                     evidence_fd,
                     final_name,
@@ -528,7 +530,7 @@ def _publish_staged_images(
                         "entry because it changed after verification: "
                         f"images/evidence/{final_name}"
                     )
-            receipt[f"images/evidence/{final_name}"] = expected_identity
+                receipt[relative_path] = expected_identity
         _verify_evidence_directories(
             root,
             root_fd,
