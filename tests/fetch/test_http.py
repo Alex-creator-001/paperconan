@@ -79,9 +79,10 @@ class _UnreadableRedirectBody(io.BytesIO):
 
     def close(self):
         self.was_closed = True
-        super().close()
         if self.close_error:
+            self.close_error = False
             raise OSError("redirect response close failed")
+        super().close()
 
 
 class _RedirectTransport(_http.urllib.request.BaseHandler):
@@ -553,6 +554,7 @@ def test_download_invalid_redirect_preserves_policy_error_when_close_fails(
     assert transport.redirect_body.read_sizes == []
     assert transport.redirect_body.was_closed
     assert sleep_calls == []
+    transport.redirect_body.close()
 
 
 def test_redirect_normalizes_non_ascii_location_before_following(monkeypatch):
