@@ -3407,11 +3407,11 @@ def main():
         rp.add_argument("--verdict", required=True, help="Path to verdict JSON")
         rp.add_argument("--out", required=True, help="Output HTML path")
         rargs = rp.parse_args(sys.argv[2:])
-        with open(rargs.scan_json, encoding="utf-8") as fh:
-            scan = json.load(fh)
-        with open(rargs.verdict, encoding="utf-8") as fh:
-            verdict = json.load(fh)
         try:
+            with open(rargs.scan_json, encoding="utf-8") as fh:
+                scan = json.load(fh)
+            with open(rargs.verdict, encoding="utf-8") as fh:
+                verdict = json.load(fh)
             write_adjudicated_report(
                 scan,
                 verdict,

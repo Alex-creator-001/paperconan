@@ -505,6 +505,43 @@ def test_report_subcommand_rejects_non_neutral_verdict_without_traceback(
     assert blocked not in proc.stderr.casefold()
     assert "neutral-language policy" in proc.stderr
     assert "quoted or negated" in proc.stderr
+    assert len(proc.stderr.strip().splitlines()) == 1
+    assert not out.exists()
+
+
+def test_report_subcommand_rejects_malformed_verdict_without_traceback(
+    tmp_path,
+):
+    scan_path = tmp_path / "scan.json"
+    scan_path.write_text(
+        json.dumps({"relations_blocks": [], "cross_sheet_findings": []}),
+        encoding="utf-8",
+    )
+    verdict_path = tmp_path / "verdict.json"
+    verdict_path.write_text("{", encoding="utf-8")
+    out = tmp_path / "adjudication.html"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paperconan",
+            "report",
+            str(scan_path),
+            "--verdict",
+            str(verdict_path),
+            "--out",
+            str(out),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr
+    assert len(proc.stderr.strip().splitlines()) == 1
     assert not out.exists()
 
 
