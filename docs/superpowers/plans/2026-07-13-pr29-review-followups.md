@@ -90,10 +90,10 @@ git commit -m "fix(fetch): harden archive and provenance outcomes"
 - Consumes: urllib request helpers and normalized repository file references
 - Produces: HTTP(S)-only redirect handling, bounded JSON reads, and valid Dryad file URLs
 
-- [ ] Add failing tests for a redirect to a non-HTTP(S) scheme, oversized JSON responses, and Dryad records without download links.
-- [ ] Run focused tests and confirm the current behavior fails the new boundaries.
-- [ ] Enforce credential-free HTTP(S) redirect targets and final URLs while permitting HTTPS CDN hosts, bound JSON bodies, and omit unusable Dryad file references.
-- [ ] Run HTTP/source/download tests and commit.
+- [x] Add failing tests for a redirect to a non-HTTP(S) scheme, oversized JSON responses, and Dryad records without download links.
+- [x] Run focused tests and confirm the current behavior fails the new boundaries.
+- [x] Enforce credential-free HTTP(S) redirect targets and final URLs while permitting HTTPS CDN hosts, bound JSON bodies, and omit unusable Dryad file references.
+- [x] Run HTTP/source/download tests and commit.
 
 Run:
 
@@ -111,6 +111,8 @@ git commit -m "fix(fetch): bound redirects and API responses"
 
 **Files:**
 - Modify: `src/paperconan/image/_diagnostics.py`
+- Modify: `src/paperconan/image/_evidence.py`
+- Modify: `src/paperconan/schema.py`
 - Modify: `tests/test_image_diagnostics.py`
 - Modify: `skills/paperconan/SKILL.md`
 - Modify: `skills/paperconan/references/output-schema.md`
@@ -120,11 +122,12 @@ git commit -m "fix(fetch): bound redirects and API responses"
 
 **Interfaces:**
 - Consumes: registered assets, bounded panel proposals, scan-wide comparison and finding caps
-- Produces: eight transform variants, margin-trimmed structural scoring, and findings that survive non-integrity evidence failures
+- Produces: eight transform variants, margin-trimmed structural scoring, typed source-integrity failures, and findings that survive other evidence failures
 
 - [ ] Add failing tests for vertical/transpose transforms, offset duplicated content, the reviewed non-duplicate calibration case, budget-limited evidence, and source replacement after scoring.
 - [ ] Run focused tests and confirm recall, calibration, and evidence behavior fail as reviewed.
-- [ ] Trim low-information margins, combine intensity and edge agreement, add all dihedral transforms, and emit `evidence: null` only when the scored source remains stable.
+- [ ] Trim low-information margins for scoring only, combine intensity and edge agreement without lowering the finding threshold, and add all dihedral transforms.
+- [ ] Add a typed source-integrity evidence failure; emit `evidence: null` for other evidence failures only when the scored source remains stable, and suppress findings after source replacement.
 - [ ] State that deterministic comparisons are within one asset, image profile fields are informational and not prefiltered, and cross-asset review belongs to the external Agent.
 - [ ] Run image diagnostics/report/workflow tests and commit.
 
