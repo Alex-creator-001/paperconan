@@ -31,7 +31,7 @@ def test_dryad_candidate_omits_files_without_valid_download_links(
                     "size": 1,
                     "_links": {
                         "stash:download": {
-                            "href": "https://cdn.example.net/files/valid.csv",
+                            "href": "//cdn.example.net/files/valid.csv",
                         },
                     },
                 },
@@ -56,6 +56,15 @@ def test_dryad_candidate_omits_files_without_valid_download_links(
                     "_links": {
                         "stash:download": {
                             "href": "https://user:secret@files.example.net/data.csv",
+                        },
+                    },
+                },
+                {
+                    "path": "scheme-relative-credentials.csv",
+                    "size": 5,
+                    "_links": {
+                        "stash:download": {
+                            "href": "//user:secret@files.example.net/data.csv",
                         },
                     },
                 },

@@ -75,17 +75,8 @@ def _dryad_candidate(doi):
             if not isinstance(dl, str) or not dl.strip():
                 continue
             try:
-                raw_download_url = dl.strip()
-                raw_parts = _urlparse.urlsplit(raw_download_url)
-                if (
-                    (raw_parts.scheme or raw_parts.netloc)
-                    and not _http._is_valid_http_url(raw_download_url)
-                ):
-                    continue
-                download_url = _urlparse.urljoin(_DRYAD, raw_download_url)
-            except ValueError:
-                continue
-            if not _http._is_valid_http_url(download_url):
+                download_url = _http.resolve_http_url(_DRYAD, dl.strip())
+            except _http.URLPolicyError:
                 continue
             all_files.append(
                 make_fileref(f.get("path"), f.get("size"), download_url)

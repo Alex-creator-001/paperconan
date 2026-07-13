@@ -1,12 +1,14 @@
 from contextlib import contextmanager
+import email.message
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import threading
+import urllib.response
 
 import pytest
 
-from paperconan.fetch import _http
+from paperconan.fetch import _download, _http
 
 
 class _StubResponse(io.BytesIO):
@@ -64,6 +66,87 @@ class _StubOpener:
         return self.response
 
 
+class _UnreadableRedirectBody(io.BytesIO):
+    def __init__(self):
+        super().__init__(b"x" * (2 * 1024 * 1024))
+        self.read_sizes = []
+        self.was_closed = False
+
+    def read(self, size=-1):
+        self.read_sizes.append(size)
+        raise AssertionError("redirect response body must not be read")
+
+    def close(self):
+        self.was_closed = True
+        super().close()
+
+
+class _RedirectTransport(_http.urllib.request.BaseHandler):
+    handler_order = 100
+
+    def __init__(
+        self,
+        final_body,
+        final_content_type,
+        location="//cdn.example.net/final",
+    ):
+        self.final_body = final_body
+        self.final_content_type = final_content_type
+        self.location = location
+        self.redirect_body = _UnreadableRedirectBody()
+        self.requests = []
+
+    def https_open(self, req):
+        self.requests.append(req.full_url)
+        headers = email.message.Message()
+        if len(self.requests) == 1:
+            headers["Location"] = self.location
+            headers["Content-Length"] = str(2 * 1024 * 1024)
+            response = urllib.response.addinfourl(
+                self.redirect_body,
+                headers,
+                req.full_url,
+                302,
+            )
+            response.msg = "Found"
+            return response
+        assert self.redirect_body.was_closed
+        headers["Content-Type"] = self.final_content_type
+        response = urllib.response.addinfourl(
+            io.BytesIO(self.final_body),
+            headers,
+            req.full_url,
+            200,
+        )
+        response.msg = "OK"
+        return response
+
+
+def _install_redirect_transport(
+    monkeypatch,
+    *,
+    final_body,
+    final_content_type,
+    location="//cdn.example.net/final",
+):
+    transport = _RedirectTransport(
+        final_body,
+        final_content_type,
+        location=location,
+    )
+    real_build_opener = _http.urllib.request.build_opener
+
+    def build_opener(*handlers):
+        return real_build_opener(transport, *handlers)
+
+    monkeypatch.setattr(
+        _http.urllib.request,
+        "build_opener",
+        build_opener,
+    )
+    return transport
+
+
 @contextmanager
 def _serve(routes):
     requests = []
@@ -101,7 +184,7 @@ def test_get_json_builds_query_and_parses(monkeypatch):
         seen["headers"] = {k.lower(): v for k, v in req.header_items()}
         return _StubResponse(json.dumps({"ok": True}).encode())
 
-    monkeypatch.setattr(_http, "_open_http", stub_urlopen)
+    monkeypatch.setattr(_http, "open_http", stub_urlopen)
     out = _http.get_json("https://api.example.org/x", params={"q": "a b", "size": 3})
     assert out == {"ok": True}
     assert seen["url"].startswith("https://api.example.org/x?")
@@ -117,7 +200,7 @@ def test_post_json_sends_body(monkeypatch):
         seen["method"] = req.get_method()
         return _StubResponse(json.dumps([{"id": 1}]).encode())
 
-    monkeypatch.setattr(_http, "_open_http", stub_urlopen)
+    monkeypatch.setattr(_http, "open_http", stub_urlopen)
     out = _http.post_json("https://api.example.org/search", {"search_for": "x"})
     assert out == [{"id": 1}]
     assert seen["method"] == "POST"
@@ -128,6 +211,21 @@ def _call_json_helper(method):
     if method == "GET":
         return _http.get_json("https://api.example.org/data")
     return _http.post_json("https://api.example.org/data", {"query": "x"})
+
+
+def test_public_url_policy_helpers_expose_typed_failures():
+    assert (
+        _http.validate_http_url("https://repository.example.org/data")
+        == "https://repository.example.org/data"
+    )
+    assert _http.resolve_http_url(
+        "https://repository.example.org/data",
+        "//cdn.example.net/files/data.csv",
+    ) == "https://cdn.example.net/files/data.csv"
+    assert callable(_http.open_http)
+
+    with pytest.raises(_http.URLPolicyError):
+        _http.validate_http_url("ftp://repository.example.org/data")
 
 
 @pytest.mark.parametrize("method", ["GET", "POST"])
@@ -150,7 +248,7 @@ def test_json_helpers_reject_declared_body_above_fixed_ceiling(
         raising=False,
     )
     monkeypatch.setattr(_http.urllib.request, "urlopen", stub_open)
-    monkeypatch.setattr(_http, "_open_http", stub_open, raising=False)
+    monkeypatch.setattr(_http, "open_http", stub_open)
 
     with pytest.raises(ValueError) as exc:
         _call_json_helper(method)
@@ -173,7 +271,7 @@ def test_json_helpers_bound_actual_body_read(monkeypatch, method):
         raising=False,
     )
     monkeypatch.setattr(_http.urllib.request, "urlopen", stub_open)
-    monkeypatch.setattr(_http, "_open_http", stub_open, raising=False)
+    monkeypatch.setattr(_http, "open_http", stub_open)
 
     with pytest.raises(ValueError) as exc:
         _call_json_helper(method)
@@ -197,9 +295,9 @@ def test_get_json_rejects_invalid_initial_url_before_open(monkeypatch, url):
         raise AssertionError("invalid initial URL must not be opened")
 
     monkeypatch.setattr(_http.urllib.request, "urlopen", reject_open)
-    monkeypatch.setattr(_http, "_open_http", reject_open, raising=False)
+    monkeypatch.setattr(_http, "open_http", reject_open)
 
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(_http.URLPolicyError) as exc:
         _http.get_json(url)
 
     assert str(exc.value) == "HTTP request URL is invalid"
@@ -213,6 +311,9 @@ def test_get_json_rejects_invalid_initial_url_before_open(monkeypatch, url):
         "https:///missing-host",
         "https://cdn.example.org:not-a-port/data",
         "https://[2001:db8::1/data",
+        "//user:secret@cdn.example.org/data",
+        "//cdn.example.org:not-a-port/data",
+        "//",
     ],
 )
 def test_get_json_rejects_invalid_final_url(monkeypatch, final_url):
@@ -222,9 +323,9 @@ def test_get_json_rejects_invalid_final_url(monkeypatch, final_url):
         return response
 
     monkeypatch.setattr(_http.urllib.request, "urlopen", stub_open)
-    monkeypatch.setattr(_http, "_open_http", stub_open, raising=False)
+    monkeypatch.setattr(_http, "open_http", stub_open)
 
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(_http.URLPolicyError) as exc:
         _http.get_json("https://api.example.org/data")
 
     assert str(exc.value) == "HTTP response URL is invalid"
@@ -242,12 +343,12 @@ def test_get_json_rejects_invalid_final_url(monkeypatch, final_url):
     ],
 )
 def test_http_redirect_handler_rejects_invalid_target(target):
-    handler = _http._ValidatedHTTPRedirectHandler()
+    handler = _http.ValidatedHTTPRedirectHandler()
     request = _http.urllib.request.Request(
         "https://repository.example.org/data",
     )
 
-    with pytest.raises(ValueError) as exc:
+    with pytest.raises(_http.URLPolicyError) as exc:
         handler.redirect_request(
             request,
             None,
@@ -261,7 +362,7 @@ def test_http_redirect_handler_rejects_invalid_target(target):
 
 
 def test_http_redirect_handler_allows_https_cdn_host():
-    handler = _http._ValidatedHTTPRedirectHandler()
+    handler = _http.ValidatedHTTPRedirectHandler()
     request = _http.urllib.request.Request(
         "https://repository.example.org/data",
     )
@@ -276,6 +377,157 @@ def test_http_redirect_handler_allows_https_cdn_host():
     )
 
     assert redirected.full_url == "https://cdn.example.net/files/data.csv"
+
+
+def test_http_redirect_handler_allows_scheme_relative_https_cdn_host():
+    handler = _http.ValidatedHTTPRedirectHandler()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/data",
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "//cdn.example.net/files/data.csv",
+    )
+
+    assert redirected.full_url == "https://cdn.example.net/files/data.csv"
+
+
+@pytest.mark.parametrize("limit", ["repeat", "total"])
+def test_http_redirect_handler_preserves_redirect_limits(limit):
+    class Parent:
+        def __init__(self):
+            self.open_calls = []
+
+        def open(self, req, timeout=None):
+            self.open_calls.append(req.full_url)
+            raise AssertionError("redirect limit must stop before opening")
+
+    handler = _http.ValidatedHTTPRedirectHandler()
+    handler.parent = Parent()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/start",
+    )
+    target = "https://cdn.example.net/final"
+    if limit == "repeat":
+        request.redirect_dict = {target: handler.max_repeats}
+    else:
+        request.redirect_dict = {
+            f"https://cdn.example.net/{index}": 1
+            for index in range(handler.max_redirections)
+        }
+    headers = email.message.Message()
+    headers["Location"] = target
+    redirect_body = _UnreadableRedirectBody()
+
+    with pytest.raises(_http.urllib.error.HTTPError) as exc:
+        handler.http_error_302(
+            request,
+            redirect_body,
+            302,
+            "Found",
+            headers,
+        )
+
+    assert "infinite loop" in str(exc.value).lower()
+    assert handler.parent.open_calls == []
+    assert redirect_body.read_sizes == []
+
+
+@pytest.mark.parametrize("client", ["json", "download"])
+def test_redirect_following_does_not_read_large_30x_body(
+    monkeypatch,
+    tmp_path,
+    client,
+):
+    if client == "json":
+        final_body = b'{"ok":true}'
+        final_content_type = "application/json"
+    else:
+        final_body = b"a,b\n1,2\n"
+        final_content_type = "text/csv"
+    transport = _install_redirect_transport(
+        monkeypatch,
+        final_body=final_body,
+        final_content_type=final_content_type,
+    )
+
+    if client == "json":
+        assert _http.get_json("https://repository.example.org/start") == {
+            "ok": True,
+        }
+    else:
+        destination = tmp_path / "data.csv"
+        result = _download.download_file(
+            "https://repository.example.org/start",
+            str(destination),
+            retries=1,
+        )
+        assert result["ok"] is True
+        assert destination.read_bytes() == final_body
+
+    assert transport.requests == [
+        "https://repository.example.org/start",
+        "https://cdn.example.net/final",
+    ]
+    assert transport.redirect_body.read_sizes == []
+    assert transport.redirect_body.was_closed
+
+
+def test_download_invalid_redirect_is_terminal_with_default_retries(
+    monkeypatch,
+    tmp_path,
+):
+    sleep_calls = []
+    transport = _install_redirect_transport(
+        monkeypatch,
+        final_body=b"unexpected",
+        final_content_type="text/csv",
+        location="ftp://cdn.example.net/final",
+    )
+    monkeypatch.setattr(
+        _download.time,
+        "sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+
+    result = _download.download_file(
+        "https://repository.example.org/start",
+        str(tmp_path / "data.csv"),
+    )
+
+    assert result["ok"] is False
+    assert result["skipped_reason"] == (
+        "download URL rejected by HTTP(S) policy"
+    )
+    assert transport.requests == [
+        "https://repository.example.org/start",
+    ]
+    assert transport.redirect_body.read_sizes == []
+    assert transport.redirect_body.was_closed
+    assert sleep_calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.org/data\x7f.csv",
+        "https://example.org/data?token=\x7f",
+        "https://example.org/data#\x7f",
+        "https://exa\x7fmple.org/data",
+        "https://example.org../data",
+    ],
+)
+def test_http_url_validation_rejects_del_and_multiple_trailing_dots(url):
+    assert _http.is_valid_http_url(url) is False
+
+
+def test_http_url_validation_allows_one_trailing_hostname_dot():
+    assert _http.is_valid_http_url("https://example.org./data") is True
 
 
 def test_get_text_bounded_reader_rejects_oversized_body(monkeypatch):

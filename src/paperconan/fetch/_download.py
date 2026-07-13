@@ -69,6 +69,7 @@ _ZIP_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
 _ZIP_MAX_COMMENT_BYTES = 0xFFFF
 _ZIP16_SENTINEL = 0xFFFF
 _ZIP32_SENTINEL = 0xFFFFFFFF
+_URL_POLICY_SKIP_REASON = "download URL rejected by HTTP(S) policy"
 
 
 class _UnstableRegularFileError(OSError):
@@ -729,10 +730,6 @@ def _dir_size(path):
     return total
 
 
-def _open_download_request(req, timeout):
-    return _http._open_http(req, timeout=timeout)
-
-
 def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                   retries=3, backoff=2.0):
     """Download to disk with redirects, size cap, HTML sniffing, and retry/backoff.
@@ -744,7 +741,7 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
         else None
     )
     result_path = staging.display_path if staging is not None else dest_path
-    if not _http._is_valid_http_url(url):
+    if not _http.is_valid_http_url(url):
         try:
             scheme = urllib.parse.urlsplit(url).scheme.lower()
         except (AttributeError, TypeError, ValueError):
@@ -764,8 +761,8 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
         fd = -1
         temp_path = None
         try:
-            with _open_download_request(req, timeout=timeout) as resp:
-                final_url = _http._require_valid_response_url(resp)
+            with _http.open_http(req, timeout=timeout) as resp:
+                final_url = _http.validated_response_url(resp)
                 ctype = (resp.info().get("Content-Type") or "").lower()
                 if "text/html" in ctype:
                     return {"ok": False, "path": result_path,
@@ -820,6 +817,12 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                     "content_type": ctype.split(";", 1)[0].strip(),
                     "source_url": final_url,
                 }
+        except _http.URLPolicyError:
+            return {
+                "ok": False,
+                "path": result_path,
+                "skipped_reason": _URL_POLICY_SKIP_REASON,
+            }
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 return {"ok": False, "path": result_path,

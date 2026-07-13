@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -11,10 +12,24 @@ _JSON_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 
 
+class URLPolicyError(ValueError):
+    """A terminal rejection of an HTTP request, redirect, or response URL."""
+
+
+def _has_disallowed_url_character(value):
+    return any(
+        character.isspace()
+        or ord(character) < 32
+        or ord(character) == 127
+        for character in value
+    )
+
+
 def _valid_hostname(hostname):
     if (
         not hostname
-        or any(character.isspace() or ord(character) < 32 for character in hostname)
+        or _has_disallowed_url_character(hostname)
+        or len(hostname) - len(hostname.rstrip(".")) > 1
     ):
         return False
     if ":" in hostname:
@@ -43,11 +58,11 @@ def _valid_hostname(hostname):
     )
 
 
-def _is_valid_http_url(url):
+def is_valid_http_url(url):
     if (
         not isinstance(url, str)
         or not url
-        or any(character.isspace() or ord(character) < 32 for character in url)
+        or _has_disallowed_url_character(url)
     ):
         return False
     try:
@@ -71,25 +86,40 @@ def _is_valid_http_url(url):
     return port is None or 0 <= port <= 65535
 
 
-def _require_valid_http_url(url, message):
-    if not _is_valid_http_url(url):
-        raise ValueError(message)
+def validate_http_url(url, message="HTTP URL is invalid"):
+    if not is_valid_http_url(url):
+        raise URLPolicyError(message)
     return url
 
 
-class _ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
+def resolve_http_url(base_url, target, message="HTTP URL is invalid"):
+    validate_http_url(base_url, message)
+    if (
+        not isinstance(target, str)
+        or not target
+        or _has_disallowed_url_character(target)
+    ):
+        raise URLPolicyError(message)
+    try:
+        raw_parts = urllib.parse.urlsplit(target)
+        if (
+            (raw_parts.scheme and not raw_parts.netloc)
+            or (target.startswith("//") and not raw_parts.netloc)
+        ):
+            raise URLPolicyError(message)
+        resolved = urllib.parse.urljoin(base_url, target)
+    except (TypeError, ValueError):
+        raise URLPolicyError(message) from None
+    return validate_http_url(resolved, message)
+
+
+class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        try:
-            raw_parts = urllib.parse.urlsplit(newurl)
-            if raw_parts.scheme or raw_parts.netloc:
-                _require_valid_http_url(
-                    newurl,
-                    "HTTP redirect URL is invalid",
-                )
-            target = urllib.parse.urljoin(req.full_url, newurl)
-        except (TypeError, ValueError):
-            raise ValueError("HTTP redirect URL is invalid") from None
-        _require_valid_http_url(target, "HTTP redirect URL is invalid")
+        target = resolve_http_url(
+            req.full_url,
+            newurl,
+            "HTTP redirect URL is invalid",
+        )
         return super().redirect_request(
             req,
             fp,
@@ -101,39 +131,64 @@ class _ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def http_error_302(self, req, fp, code, msg, headers):
         location = headers.get("location") or headers.get("uri")
-        if location is not None:
-            try:
-                raw_parts = urllib.parse.urlsplit(location)
-                if raw_parts.scheme or raw_parts.netloc:
-                    _require_valid_http_url(
-                        location,
-                        "HTTP redirect URL is invalid",
-                    )
-                target = urllib.parse.urljoin(req.full_url, location)
-            except (TypeError, ValueError):
-                raise ValueError("HTTP redirect URL is invalid") from None
-            _require_valid_http_url(target, "HTTP redirect URL is invalid")
-        return super().http_error_302(req, fp, code, msg, headers)
+        if location is None:
+            return None
+        try:
+            target = resolve_http_url(
+                req.full_url,
+                location,
+                "HTTP redirect URL is invalid",
+            )
+        except URLPolicyError:
+            fp.close()
+            raise
+        parts = urllib.parse.urlsplit(target)
+        if not parts.path and parts.netloc:
+            target = urllib.parse.urlunsplit(
+                (parts.scheme, parts.netloc, "/", parts.query, parts.fragment)
+            )
+        new = self.redirect_request(req, fp, code, msg, headers, target)
+        if new is None:
+            return None
+        if hasattr(req, "redirect_dict"):
+            visited = new.redirect_dict = req.redirect_dict
+            if (
+                visited.get(target, 0) >= self.max_repeats
+                or len(visited) >= self.max_redirections
+            ):
+                raise urllib.error.HTTPError(
+                    req.full_url,
+                    code,
+                    self.inf_msg + msg,
+                    headers,
+                    fp,
+                )
+        else:
+            visited = new.redirect_dict = req.redirect_dict = {}
+        visited[target] = visited.get(target, 0) + 1
+        fp.close()
+        return self.parent.open(new, timeout=req.timeout)
 
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = (
         http_error_302
     )
 
 
-def _open_http(req, timeout):
-    opener = urllib.request.build_opener(_ValidatedHTTPRedirectHandler())
+def open_http(req, timeout):
+    validate_http_url(req.full_url, "HTTP request URL is invalid")
+    opener = urllib.request.build_opener(ValidatedHTTPRedirectHandler())
     return opener.open(req, timeout=timeout)
 
 
-def _require_valid_response_url(resp):
+def validated_response_url(resp):
     geturl = getattr(resp, "geturl", None)
     if not callable(geturl):
-        raise ValueError("HTTP response URL is invalid")
+        raise URLPolicyError("HTTP response URL is invalid")
     try:
         final_url = geturl()
     except (TypeError, ValueError):
-        raise ValueError("HTTP response URL is invalid") from None
-    return _require_valid_http_url(final_url, "HTTP response URL is invalid")
+        raise URLPolicyError("HTTP response URL is invalid") from None
+    return validate_http_url(final_url, "HTTP response URL is invalid")
 
 
 def _read_json_response(resp):
@@ -232,13 +287,13 @@ class _AllowedOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
 def get_json(url, params=None, headers=None, timeout=15):
     if params:
         url = url + "?" + urllib.parse.urlencode(params)
-    _require_valid_http_url(url, "HTTP request URL is invalid")
+    validate_http_url(url, "HTTP request URL is invalid")
     h = {"Accept": "application/json", "User-Agent": _UA}
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, headers=h, method="GET")
-    with _open_http(req, timeout=timeout) as resp:
-        _require_valid_response_url(resp)
+    with open_http(req, timeout=timeout) as resp:
+        validated_response_url(resp)
         return _read_json_response(resp)
 
 
@@ -286,12 +341,12 @@ def get_text(
 
 
 def post_json(url, payload, headers=None, timeout=15):
-    _require_valid_http_url(url, "HTTP request URL is invalid")
+    validate_http_url(url, "HTTP request URL is invalid")
     body = json.dumps(payload).encode("utf-8")
     h = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": _UA}
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, data=body, headers=h, method="POST")
-    with _open_http(req, timeout=timeout) as resp:
-        _require_valid_response_url(resp)
+    with open_http(req, timeout=timeout) as resp:
+        validated_response_url(resp)
         return _read_json_response(resp)
