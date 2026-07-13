@@ -458,12 +458,13 @@ def _validate_neutral_verdict(
     text = "\n".join(
         _rendered_visible_text(value) if markdown else value
         for value, markdown in _iter_verdict_text(verdict, scan_findings)
-    ).casefold()
+    )
     if contains_blocked_language(text):
         raise ValueError(
             "verdict text violates the neutral-language policy; rewrite it as a "
             "statistical signal, data inconsistency, unresolved similarity, or "
-            "request for clarification"
+            "request for clarification; quoted or negated blocked language must "
+            "also be rewritten"
         )
 
 

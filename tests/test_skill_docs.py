@@ -181,6 +181,7 @@ def test_tracked_product_surfaces_follow_neutral_language_policy() -> None:
         "伪" + "造",
         "捏" + "造",
         "作" + "假",
+        "实" + "锤",
         "fr" + "audster",
         "de" + "fr" + "auder",
     ],

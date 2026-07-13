@@ -382,8 +382,26 @@ def test_adjudicated_report_rejects_blocked_language_families_without_echo(
     assert str(exc.value) == (
         "verdict text violates the neutral-language policy; rewrite it as a "
         "statistical signal, data inconsistency, unresolved similarity, or "
-        "request for clarification"
+        "request for clarification; quoted or negated blocked language must "
+        "also be rewritten"
     )
+
+
+def test_adjudicated_report_rejects_identifier_style_blocked_language(
+    tmp_path,
+):
+    blocked = "sample" + "Fa" + "keDownload"
+    verdict = {
+        "verdict": "NEEDS_HUMAN",
+        "report_md": f"The visible label is {blocked}.",
+    }
+
+    with pytest.raises(ValueError, match="neutral-language policy"):
+        render_adjudicated_report(
+            {"relations_blocks": [], "cross_sheet_findings": []},
+            verdict,
+            artifact_dir=str(tmp_path),
+        )
 
 
 def test_write_adjudicated_report_publication_failure_preserves_existing_output(
@@ -443,6 +461,51 @@ def test_report_subcommand_writes_adjudicated_html(tmp_path):
     assert 'class="finding-block"' in html
     assert "identical_column" in html
     assert str(out) in proc.stdout
+
+
+def test_report_subcommand_rejects_non_neutral_verdict_without_traceback(
+    tmp_path,
+):
+    scan_path = tmp_path / "scan.json"
+    scan_path.write_text(
+        json.dumps({"relations_blocks": [], "cross_sheet_findings": []}),
+        encoding="utf-8",
+    )
+    blocked = "mis" + "conduct"
+    verdict_path = tmp_path / "verdict.json"
+    verdict_path.write_text(
+        json.dumps({
+            "verdict": "NEEDS_HUMAN",
+            "report_md": f"There is no evidence of {blocked}.",
+        }),
+        encoding="utf-8",
+    )
+    out = tmp_path / "adjudication.html"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paperconan",
+            "report",
+            str(scan_path),
+            "--verdict",
+            str(verdict_path),
+            "--out",
+            str(out),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "Traceback" not in proc.stderr
+    assert blocked not in proc.stderr.casefold()
+    assert "neutral-language policy" in proc.stderr
+    assert "quoted or negated" in proc.stderr
+    assert not out.exists()
 
 
 def test_report_subcommand_resolves_preview_relative_to_scan_json(tmp_path):

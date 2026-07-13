@@ -3411,12 +3411,15 @@ def main():
             scan = json.load(fh)
         with open(rargs.verdict, encoding="utf-8") as fh:
             verdict = json.load(fh)
-        write_adjudicated_report(
-            scan,
-            verdict,
-            rargs.out,
-            artifact_dir=os.path.dirname(os.path.abspath(rargs.scan_json)),
-        )
+        try:
+            write_adjudicated_report(
+                scan,
+                verdict,
+                rargs.out,
+                artifact_dir=os.path.dirname(os.path.abspath(rargs.scan_json)),
+            )
+        except ValueError as exc:
+            sys.exit(str(exc))
         print(f"wrote {rargs.out}")
         return
     ap = argparse.ArgumentParser(

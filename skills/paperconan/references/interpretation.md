@@ -31,7 +31,7 @@ not establish author intent.
 - 不判断作者意图或责任；只描述文件、sheet、列、行和数值模式。
 - 不点名作者作个人归因；只提出可复核的数据问题。
 - 不建议微博 / Twitter / 知乎 / 小红书 / 抖音曝光。
-- 不用"实锤"。
+- 不把统计信号写成最终结论。
 - 不把 paperconan 当统计学审稿工具；它只看数值模式。
 
 ## Normal Scan Summary Template
@@ -63,7 +63,7 @@ not establish author intent.
 
 - "这说明数据是编的。"
 - "作者意图已经确定。"
-- "已经实锤。"
+- "已经可以直接定性。"
 
 ## If The User Asks For An Author-Intent Conclusion
 

@@ -23,6 +23,7 @@ _BLOCKED_LANGUAGE_PATTERNS = tuple(
         re.escape("伪" + "造"),
         re.escape("捏" + "造"),
         re.escape("作" + "假"),
+        re.escape("实" + "锤"),
     )
 )
 

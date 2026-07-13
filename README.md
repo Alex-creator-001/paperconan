@@ -154,7 +154,7 @@ PaperConan 本身不调用或配置模型服务。
 
 **请走正规渠道：** 把可疑 signal 提交 PubPeer / 联系期刊 ethics inquiry / 涉及本单位走 research integrity office。
 
-**请不要：** 在社交媒体直接指控具体作者 / 把 paperconan 截图当"实锤" / 跳过作者澄清直接定性。
+**请不要：** 在社交媒体直接指控具体作者 / 把 paperconan 截图当最终结论 / 跳过作者澄清直接定性。
 
 工具是中立的，使用方式不能。
 
