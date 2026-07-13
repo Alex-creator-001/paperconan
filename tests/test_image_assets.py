@@ -112,6 +112,31 @@ def test_prepare_image_assets_preserves_native_pixels_and_stable_ids(tmp_path):
     assert first[0]["path"] != first[0]["preview_path"]
 
 
+def test_prepare_image_assets_orders_assets_by_stable_source_name(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    first_path = source / "FigA.png"
+    second_path = source / "FigB.png"
+    _image(first_path)
+    _image(second_path, color=(180, 60, 20))
+    ids = {
+        _assets._sha256(first_path): "img:zzzz",
+        _assets._sha256(second_path): "img:aaaa",
+    }
+    monkeypatch.setattr(_assets, "_asset_id", ids.__getitem__)
+
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(tmp_path / "audit"),
+    )
+
+    assert errors == []
+    assert [asset["file"] for asset in assets] == ["FigA.png", "FigB.png"]
+
+
 def test_exact_duplicate_files_are_one_asset_with_all_source_names(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -1517,25 +1542,25 @@ def test_local_image_stat_hash_replacement_uses_one_stable_source_handle(
     replacement_path = tmp_path / "replacement.png"
     replacement_path.write_bytes(replacement_bytes)
     monkeypatch.setattr(_assets, "_MAX_IMAGE_BYTES", len(original_bytes))
-    real_path_stat = Path.stat
+    real_is_file = Path.is_file
     real_fstat = os.fstat
     real_sha256 = _assets._sha256
     real_image_open = PIL.open
-    path_stat_calls = 0
+    image_is_file_calls = 0
     source_fstat_calls = 0
     swapped = False
     pathname_hashed = False
     decoded_identities = []
 
-    def replace_after_path_stat(path, *args, **kwargs):
-        nonlocal path_stat_calls, swapped
-        current = real_path_stat(path, *args, **kwargs)
+    def replace_after_is_file(path):
+        nonlocal image_is_file_calls, swapped
+        is_file = real_is_file(path)
         if path == image_path:
-            path_stat_calls += 1
-            if path_stat_calls == 2 and not swapped:
+            image_is_file_calls += 1
+            if image_is_file_calls == 2 and not swapped:
                 replacement_path.replace(image_path)
                 swapped = True
-        return current
+        return is_file
 
     def replace_after_descriptor_size(fd):
         nonlocal source_fstat_calls, swapped
@@ -1558,7 +1583,7 @@ def test_local_image_stat_hash_replacement_uses_one_stable_source_handle(
             decoded_identities.append((current.st_dev, current.st_ino))
         return real_image_open(fp, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", replace_after_path_stat)
+    monkeypatch.setattr(Path, "is_file", replace_after_is_file)
     monkeypatch.setattr(_assets.os, "fstat", replace_after_descriptor_size)
     monkeypatch.setattr(_assets, "_sha256", track_pathname_hash)
     monkeypatch.setattr(PIL, "open", track_decode)
@@ -1566,6 +1591,7 @@ def test_local_image_stat_hash_replacement_uses_one_stable_source_handle(
 
     assets, errors = _assets.prepare_image_assets(str(source), str(output))
 
+    assert image_is_file_calls == 1
     assert swapped
     assert not pathname_hashed
     assert errors == []

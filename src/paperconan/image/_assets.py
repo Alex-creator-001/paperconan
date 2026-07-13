@@ -1173,20 +1173,19 @@ def prepare_image_assets(
         return [], [{"error": str(exc)}]
     downloads = _source_provenance(source_root)
     downloads.update(_provided_provenance(provenance))
-    candidates = sorted(
-        [
-            path for path in source_root.iterdir()
-            if path.is_file() and path.suffix.lower() in _IMAGE_SUFFIXES
-        ],
-        key=lambda path: _stable_name_key(path.name),
-    )
-    pdfs = sorted(
-        [
-            path for path in source_root.iterdir()
-            if path.is_file() and path.suffix.lower() == ".pdf"
-        ],
-        key=lambda path: _stable_name_key(path.name),
-    )
+    candidates = []
+    pdfs = []
+    for path in sorted(
+        source_root.iterdir(),
+        key=lambda item: _stable_name_key(item.name),
+    ):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix in _IMAGE_SUFFIXES:
+            candidates.append(path)
+        elif suffix == ".pdf":
+            pdfs.append(path)
     if candidates or (render_pdf and pdfs):
         preflight_image_dependencies(
             render_pdf=False,
@@ -1391,6 +1390,9 @@ def prepare_image_assets(
         output_context.__exit__(None, None, None)
     assets = sorted(
         assets_by_digest.values(),
-        key=lambda asset: (asset["asset_id"], asset["file"]),
+        key=lambda asset: (
+            _stable_name_key(asset["file"]),
+            asset["asset_id"],
+        ),
     )
     return assets, errors
