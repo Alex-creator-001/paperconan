@@ -1732,11 +1732,12 @@ def test_supplementary_zip_processing_failures_are_skipped(
     summary = _download.download_candidate(candidate, str(tmp_path))
 
     assert summary["downloaded"] == []
-    assert any(
-        item["name"] == archive["name"]
-        and "archive processing unavailable" in item["reason"]
-        for item in summary["skipped"]
-    )
+    archive_outcomes = [
+        item for item in summary["skipped"]
+        if item["name"] == archive["name"]
+    ]
+    assert len(archive_outcomes) == 1
+    assert "archive processing unavailable" in archive_outcomes[0]["reason"]
     assert not list(tmp_path.glob(".paperconan-archive-*"))
 
 
@@ -1748,12 +1749,78 @@ def test_truncated_oa_gzip_processing_is_skipped(monkeypatch, tmp_path):
     summary = _download.download_candidate(candidate, str(tmp_path))
 
     assert summary["downloaded"] == []
-    assert any(
-        item["name"] == archive["name"]
-        and "archive processing unavailable" in item["reason"]
-        for item in summary["skipped"]
-    )
+    archive_outcomes = [
+        item for item in summary["skipped"]
+        if item["name"] == archive["name"]
+    ]
+    assert len(archive_outcomes) == 1
+    assert "archive processing unavailable" in archive_outcomes[0]["reason"]
     assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+def test_archive_publication_runtime_error_propagates(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+):
+    candidate, _ = _archive_candidate(archive_kind)
+    _install_archive_payload(
+        monkeypatch,
+        _archive_bytes(archive_kind),
+    )
+    monkeypatch.setattr(
+        _download,
+        "_write_collision_safe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("internal archive publication error")
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="internal archive publication error",
+    ):
+        _download.download_candidate(candidate, str(tmp_path))
+
+    assert not list(tmp_path.glob(".paperconan-archive-*"))
+
+
+@pytest.mark.parametrize("archive_kind", ["oa", "supplementary"])
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        _download.SOURCE_SIDECAR,
+        _download.SOURCE_SIDECAR.upper(),
+    ],
+)
+def test_archive_reserved_sidecar_basename_is_skipped(
+    monkeypatch,
+    tmp_path,
+    archive_kind,
+    reserved_name,
+):
+    candidate, archive = _archive_candidate(archive_kind)
+    _install_archive_payload(
+        monkeypatch,
+        _archive_bytes_with_members(
+            archive_kind,
+            [(f"nested/{reserved_name}", b"remote-sidecar")],
+        ),
+    )
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert summary["downloaded"] == []
+    assert summary["skipped"] == [{
+        "name": archive["name"],
+        "reason": "reserved provenance sidecar basename",
+    }]
+    assert sidecar["cand_id"] == candidate["cand_id"]
+    assert sidecar["downloads"] == []
 
 
 def _fail_download_staging_unlink(monkeypatch):
@@ -4791,9 +4858,17 @@ def test_sidecar_publication_retains_concurrent_no_replace_creation(
     assert not list(out_dir.glob(".paperconan-sidecar-*"))
 
 
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        _download.SOURCE_SIDECAR,
+        _download.SOURCE_SIDECAR.upper(),
+    ],
+)
 def test_remote_reserved_sidecar_basename_is_skipped_before_download(
     monkeypatch,
     tmp_path,
+    reserved_name,
 ):
     def reject_download(*args, **kwargs):
         raise AssertionError("reserved provenance basename must not be downloaded")
@@ -4803,7 +4878,7 @@ def test_remote_reserved_sidecar_basename_is_skipped_before_download(
         "cand_id": "source:1",
         "source": "source",
         "tabular_files": [{
-            "name": f"remote/{_download.SOURCE_SIDECAR}",
+            "name": f"remote/{reserved_name}",
             "download_url": "https://example.test/paperconan_source.json",
         }],
     }
@@ -4815,7 +4890,7 @@ def test_remote_reserved_sidecar_basename_is_skipped_before_download(
 
     assert summary["downloaded"] == []
     assert summary["skipped"] == [{
-        "name": f"remote/{_download.SOURCE_SIDECAR}",
+        "name": f"remote/{reserved_name}",
         "reason": "reserved provenance sidecar basename",
     }]
     assert sidecar["downloads"] == []

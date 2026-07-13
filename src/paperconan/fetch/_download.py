@@ -25,22 +25,17 @@ from ._files import asset_type
 
 # Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
 SOURCE_SIDECAR = "paperconan_source.json"
-_ZIP_PROCESSING_EXCEPTIONS = (
+_RESERVED_SOURCE_SIDECAR_REASON = "reserved provenance sidecar basename"
+_ZIP_MEMBER_READ_EXCEPTIONS = (
     zipfile.BadZipFile,
-    zipfile.LargeZipFile,
     zlib.error,
     RuntimeError,
     NotImplementedError,
-    OSError,
-    ValueError,
 )
-_TAR_PROCESSING_EXCEPTIONS = (
-    tarfile.TarError,
+_TAR_STREAM_READ_EXCEPTIONS = (
     gzip.BadGzipFile,
     EOFError,
     zlib.error,
-    OSError,
-    ValueError,
 )
 
 _UA = "paperconan-fetch/0.6 (+https://github.com/zixixr/paperconan)"
@@ -88,6 +83,10 @@ class _SourceSidecarPublicationError(ValueError):
 
 
 class _PaperDataLimitError(ValueError):
+    pass
+
+
+class _ArchiveReadError(Exception):
     pass
 
 
@@ -1132,6 +1131,14 @@ def _append_limit_reason(reasons: list[str] | None, reason: str) -> None:
         reasons.append(reason)
 
 
+def _is_reserved_source_sidecar(name: object) -> bool:
+    try:
+        basename = os.path.basename(os.fsdecode(name))
+    except (TypeError, ValueError):
+        return False
+    return basename.casefold() == SOURCE_SIDECAR.casefold()
+
+
 def _archive_blocking_reason(
     cardinality: _CandidateCardinality | None,
 ) -> str | None:
@@ -1425,6 +1432,12 @@ def _extract_selected_zip(
             if info.is_dir():
                 continue
             name = os.path.basename(info.filename)
+            if _is_reserved_source_sidecar(name):
+                _append_limit_reason(
+                    limit_reasons,
+                    _RESERVED_SOURCE_SIDECAR_REASON,
+                )
+                continue
             if (
                 not name
                 or asset_type(name) not in allowed
@@ -1444,10 +1457,13 @@ def _extract_selected_zip(
                         _archive_member_limit_reason(cardinality),
                     )
                     break
-            with zf.open(info) as src:
-                data = src.read(max_member_bytes + 1)
-                if len(data) > max_member_bytes:
-                    continue
+            try:
+                with zf.open(info) as src:
+                    data = src.read(max_member_bytes + 1)
+            except _ZIP_MEMBER_READ_EXCEPTIONS as exc:
+                raise _ArchiveReadError(str(exc)) from exc
+            if len(data) > max_member_bytes:
+                continue
             try:
                 dest = _write_collision_safe(
                     out_dir,
@@ -1502,11 +1518,28 @@ def _extract_selected_tar(
                 max_bytes=_MAX_UNCOMPRESSED_TAR_BYTES_PER_ARCHIVE,
                 max_members=_MAX_RAW_TAR_MEMBERS_PER_ARCHIVE,
             )
-            with tarfile.open(fileobj=bounded, mode="r|") as tf:
-                for member in tf:
+            try:
+                tf = tarfile.open(fileobj=bounded, mode="r|")
+            except _TAR_STREAM_READ_EXCEPTIONS as exc:
+                raise _ArchiveReadError(str(exc)) from exc
+            with tf:
+                members = iter(tf)
+                while True:
+                    try:
+                        member = next(members)
+                    except StopIteration:
+                        break
+                    except _TAR_STREAM_READ_EXCEPTIONS as exc:
+                        raise _ArchiveReadError(str(exc)) from exc
                     if not member.isfile():
                         continue
                     name = os.path.basename(member.name)
+                    if _is_reserved_source_sidecar(name):
+                        _append_limit_reason(
+                            limit_reasons,
+                            _RESERVED_SOURCE_SIDECAR_REASON,
+                        )
+                        continue
                     if (
                         not name
                         or asset_type(name) not in allowed
@@ -1526,10 +1559,13 @@ def _extract_selected_tar(
                                 _archive_member_limit_reason(cardinality),
                             )
                             break
-                    src = tf.extractfile(member)
-                    if src is None:
-                        continue
-                    data = src.read(max_member_bytes + 1)
+                    try:
+                        src = tf.extractfile(member)
+                        if src is None:
+                            continue
+                        data = src.read(max_member_bytes + 1)
+                    except _TAR_STREAM_READ_EXCEPTIONS as exc:
+                        raise _ArchiveReadError(str(exc)) from exc
                     if len(data) > max_member_bytes:
                         continue
                     try:
@@ -1764,7 +1800,12 @@ def _download_oa_package(
                             pending_entries=pending,
                             transient_files=(tmp,),
                         )
-                    except _TAR_PROCESSING_EXCEPTIONS as exc:
+                    except (
+                        tarfile.TarError,
+                        OSError,
+                        ValueError,
+                        _ArchiveReadError,
+                    ) as exc:
                         processing_error = exc
             except _UnstableRegularFileError as exc:
                 staging_error = exc
@@ -1793,7 +1834,7 @@ def _download_oa_package(
                     reason += "; " + "; ".join(outcomes)
                 skipped.append({"name": pkg.get("name"), "reason": reason})
                 return reconciled
-        except _TAR_PROCESSING_EXCEPTIONS as e:
+        except (tarfile.TarError, OSError, ValueError) as e:
             reason = (
                 f"archive publication unavailable: {e}"
                 if isinstance(e, OSError)
@@ -1806,7 +1847,7 @@ def _download_oa_package(
             for reason in limit_reasons
         )
         return reconciled
-    except _TAR_PROCESSING_EXCEPTIONS as e:
+    except (tarfile.TarError, OSError, ValueError) as e:
         skipped.append({"name": pkg.get("name"), "reason": f"bad tar.gz: {e}"})
         return []
     finally:
@@ -1869,7 +1910,13 @@ def _download_supplementary_archive(
                                 pending_entries=pending,
                                 transient_files=(tmp_zip,),
                             )
-                    except _ZIP_PROCESSING_EXCEPTIONS as exc:
+                    except (
+                        zipfile.BadZipFile,
+                        zipfile.LargeZipFile,
+                        OSError,
+                        ValueError,
+                        _ArchiveReadError,
+                    ) as exc:
                         processing_error = exc
             except _UnstableRegularFileError as exc:
                 staging_error = exc
@@ -1902,7 +1949,12 @@ def _download_supplementary_archive(
                     reason += "; " + "; ".join(outcomes)
                 skipped.append({"name": arch.get("name"), "reason": reason})
                 return reconciled
-        except _ZIP_PROCESSING_EXCEPTIONS as exc:
+        except (
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+            OSError,
+            ValueError,
+        ) as exc:
             reason = (
                 "not a valid zip archive"
                 if isinstance(exc, zipfile.BadZipFile)
@@ -1919,7 +1971,12 @@ def _download_supplementary_archive(
             for reason in limit_reasons
         )
         return reconciled
-    except _ZIP_PROCESSING_EXCEPTIONS as exc:
+    except (
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        OSError,
+        ValueError,
+    ) as exc:
         reason = (
             "not a valid zip archive"
             if isinstance(exc, zipfile.BadZipFile)
@@ -2206,10 +2263,10 @@ def download_candidate(
             max_archive_members=_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE,
         )
         for f in files:
-            if os.path.basename(f["name"]) == SOURCE_SIDECAR:
+            if _is_reserved_source_sidecar(f["name"]):
                 skipped.append({
                     "name": f["name"],
-                    "reason": "reserved provenance sidecar basename",
+                    "reason": _RESERVED_SOURCE_SIDECAR_REASON,
                 })
                 continue
             if not cardinality.can_publish():
