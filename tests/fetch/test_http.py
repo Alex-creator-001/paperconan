@@ -408,6 +408,61 @@ def test_http_redirect_handler_allows_scheme_relative_https_cdn_host():
     assert redirected.full_url == "https://cdn.example.net/files/data.csv"
 
 
+def test_cross_origin_redirect_strips_sensitive_request_headers():
+    handler = _http.ValidatedHTTPRedirectHandler()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/data",
+        headers={
+            "Authorization": "Bearer repository-secret",
+            "Cookie": "session=repository-secret",
+            "X-Request-Id": "request-123",
+        },
+    )
+    request.add_unredirected_header(
+        "Proxy-Authorization",
+        "Basic proxy-secret",
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://cdn.example.net/files/data.csv",
+    )
+
+    redirected_headers = {
+        name.lower(): value
+        for name, value in redirected.header_items()
+    }
+    assert "authorization" not in redirected_headers
+    assert "proxy-authorization" not in redirected_headers
+    assert "cookie" not in redirected_headers
+    assert redirected_headers["x-request-id"] == "request-123"
+
+
+def test_same_origin_redirect_retains_request_authorization():
+    handler = _http.ValidatedHTTPRedirectHandler()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/data",
+        headers={"Authorization": "Bearer repository-secret"},
+    )
+
+    redirected = handler.redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        {},
+        "https://repository.example.org/files/data.csv",
+    )
+
+    assert redirected.get_header("Authorization") == (
+        "Bearer repository-secret"
+    )
+
+
 @pytest.mark.parametrize("limit", ["repeat", "total"])
 def test_http_redirect_handler_preserves_redirect_limits(limit):
     class Parent:
@@ -447,6 +502,68 @@ def test_http_redirect_handler_preserves_redirect_limits(limit):
     assert "infinite loop" in str(exc.value).lower()
     assert handler.parent.open_calls == []
     assert redirect_body.read_sizes == []
+    assert redirect_body.was_closed
+
+
+def test_redirect_limit_preserves_http_error_when_response_close_fails():
+    class Parent:
+        def open(self, req, timeout=None):
+            raise AssertionError("redirect limit must stop before opening")
+
+    handler = _http.ValidatedHTTPRedirectHandler()
+    handler.parent = Parent()
+    request = _http.urllib.request.Request(
+        "https://repository.example.org/start",
+    )
+    target = "https://cdn.example.net/final"
+    request.redirect_dict = {target: handler.max_repeats}
+    headers = email.message.Message()
+    headers["Location"] = target
+    redirect_body = _UnreadableRedirectBody(close_error=True)
+
+    with pytest.raises(_http.urllib.error.HTTPError) as exc:
+        handler.http_error_302(
+            request,
+            redirect_body,
+            302,
+            "Found",
+            headers,
+        )
+
+    assert "infinite loop" in str(exc.value).lower()
+    assert redirect_body.was_closed
+
+
+def test_open_http_closes_http_error_response(monkeypatch):
+    response = _UnreadableRedirectBody(close_error=True)
+    error = _http.urllib.error.HTTPError(
+        "https://repository.example.org/start",
+        503,
+        "Unavailable",
+        {},
+        response,
+    )
+
+    class FailingOpener:
+        def open(self, req, timeout=None):
+            raise error
+
+    monkeypatch.setattr(
+        _http.urllib.request,
+        "build_opener",
+        lambda *handlers: FailingOpener(),
+    )
+
+    with pytest.raises(_http.urllib.error.HTTPError) as exc:
+        _http.open_http(
+            _http.urllib.request.Request(
+                "https://repository.example.org/start",
+            ),
+            timeout=15,
+        )
+
+    assert exc.value is error
+    assert response.was_closed
 
 
 @pytest.mark.parametrize("client", ["json", "download"])

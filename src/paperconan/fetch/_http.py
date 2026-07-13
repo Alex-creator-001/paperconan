@@ -11,6 +11,12 @@ import urllib.request
 _UA = "paperconan-fetch/0.6 (+https://github.com/zixixr/paperconan)"
 _JSON_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+_SENSITIVE_REDIRECT_HEADERS = frozenset({
+    "authorization",
+    "cookie",
+    "cookie2",
+    "proxy-authorization",
+})
 
 
 class URLPolicyError(ValueError):
@@ -134,6 +140,37 @@ def _normalize_redirect_location(location):
         raise URLPolicyError("HTTP redirect URL is invalid") from None
 
 
+def _http_origin(url):
+    try:
+        parts = urllib.parse.urlsplit(url)
+        scheme = parts.scheme.lower()
+        hostname = parts.hostname.casefold()
+        port = parts.port
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, hostname, port
+
+
+def _strip_cross_origin_sensitive_headers(request, source_url, target_url):
+    if _http_origin(source_url) == _http_origin(target_url):
+        return
+    for headers in (request.headers, request.unredirected_hdrs):
+        for name in list(headers):
+            if name.casefold() in _SENSITIVE_REDIRECT_HEADERS:
+                del headers[name]
+
+
+def _close_http_response(response):
+    close = getattr(response, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
 class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = resolve_http_url(
@@ -141,7 +178,7 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
             newurl,
             "HTTP redirect URL is invalid",
         )
-        return super().redirect_request(
+        redirected = super().redirect_request(
             req,
             fp,
             code,
@@ -149,6 +186,13 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
             headers,
             target,
         )
+        if redirected is not None:
+            _strip_cross_origin_sensitive_headers(
+                redirected,
+                req.full_url,
+                target,
+            )
+        return redirected
 
     def http_error_302(self, req, fp, code, msg, headers):
         location = headers.get("location") or headers.get("uri")
@@ -180,13 +224,15 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
                 visited.get(target, 0) >= self.max_repeats
                 or len(visited) >= self.max_redirections
             ):
-                raise urllib.error.HTTPError(
+                error = urllib.error.HTTPError(
                     req.full_url,
                     code,
                     self.inf_msg + msg,
                     headers,
                     fp,
                 )
+                _close_http_response(fp)
+                raise error
         else:
             visited = new.redirect_dict = req.redirect_dict = {}
         visited[target] = visited.get(target, 0) + 1
@@ -201,7 +247,11 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
 def open_http(req, timeout):
     validate_http_url(req.full_url, "HTTP request URL is invalid")
     opener = urllib.request.build_opener(ValidatedHTTPRedirectHandler())
-    return opener.open(req, timeout=timeout)
+    try:
+        return opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        _close_http_response(exc)
+        raise
 
 
 def validated_response_url(resp):

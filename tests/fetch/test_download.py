@@ -58,6 +58,49 @@ def test_download_file_auth_required_message(monkeypatch, tmp_path):
     assert not (tmp_path / "t.csv").exists()
 
 
+def test_download_file_closes_http_error_without_masking_auth_result(
+    monkeypatch,
+    tmp_path,
+):
+    import urllib.error
+
+    class ErrorBody(io.BytesIO):
+        def __init__(self):
+            super().__init__(b"must not be read")
+            self.was_closed = False
+            self.close_error = True
+
+        def close(self):
+            self.was_closed = True
+            if self.close_error:
+                self.close_error = False
+                raise OSError("synthetic close failure")
+            super().close()
+
+    body = ErrorBody()
+    error = urllib.error.HTTPError(
+        "https://x/t.csv",
+        403,
+        "Forbidden",
+        {},
+        body,
+    )
+
+    def reject(req, timeout=None):
+        raise error
+
+    monkeypatch.setattr(_http, "open_http", reject)
+
+    result = _download.download_file(
+        "https://x/t.csv",
+        str(tmp_path / "t.csv"),
+    )
+
+    assert result["ok"] is False
+    assert "authentication" in result["skipped_reason"]
+    assert body.was_closed
+
+
 def test_download_candidate_tabular_only(monkeypatch, tmp_path):
     saved = []
     def stub_download(url, dest, **kw):

@@ -824,6 +824,7 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                 "skipped_reason": _URL_POLICY_SKIP_REASON,
             }
         except urllib.error.HTTPError as e:
+            _http._close_http_response(e)
             if e.code in (401, 403):
                 return {"ok": False, "path": result_path,
                         "skipped_reason": (f"requires authentication (HTTP {e.code}); "
