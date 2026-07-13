@@ -363,7 +363,7 @@ def _existing_evidence_matches_staged(
     evidence_fd: int,
     final_name: str,
     staged_fd: int,
-) -> bool:
+) -> tuple[int, int] | None:
     relative_name = f"images/evidence/{final_name}"
     try:
         current = os.stat(
@@ -372,7 +372,7 @@ def _existing_evidence_matches_staged(
             follow_symlinks=False,
         )
     except FileNotFoundError:
-        return False
+        return None
     if not stat.S_ISREG(current.st_mode):
         raise _EvidencePublicationRecoveryError(
             "image evidence publication retained existing visible entry "
@@ -426,7 +426,7 @@ def _existing_evidence_matches_staged(
                 "image evidence publication retained existing visible entry "
                 f"because it differs from prepared output: {relative_name}"
             )
-        return True
+        return opened.st_dev, opened.st_ino
     finally:
         if existing_fd >= 0:
             os.close(existing_fd)
@@ -437,13 +437,14 @@ def _install_or_reuse_evidence(
     temp_name: str,
     temp_fd: int,
     final_name: str,
-) -> bool:
-    if _existing_evidence_matches_staged(
+) -> tuple[bool, tuple[int, int]]:
+    existing_identity = _existing_evidence_matches_staged(
         evidence_fd,
         final_name,
         temp_fd,
-    ):
-        return False
+    )
+    if existing_identity is not None:
+        return False, existing_identity
     try:
         os.link(
             temp_name,
@@ -457,7 +458,8 @@ def _install_or_reuse_evidence(
             "created during publication: "
             f"images/evidence/{final_name}"
         ) from exc
-    return True
+    staged = os.fstat(temp_fd)
+    return True, (staged.st_dev, staged.st_ino)
 
 
 def _publish_staged_images(
@@ -466,8 +468,9 @@ def _publish_staged_images(
     images_fd: int,
     evidence_fd: int,
     staged: list[tuple[str, int, str]],
-) -> None:
+) -> dict[str, tuple[int, int]]:
     installed: list[str] = []
+    receipt = {}
     try:
         _verify_evidence_directories(
             root,
@@ -493,7 +496,7 @@ def _publish_staged_images(
                 temp_name,
                 temp_fd,
             )
-            was_installed = _install_or_reuse_evidence(
+            was_installed, expected_identity = _install_or_reuse_evidence(
                 evidence_fd,
                 temp_name,
                 temp_fd,
@@ -507,17 +510,40 @@ def _publish_staged_images(
                     temp_fd,
                 )
             else:
-                _existing_evidence_matches_staged(
+                current_identity = _existing_evidence_matches_staged(
                     evidence_fd,
                     final_name,
                     temp_fd,
                 )
+                if current_identity != expected_identity:
+                    raise _EvidencePublicationRecoveryError(
+                        "image evidence publication retained existing visible "
+                        "entry because it changed after verification: "
+                        f"images/evidence/{final_name}"
+                    )
+            receipt[f"images/evidence/{final_name}"] = expected_identity
         _verify_evidence_directories(
             root,
             root_fd,
             images_fd,
             evidence_fd,
         )
+        for relative_path, expected_identity in receipt.items():
+            final_name = relative_path.rsplit("/", 1)[-1]
+            current = os.stat(
+                final_name,
+                dir_fd=evidence_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != expected_identity
+            ):
+                raise _EvidencePublicationRecoveryError(
+                    "image evidence publication retained uncertain visible "
+                    f"entry: {relative_path}"
+                )
+        return receipt
     except Exception as publication_error:
         context = ["image evidence publication incomplete"]
         if installed:
@@ -533,31 +559,6 @@ def _publish_staged_images(
         raise _EvidencePublicationRecoveryError(
             "; ".join(context)
         ) from publication_error
-
-
-def _published_evidence_receipt(
-    evidence_fd: int,
-    staged: list[tuple[str, int, str]],
-) -> dict[str, tuple[int, int]]:
-    receipt = {}
-    for _, _, final_name in staged:
-        current = os.stat(
-            final_name,
-            dir_fd=evidence_fd,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISREG(current.st_mode):
-            raise _EvidencePublicationRecoveryError(
-                "image evidence publication retained uncertain visible entry: "
-                f"images/evidence/{final_name}"
-            )
-        receipt[f"images/evidence/{final_name}"] = (
-            current.st_dev,
-            current.st_ino,
-        )
-    return receipt
-
-
 def remove_published_evidence_if_owned(
     output_root: str,
     receipts: list[dict[str, tuple[int, int]]],
@@ -1213,7 +1214,7 @@ def write_native_pair_evidence(
                         existing_size=existing_size,
                         staged_size=staged_size,
                     )
-                    _publish_staged_images(
+                    published_receipt = _publish_staged_images(
                         root,
                         root_fd,
                         images_fd,
@@ -1227,10 +1228,7 @@ def write_native_pair_evidence(
                     if publication_receipt is not None:
                         publication_receipt.clear()
                         publication_receipt.update(
-                            _published_evidence_receipt(
-                                evidence_fd,
-                                staged,
-                            )
+                            published_receipt
                         )
                 finally:
                     active_error = sys.exc_info()[0] is not None

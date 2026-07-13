@@ -1222,6 +1222,61 @@ def test_source_change_rollback_retains_concurrent_evidence_replacement(
     assert budget.used_bytes == visible_bytes
 
 
+def test_source_change_rollback_does_not_claim_post_publication_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(replacement)
+    concurrent_bytes = b"external regular evidence replacement"
+    concurrent_final = None
+    original_publish = _evidence._publish_staged_images
+
+    def publish_then_replace(
+        root,
+        root_fd,
+        images_fd,
+        evidence_fd,
+        staged,
+    ):
+        nonlocal concurrent_final
+        receipt = original_publish(
+            root,
+            root_fd,
+            images_fd,
+            evidence_fd,
+            staged,
+        )
+        concurrent_final = root / "images" / "evidence" / staged[0][2]
+        concurrent_final.unlink()
+        concurrent_final.write_bytes(concurrent_bytes)
+        replacement.replace(native)
+        return receipt
+
+    monkeypatch.setattr(
+        _evidence,
+        "_publish_staged_images",
+        publish_then_replace,
+    )
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+    assert concurrent_final is not None
+    assert concurrent_final.read_bytes() == concurrent_bytes
+
+
 def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
     tmp_path,
     monkeypatch,
