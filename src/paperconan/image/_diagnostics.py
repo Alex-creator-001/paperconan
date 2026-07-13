@@ -12,6 +12,7 @@ import numpy as np
 
 from ._budget import ImageArtifactBudget
 from ._evidence import (
+    _EvidenceIdentity,
     ImageEvidenceSourceChangedError,
     _max_image_bytes,
     _max_image_pixels,
@@ -528,7 +529,7 @@ def diagnose_image_assets(
     invalid_asset_ids = set()
     evidence_receipts_by_asset: dict[
         str,
-        list[dict[str, tuple[int, int]]],
+        list[dict[str, _EvidenceIdentity]],
     ] = {}
 
     def invalidate_asset(candidate: dict, exc: Exception) -> None:
@@ -563,7 +564,7 @@ def diagnose_image_assets(
         evidence_id = candidate["finding_id"].replace(":", "-")
         evidence = None
         evidence_error = None
-        publication_receipt: dict[str, tuple[int, int]] = {}
+        publication_receipt: dict[str, _EvidenceIdentity] = {}
         if budget_ready:
             try:
                 evidence = write_native_pair_evidence(

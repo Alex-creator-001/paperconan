@@ -30,6 +30,7 @@ _SUPPORTED_PREVIEW_MIMES = frozenset({
 _PNG_NATIVE_MODES = frozenset({"1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16"})
 _DEFAULT_MAX_IMAGE_MB = 100.0
 _DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
+_EvidenceIdentity = tuple[int, int, int, str]
 
 
 class _EvidencePublicationRecoveryError(RuntimeError):
@@ -37,7 +38,7 @@ class _EvidencePublicationRecoveryError(RuntimeError):
         self,
         message: str,
         *,
-        publication_receipt: dict[str, tuple[int, int]] | None = None,
+        publication_receipt: dict[str, _EvidenceIdentity] | None = None,
     ):
         super().__init__(message)
         self.publication_receipt = dict(publication_receipt or {})
@@ -370,7 +371,7 @@ def _existing_evidence_matches_staged(
     evidence_fd: int,
     final_name: str,
     staged_fd: int,
-) -> tuple[int, int] | None:
+) -> _EvidenceIdentity | None:
     relative_name = f"images/evidence/{final_name}"
     try:
         current = os.stat(
@@ -403,9 +404,11 @@ def _existing_evidence_matches_staged(
                 f"because it changed during verification: {relative_name}"
             )
         staged = os.fstat(staged_fd)
+        staged_sha256 = _sha256_fd(staged_fd)
+        existing_sha256 = _sha256_fd(existing_fd)
         matches = (
             opened.st_size == staged.st_size
-            and _sha256_fd(existing_fd) == _sha256_fd(staged_fd)
+            and existing_sha256 == staged_sha256
         )
         final_opened = os.fstat(existing_fd)
         final_current = os.stat(
@@ -433,7 +436,12 @@ def _existing_evidence_matches_staged(
                 "image evidence publication retained existing visible entry "
                 f"because it differs from prepared output: {relative_name}"
             )
-        return opened.st_dev, opened.st_ino
+        return (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            existing_sha256,
+        )
     finally:
         if existing_fd >= 0:
             os.close(existing_fd)
@@ -444,7 +452,7 @@ def _install_or_reuse_evidence(
     temp_name: str,
     temp_fd: int,
     final_name: str,
-) -> tuple[bool, tuple[int, int]]:
+) -> tuple[bool, _EvidenceIdentity]:
     existing_identity = _existing_evidence_matches_staged(
         evidence_fd,
         final_name,
@@ -452,6 +460,13 @@ def _install_or_reuse_evidence(
     )
     if existing_identity is not None:
         return False, existing_identity
+    staged = os.fstat(temp_fd)
+    staged_identity = (
+        staged.st_dev,
+        staged.st_ino,
+        staged.st_size,
+        _sha256_fd(temp_fd),
+    )
     try:
         os.link(
             temp_name,
@@ -465,8 +480,75 @@ def _install_or_reuse_evidence(
             "created during publication: "
             f"images/evidence/{final_name}"
         ) from exc
-    staged = os.fstat(temp_fd)
-    return True, (staged.st_dev, staged.st_ino)
+    return True, staged_identity
+
+
+def _evidence_entry_matches_identity(
+    parent_fd: int,
+    name: str,
+    expected_identity: _EvidenceIdentity,
+) -> bool:
+    expected_device, expected_inode, expected_size, expected_sha256 = (
+        expected_identity
+    )
+    current = os.stat(
+        name,
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino)
+        != (expected_device, expected_inode)
+        or current.st_size != expected_size
+    ):
+        return False
+
+    file_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW,
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (expected_device, expected_inode)
+            or opened.st_size != expected_size
+        ):
+            return False
+        actual_sha256 = _sha256_fd(file_fd)
+        post_hash_opened = os.fstat(file_fd)
+        final_current = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        final_opened = os.fstat(file_fd)
+        return (
+            stat.S_ISREG(post_hash_opened.st_mode)
+            and stat.S_ISREG(final_opened.st_mode)
+            and stat.S_ISREG(final_current.st_mode)
+            and (post_hash_opened.st_dev, post_hash_opened.st_ino)
+            == (expected_device, expected_inode)
+            and (final_opened.st_dev, final_opened.st_ino)
+            == (expected_device, expected_inode)
+            and (final_current.st_dev, final_current.st_ino)
+            == (expected_device, expected_inode)
+            and post_hash_opened.st_size == expected_size
+            and final_opened.st_size == expected_size
+            and final_current.st_size == expected_size
+            and post_hash_opened.st_mtime_ns == opened.st_mtime_ns
+            and post_hash_opened.st_ctime_ns == opened.st_ctime_ns
+            and final_current.st_mtime_ns == opened.st_mtime_ns
+            and final_current.st_ctime_ns == opened.st_ctime_ns
+            and final_opened.st_mtime_ns == opened.st_mtime_ns
+            and final_opened.st_ctime_ns == opened.st_ctime_ns
+            and actual_sha256 == expected_sha256
+        )
+    finally:
+        os.close(file_fd)
 
 
 def _publish_staged_images(
@@ -475,9 +557,9 @@ def _publish_staged_images(
     images_fd: int,
     evidence_fd: int,
     staged: list[tuple[str, int, str]],
-) -> dict[str, tuple[int, int]]:
+) -> dict[str, _EvidenceIdentity]:
     installed: list[str] = []
-    receipt = {}
+    receipt: dict[str, _EvidenceIdentity] = {}
     try:
         _verify_evidence_directories(
             root,
@@ -539,14 +621,10 @@ def _publish_staged_images(
         )
         for relative_path, expected_identity in receipt.items():
             final_name = relative_path.rsplit("/", 1)[-1]
-            current = os.stat(
+            if not _evidence_entry_matches_identity(
+                evidence_fd,
                 final_name,
-                dir_fd=evidence_fd,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(current.st_mode)
-                or (current.st_dev, current.st_ino) != expected_identity
+                expected_identity,
             ):
                 raise _EvidencePublicationRecoveryError(
                     "image evidence publication retained uncertain visible "
@@ -704,7 +782,7 @@ def _restore_quarantined_evidence(
 def _remove_published_evidence_entry_if_owned(
     evidence_fd: int,
     final_name: str,
-    expected_identity: tuple[int, int],
+    expected_identity: _EvidenceIdentity,
 ) -> None:
     try:
         current = os.stat(
@@ -716,7 +794,7 @@ def _remove_published_evidence_entry_if_owned(
         return
     if (
         not stat.S_ISREG(current.st_mode)
-        or (current.st_dev, current.st_ino) != expected_identity
+        or (current.st_dev, current.st_ino) != expected_identity[:2]
     ):
         return
 
@@ -747,21 +825,19 @@ def _remove_published_evidence_entry_if_owned(
             f"{_ROLLBACK_QUARANTINE_ENTRY}"
         )
         try:
-            quarantined = os.stat(
+            owned = _evidence_entry_matches_identity(
+                quarantine_fd,
                 _ROLLBACK_QUARANTINE_ENTRY,
-                dir_fd=quarantine_fd,
-                follow_symlinks=False,
+                expected_identity,
             )
         except Exception as exc:
             raise _EvidencePublicationRecoveryError(
                 "image evidence rollback retained unverified quarantined "
                 f"entry: {relative_quarantine}"
             ) from exc
-        if (
-            stat.S_ISREG(quarantined.st_mode)
-            and (quarantined.st_dev, quarantined.st_ino)
-            == expected_identity
-        ):
+        # Keep verification and unlink adjacent. Writers that ignore the
+        # publication lock cannot be covered by a kernel-atomic check-and-unlink.
+        if owned:
             try:
                 os.unlink(
                     _ROLLBACK_QUARANTINE_ENTRY,
@@ -790,7 +866,7 @@ def _remove_published_evidence_entry_if_owned(
 
 def remove_published_evidence_if_owned(
     output_root: str,
-    receipts: list[dict[str, tuple[int, int]]],
+    receipts: list[dict[str, _EvidenceIdentity]],
     *,
     artifact_budget: ImageArtifactBudget,
 ) -> None:
@@ -1298,7 +1374,7 @@ def write_native_pair_evidence(
     evidence_id: str,
     artifact_budget: ImageArtifactBudget | None = None,
     expected_sha256: str | None = None,
-    publication_receipt: dict[str, tuple[int, int]] | None = None,
+    publication_receipt: dict[str, _EvidenceIdentity] | None = None,
 ) -> dict[str, str]:
     from PIL import Image
 

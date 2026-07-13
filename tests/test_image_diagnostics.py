@@ -1601,12 +1601,15 @@ def _owned_evidence_rollback_state(tmp_path):
     evidence_dir = out / "images" / "evidence"
     evidence_dir.mkdir(parents=True)
     evidence = evidence_dir / "owned.png"
-    evidence.write_bytes(b"owned evidence")
+    owned_bytes = b"owned evidence"
+    evidence.write_bytes(owned_bytes)
     owned_state = evidence.stat()
     receipt = {
         "images/evidence/owned.png": (
             owned_state.st_dev,
             owned_state.st_ino,
+            owned_state.st_size,
+            hashlib.sha256(owned_bytes).hexdigest(),
         ),
     }
     budget = ImageArtifactBudget(1024 * 1024)
@@ -1700,10 +1703,24 @@ def test_owned_evidence_rollback_restores_replacement_after_identity_check(
     out, evidence_dir, evidence, receipt, budget = (
         _owned_evidence_rollback_state(tmp_path)
     )
-    replacement_bytes = b"external replacement"
+    replacement_bytes = b"other evidence"
+    assert len(replacement_bytes) == len(evidence.read_bytes())
+    expected_device, expected_inode, _, _ = next(iter(receipt.values()))
     real_stat = _evidence.os.stat
+    real_fstat = _evidence.os.fstat
+    real_open = _evidence.os.open
     real_unlink = _evidence.os.unlink
+    quarantined_fds = set()
     replaced = False
+
+    class MatchingIdentity:
+        def __init__(self, current):
+            self._current = current
+            self.st_dev = expected_device
+            self.st_ino = expected_inode
+
+        def __getattr__(self, name):
+            return getattr(self._current, name)
 
     def replace_after_identity_check(path, *args, **kwargs):
         nonlocal replaced
@@ -1729,9 +1746,32 @@ def test_owned_evidence_rollback_restores_replacement_after_identity_check(
             finally:
                 _evidence.os.close(replacement_fd)
             replaced = True
+        if (
+            replaced
+            and _evidence.os.fspath(path)
+            == _evidence._ROLLBACK_QUARANTINE_ENTRY
+        ):
+            return MatchingIdentity(current)
+        return current
+
+    def record_quarantined_open(path, flags, mode=0o777, *, dir_fd=None):
+        fd = real_open(path, flags, mode, dir_fd=dir_fd)
+        if (
+            _evidence.os.fspath(path)
+            == _evidence._ROLLBACK_QUARANTINE_ENTRY
+        ):
+            quarantined_fds.add(fd)
+        return fd
+
+    def matching_quarantined_fstat(fd):
+        current = real_fstat(fd)
+        if fd in quarantined_fds:
+            return MatchingIdentity(current)
         return current
 
     monkeypatch.setattr(_evidence.os, "stat", replace_after_identity_check)
+    monkeypatch.setattr(_evidence.os, "open", record_quarantined_open)
+    monkeypatch.setattr(_evidence.os, "fstat", matching_quarantined_fstat)
 
     _evidence.remove_published_evidence_if_owned(
         str(out),
@@ -1746,6 +1786,88 @@ def test_owned_evidence_rollback_restores_replacement_after_identity_check(
         for path in evidence_dir.iterdir()
     )
     assert budget.used_bytes == len(replacement_bytes)
+
+
+def test_owned_evidence_rollback_restores_same_inode_mutation_after_hash(
+    tmp_path,
+    monkeypatch,
+):
+    out, evidence_dir, evidence, receipt, budget = (
+        _owned_evidence_rollback_state(tmp_path)
+    )
+    mutated_bytes = b"other evidence"
+    assert len(mutated_bytes) == len(evidence.read_bytes())
+    writer_fd = _evidence.os.open(
+        evidence,
+        _evidence.os.O_WRONLY | _evidence.os.O_NOFOLLOW,
+    )
+    real_stat = _evidence.os.stat
+    initial_quarantine_state = None
+    quarantine_stat_calls = 0
+    mutated = False
+
+    def mutate_during_final_quarantine_stat(path, *args, **kwargs):
+        nonlocal initial_quarantine_state, quarantine_stat_calls, mutated
+        if (
+            _evidence.os.fspath(path)
+            == _evidence._ROLLBACK_QUARANTINE_ENTRY
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            quarantine_stat_calls += 1
+            if quarantine_stat_calls == 1:
+                initial_quarantine_state = real_stat(
+                    path,
+                    *args,
+                    **kwargs,
+                )
+                return initial_quarantine_state
+            if quarantine_stat_calls == 2:
+                assert initial_quarantine_state is not None
+                _evidence.os.pwrite(writer_fd, mutated_bytes, 0)
+                _evidence.os.fsync(writer_fd)
+                _evidence.os.utime(
+                    path,
+                    ns=(
+                        initial_quarantine_state.st_atime_ns,
+                        initial_quarantine_state.st_mtime_ns
+                        + 1_000_000_000,
+                    ),
+                    dir_fd=kwargs["dir_fd"],
+                    follow_symlinks=False,
+                )
+                current = real_stat(path, *args, **kwargs)
+                assert (
+                    current.st_mtime_ns
+                    != initial_quarantine_state.st_mtime_ns
+                )
+                mutated = True
+                return current
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        _evidence.os,
+        "stat",
+        mutate_during_final_quarantine_stat,
+    )
+
+    try:
+        _evidence.remove_published_evidence_if_owned(
+            str(out),
+            [receipt],
+            artifact_budget=budget,
+        )
+    finally:
+        _evidence.os.close(writer_fd)
+
+    assert quarantine_stat_calls == 2
+    assert mutated
+    assert evidence.read_bytes() == mutated_bytes
+    assert not any(
+        path.name.startswith(".paperconan-evidence-rollback-")
+        for path in evidence_dir.iterdir()
+    )
+    assert budget.used_bytes == len(mutated_bytes)
 
 
 def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
