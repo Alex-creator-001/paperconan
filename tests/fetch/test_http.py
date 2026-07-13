@@ -101,6 +101,7 @@ class _RedirectTransport(_http.urllib.request.BaseHandler):
         self.redirect_body = _UnreadableRedirectBody(
             close_error=redirect_close_error,
         )
+        self.redirect_response = None
         self.requests = []
 
     def https_open(self, req):
@@ -116,6 +117,7 @@ class _RedirectTransport(_http.urllib.request.BaseHandler):
                 302,
             )
             response.msg = "Found"
+            self.redirect_response = response
             return response
         assert self.redirect_body.was_closed
         headers["Content-Type"] = self.final_content_type
@@ -554,7 +556,7 @@ def test_download_invalid_redirect_preserves_policy_error_when_close_fails(
     assert transport.redirect_body.read_sizes == []
     assert transport.redirect_body.was_closed
     assert sleep_calls == []
-    transport.redirect_body.close()
+    transport.redirect_response.close()
 
 
 def test_redirect_normalizes_non_ascii_location_before_following(monkeypatch):
