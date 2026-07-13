@@ -33,7 +33,14 @@ _DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 
 
 class _EvidencePublicationRecoveryError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        publication_receipt: dict[str, tuple[int, int]] | None = None,
+    ):
+        super().__init__(message)
+        self.publication_receipt = dict(publication_receipt or {})
 
 
 class _EvidenceEncodingLimitError(ValueError):
@@ -557,8 +564,228 @@ def _publish_staged_images(
             f"{str(publication_error) or 'no detail'}"
         )
         raise _EvidencePublicationRecoveryError(
-            "; ".join(context)
+            "; ".join(context),
+            publication_receipt=receipt,
         ) from publication_error
+
+
+_ROLLBACK_QUARANTINE_ENTRY = "entry"
+
+
+def _create_rollback_quarantine(evidence_fd: int) -> tuple[str, int]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise _EvidencePublicationRecoveryError(
+            "secure image evidence rollback quarantine is unavailable"
+        )
+    for _ in range(128):
+        name = (
+            ".paperconan-evidence-rollback-"
+            f"{secrets.token_hex(16)}"
+        )
+        try:
+            os.mkdir(
+                name,
+                0o700,
+                dir_fd=evidence_fd,
+            )
+        except FileExistsError:
+            continue
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise _EvidencePublicationRecoveryError(
+                "could not allocate private image evidence rollback "
+                "quarantine"
+            ) from exc
+        relative_directory = f"images/evidence/{name}"
+        quarantine_fd = -1
+        try:
+            quarantine_fd = os.open(
+                name,
+                os.O_RDONLY | directory | nofollow,
+                dir_fd=evidence_fd,
+            )
+            opened = os.fstat(quarantine_fd)
+            current = os.stat(
+                name,
+                dir_fd=evidence_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(current.st_mode)
+                or (opened.st_dev, opened.st_ino)
+                != (current.st_dev, current.st_ino)
+                or os.listdir(quarantine_fd)
+            ):
+                raise OSError(
+                    "private rollback quarantine changed after creation"
+                )
+        except Exception as exc:
+            if quarantine_fd >= 0:
+                os.close(quarantine_fd)
+            raise _EvidencePublicationRecoveryError(
+                "image evidence rollback retained uncertain private "
+                f"quarantine directory: {relative_directory}"
+            ) from exc
+        return name, quarantine_fd
+    raise _EvidencePublicationRecoveryError(
+        "could not allocate unique private image evidence rollback quarantine"
+    )
+
+
+def _remove_empty_rollback_quarantine(
+    evidence_fd: int,
+    quarantine_name: str,
+    quarantine_fd: int,
+) -> None:
+    relative_directory = f"images/evidence/{quarantine_name}"
+    try:
+        if os.listdir(quarantine_fd):
+            raise OSError("private rollback quarantine is not empty")
+        opened = os.fstat(quarantine_fd)
+        current = os.stat(
+            quarantine_name,
+            dir_fd=evidence_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (current.st_dev, current.st_ino)
+        ):
+            raise OSError("private rollback quarantine changed")
+        os.rmdir(quarantine_name, dir_fd=evidence_fd)
+    except Exception as exc:
+        raise _EvidencePublicationRecoveryError(
+            "image evidence rollback retained private quarantine directory: "
+            f"{relative_directory}"
+        ) from exc
+
+
+def _restore_quarantined_evidence(
+    evidence_fd: int,
+    quarantine_fd: int,
+    quarantine_name: str,
+    final_name: str,
+) -> None:
+    relative_quarantine = (
+        f"images/evidence/{quarantine_name}/"
+        f"{_ROLLBACK_QUARANTINE_ENTRY}"
+    )
+    try:
+        os.link(
+            _ROLLBACK_QUARANTINE_ENTRY,
+            final_name,
+            src_dir_fd=quarantine_fd,
+            dst_dir_fd=evidence_fd,
+            follow_symlinks=False,
+        )
+    except Exception as exc:
+        raise _EvidencePublicationRecoveryError(
+            "image evidence rollback retained quarantined entry: "
+            f"{relative_quarantine}"
+        ) from exc
+    try:
+        os.unlink(
+            _ROLLBACK_QUARANTINE_ENTRY,
+            dir_fd=quarantine_fd,
+        )
+    except Exception as exc:
+        raise _EvidencePublicationRecoveryError(
+            "image evidence rollback restored the final entry but retained "
+            f"quarantined entry: {relative_quarantine}"
+        ) from exc
+
+
+def _remove_published_evidence_entry_if_owned(
+    evidence_fd: int,
+    final_name: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        current = os.stat(
+            final_name,
+            dir_fd=evidence_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or (current.st_dev, current.st_ino) != expected_identity
+    ):
+        return
+
+    quarantine_name, quarantine_fd = _create_rollback_quarantine(evidence_fd)
+    try:
+        try:
+            os.rename(
+                final_name,
+                _ROLLBACK_QUARANTINE_ENTRY,
+                src_dir_fd=evidence_fd,
+                dst_dir_fd=quarantine_fd,
+            )
+        except FileNotFoundError:
+            _remove_empty_rollback_quarantine(
+                evidence_fd,
+                quarantine_name,
+                quarantine_fd,
+            )
+            return
+        except Exception as exc:
+            raise _EvidencePublicationRecoveryError(
+                "image evidence rollback retained uncertain private "
+                "quarantine directory: "
+                f"images/evidence/{quarantine_name}"
+            ) from exc
+        relative_quarantine = (
+            f"images/evidence/{quarantine_name}/"
+            f"{_ROLLBACK_QUARANTINE_ENTRY}"
+        )
+        try:
+            quarantined = os.stat(
+                _ROLLBACK_QUARANTINE_ENTRY,
+                dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+        except Exception as exc:
+            raise _EvidencePublicationRecoveryError(
+                "image evidence rollback retained unverified quarantined "
+                f"entry: {relative_quarantine}"
+            ) from exc
+        if (
+            stat.S_ISREG(quarantined.st_mode)
+            and (quarantined.st_dev, quarantined.st_ino)
+            == expected_identity
+        ):
+            try:
+                os.unlink(
+                    _ROLLBACK_QUARANTINE_ENTRY,
+                    dir_fd=quarantine_fd,
+                )
+            except Exception as exc:
+                raise _EvidencePublicationRecoveryError(
+                    "image evidence rollback retained owned quarantined "
+                    f"entry: {relative_quarantine}"
+                ) from exc
+        else:
+            _restore_quarantined_evidence(
+                evidence_fd,
+                quarantine_fd,
+                quarantine_name,
+                final_name,
+            )
+        _remove_empty_rollback_quarantine(
+            evidence_fd,
+            quarantine_name,
+            quarantine_fd,
+        )
+    finally:
+        os.close(quarantine_fd)
+
+
 def remove_published_evidence_if_owned(
     output_root: str,
     receipts: list[dict[str, tuple[int, int]]],
@@ -571,6 +798,7 @@ def remove_published_evidence_if_owned(
     with _evidence_output_directory(root) as directory_fds:
         root_fd, images_fd, evidence_fd = directory_fds
         with image_publication_lock(root_fd):
+            rollback_errors = []
             for receipt in receipts:
                 for relative_path, expected_identity in receipt.items():
                     parts = _registered_relative_parts(relative_path)
@@ -582,21 +810,22 @@ def remove_published_evidence_if_owned(
                         continue
                     final_name = parts[2]
                     try:
-                        current = os.stat(
+                        _remove_published_evidence_entry_if_owned(
+                            evidence_fd,
                             final_name,
-                            dir_fd=evidence_fd,
-                            follow_symlinks=False,
+                            expected_identity,
                         )
-                    except FileNotFoundError:
-                        continue
-                    if (
-                        stat.S_ISREG(current.st_mode)
-                        and (current.st_dev, current.st_ino)
-                        == expected_identity
-                    ):
-                        os.unlink(final_name, dir_fd=evidence_fd)
-            artifact_budget.resynchronize_from_images_fd(images_fd)
-            artifact_budget.ensure_within_limit()
+                    except Exception as exc:
+                        rollback_errors.append(exc)
+            try:
+                artifact_budget.resynchronize_from_images_fd(images_fd)
+                artifact_budget.ensure_within_limit()
+            except Exception as exc:
+                rollback_errors.append(exc)
+            if rollback_errors:
+                raise _EvidencePublicationRecoveryError(
+                    "; ".join(str(error) for error in rollback_errors)
+                ) from rollback_errors[0]
 
 
 def _max_image_bytes() -> int:
@@ -1214,13 +1443,21 @@ def write_native_pair_evidence(
                         existing_size=existing_size,
                         staged_size=staged_size,
                     )
-                    published_receipt = _publish_staged_images(
-                        root,
-                        root_fd,
-                        images_fd,
-                        evidence_fd,
-                        staged,
-                    )
+                    try:
+                        published_receipt = _publish_staged_images(
+                            root,
+                            root_fd,
+                            images_fd,
+                            evidence_fd,
+                            staged,
+                        )
+                    except _EvidencePublicationRecoveryError as exc:
+                        if publication_receipt is not None:
+                            publication_receipt.clear()
+                            publication_receipt.update(
+                                exc.publication_receipt
+                            )
+                        raise
                     budget.commit_replacement(
                         existing_size=existing_size,
                         staged_size=staged_size,

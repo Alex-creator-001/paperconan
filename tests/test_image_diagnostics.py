@@ -1277,6 +1277,218 @@ def test_source_change_rollback_does_not_claim_post_publication_replacement(
     assert concurrent_final.read_bytes() == concurrent_bytes
 
 
+def test_source_change_rolls_back_partial_evidence_publication(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(replacement)
+    real_link = _evidence.os.link
+    install_calls = 0
+
+    def publish_one_then_fail(
+        src,
+        dst,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+        follow_symlinks=True,
+    ):
+        nonlocal install_calls
+        if Path(src).name.startswith(".paperconan-evidence-"):
+            install_calls += 1
+            if install_calls == 2:
+                raise OSError("synthetic second evidence install failure")
+            result = real_link(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            replacement.replace(native)
+            return result
+        return real_link(
+            src,
+            dst,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(_evidence.os, "link", publish_one_then_fail)
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert install_calls == 2
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+    evidence_dir = out / "images" / "evidence"
+    assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
+
+
+def _owned_evidence_rollback_state(tmp_path):
+    out = tmp_path / "audit"
+    evidence_dir = out / "images" / "evidence"
+    evidence_dir.mkdir(parents=True)
+    evidence = evidence_dir / "owned.png"
+    evidence.write_bytes(b"owned evidence")
+    owned_state = evidence.stat()
+    receipt = {
+        "images/evidence/owned.png": (
+            owned_state.st_dev,
+            owned_state.st_ino,
+        ),
+    }
+    budget = ImageArtifactBudget(1024 * 1024)
+    budget.initialize_from_root(out)
+    return out, evidence_dir, evidence, receipt, budget
+
+
+def test_owned_evidence_rollback_retries_private_quarantine_collision(
+    tmp_path,
+    monkeypatch,
+):
+    out, evidence_dir, evidence, receipt, budget = (
+        _owned_evidence_rollback_state(tmp_path)
+    )
+    real_mkdir = _evidence.os.mkdir
+    quarantine_mkdir_calls = 0
+    collision_directory = None
+
+    def collide_with_first_quarantine_directory(
+        path,
+        mode=0o777,
+        *,
+        dir_fd=None,
+    ):
+        nonlocal quarantine_mkdir_calls, collision_directory
+        if _evidence.os.fspath(path).startswith(
+            ".paperconan-evidence-rollback-"
+        ):
+            quarantine_mkdir_calls += 1
+            if quarantine_mkdir_calls == 1:
+                real_mkdir(path, mode, dir_fd=dir_fd)
+                collision_directory = evidence_dir / path
+                collision_fd = _evidence.os.open(
+                    path,
+                    _evidence.os.O_RDONLY
+                    | _evidence.os.O_DIRECTORY
+                    | _evidence.os.O_NOFOLLOW,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    marker_fd = _evidence.os.open(
+                        "external-marker",
+                        _evidence.os.O_WRONLY
+                        | _evidence.os.O_CREAT
+                        | _evidence.os.O_EXCL
+                        | _evidence.os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=collision_fd,
+                    )
+                    try:
+                        _evidence.os.write(
+                            marker_fd,
+                            b"external quarantine entry",
+                        )
+                    finally:
+                        _evidence.os.close(marker_fd)
+                finally:
+                    _evidence.os.close(collision_fd)
+        return real_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        _evidence.os,
+        "mkdir",
+        collide_with_first_quarantine_directory,
+    )
+
+    _evidence.remove_published_evidence_if_owned(
+        str(out),
+        [receipt],
+        artifact_budget=budget,
+    )
+
+    assert not evidence.exists()
+    assert quarantine_mkdir_calls == 2
+    assert collision_directory is not None
+    assert (
+        collision_directory / "external-marker"
+    ).read_bytes() == b"external quarantine entry"
+    assert [
+        path
+        for path in evidence_dir.iterdir()
+        if path.name.startswith(".paperconan-evidence-rollback-")
+    ] == [collision_directory]
+    assert budget.used_bytes == len(b"external quarantine entry")
+
+
+def test_owned_evidence_rollback_restores_replacement_after_identity_check(
+    tmp_path,
+    monkeypatch,
+):
+    out, evidence_dir, evidence, receipt, budget = (
+        _owned_evidence_rollback_state(tmp_path)
+    )
+    replacement_bytes = b"external replacement"
+    real_stat = _evidence.os.stat
+    real_unlink = _evidence.os.unlink
+    replaced = False
+
+    def replace_after_identity_check(path, *args, **kwargs):
+        nonlocal replaced
+        current = real_stat(path, *args, **kwargs)
+        if (
+            not replaced
+            and _evidence.os.fspath(path) == evidence.name
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            real_unlink(path, dir_fd=kwargs["dir_fd"])
+            replacement_fd = _evidence.os.open(
+                path,
+                _evidence.os.O_WRONLY
+                | _evidence.os.O_CREAT
+                | _evidence.os.O_EXCL
+                | _evidence.os.O_NOFOLLOW,
+                0o600,
+                dir_fd=kwargs["dir_fd"],
+            )
+            try:
+                _evidence.os.write(replacement_fd, replacement_bytes)
+            finally:
+                _evidence.os.close(replacement_fd)
+            replaced = True
+        return current
+
+    monkeypatch.setattr(_evidence.os, "stat", replace_after_identity_check)
+
+    _evidence.remove_published_evidence_if_owned(
+        str(out),
+        [receipt],
+        artifact_budget=budget,
+    )
+
+    assert replaced
+    assert evidence.read_bytes() == replacement_bytes
+    assert not any(
+        path.name.startswith(".paperconan-evidence-rollback-")
+        for path in evidence_dir.iterdir()
+    )
+    assert budget.used_bytes == len(replacement_bytes)
+
+
 def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
     tmp_path,
     monkeypatch,
