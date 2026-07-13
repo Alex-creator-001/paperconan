@@ -137,6 +137,31 @@ def test_prepare_image_assets_orders_assets_by_stable_source_name(
     assert [asset["file"] for asset in assets] == ["FigA.png", "FigB.png"]
 
 
+def test_prepare_image_assets_sorts_only_supported_candidates(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    (source / "notes.txt").write_text("not an image", encoding="utf-8")
+    real_stable_name_key = _assets._stable_name_key
+
+    def supported_name_key(name):
+        assert name != "notes.txt"
+        return real_stable_name_key(name)
+
+    monkeypatch.setattr(_assets, "_stable_name_key", supported_name_key)
+
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(tmp_path / "audit"),
+    )
+
+    assert errors == []
+    assert [asset["file"] for asset in assets] == ["FigA.png"]
+
+
 def test_exact_duplicate_files_are_one_asset_with_all_source_names(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

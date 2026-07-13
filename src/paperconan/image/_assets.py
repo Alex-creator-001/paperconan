@@ -1175,10 +1175,7 @@ def prepare_image_assets(
     downloads.update(_provided_provenance(provenance))
     candidates = []
     pdfs = []
-    for path in sorted(
-        source_root.iterdir(),
-        key=lambda item: _stable_name_key(item.name),
-    ):
+    for path in source_root.iterdir():
         if not path.is_file():
             continue
         suffix = path.suffix.lower()
@@ -1186,6 +1183,8 @@ def prepare_image_assets(
             candidates.append(path)
         elif suffix == ".pdf":
             pdfs.append(path)
+    candidates.sort(key=lambda path: _stable_name_key(path.name))
+    pdfs.sort(key=lambda path: _stable_name_key(path.name))
     if candidates or (render_pdf and pdfs):
         preflight_image_dependencies(
             render_pdf=False,
