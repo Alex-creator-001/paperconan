@@ -67,8 +67,9 @@ class _StubOpener:
 
 
 class _UnreadableRedirectBody(io.BytesIO):
-    def __init__(self):
+    def __init__(self, *, close_error=False):
         super().__init__(b"x" * (2 * 1024 * 1024))
+        self.close_error = close_error
         self.read_sizes = []
         self.was_closed = False
 
@@ -79,6 +80,8 @@ class _UnreadableRedirectBody(io.BytesIO):
     def close(self):
         self.was_closed = True
         super().close()
+        if self.close_error:
+            raise OSError("redirect response close failed")
 
 
 class _RedirectTransport(_http.urllib.request.BaseHandler):
@@ -89,11 +92,14 @@ class _RedirectTransport(_http.urllib.request.BaseHandler):
         final_body,
         final_content_type,
         location="//cdn.example.net/final",
+        redirect_close_error=False,
     ):
         self.final_body = final_body
         self.final_content_type = final_content_type
         self.location = location
-        self.redirect_body = _UnreadableRedirectBody()
+        self.redirect_body = _UnreadableRedirectBody(
+            close_error=redirect_close_error,
+        )
         self.requests = []
 
     def https_open(self, req):
@@ -128,11 +134,13 @@ def _install_redirect_transport(
     final_body,
     final_content_type,
     location="//cdn.example.net/final",
+    redirect_close_error=False,
 ):
     transport = _RedirectTransport(
         final_body,
         final_content_type,
         location=location,
+        redirect_close_error=redirect_close_error,
     )
     real_build_opener = _http.urllib.request.build_opener
 
@@ -510,6 +518,60 @@ def test_download_invalid_redirect_is_terminal_with_default_retries(
     assert transport.redirect_body.read_sizes == []
     assert transport.redirect_body.was_closed
     assert sleep_calls == []
+
+
+def test_download_invalid_redirect_preserves_policy_error_when_close_fails(
+    monkeypatch,
+    tmp_path,
+):
+    sleep_calls = []
+    transport = _install_redirect_transport(
+        monkeypatch,
+        final_body=b"unexpected",
+        final_content_type="text/csv",
+        location="ftp://cdn.example.net/final",
+        redirect_close_error=True,
+    )
+    monkeypatch.setattr(
+        _download.time,
+        "sleep",
+        lambda seconds: sleep_calls.append(seconds),
+    )
+
+    result = _download.download_file(
+        "https://repository.example.org/start",
+        str(tmp_path / "data.csv"),
+    )
+
+    assert result["ok"] is False
+    assert result["skipped_reason"] == (
+        "download URL rejected by HTTP(S) policy"
+    )
+    assert transport.requests == [
+        "https://repository.example.org/start",
+    ]
+    assert transport.redirect_body.read_sizes == []
+    assert transport.redirect_body.was_closed
+    assert sleep_calls == []
+
+
+def test_redirect_normalizes_non_ascii_location_before_following(monkeypatch):
+    transport = _install_redirect_transport(
+        monkeypatch,
+        final_body=b'{"ok":true}',
+        final_content_type="application/json",
+        location="/caf\xe9 data.csv",
+    )
+
+    assert _http.get_json("https://repository.example.org/start") == {
+        "ok": True,
+    }
+    assert transport.requests == [
+        "https://repository.example.org/start",
+        "https://repository.example.org/caf%E9%20data.csv",
+    ]
+    assert transport.redirect_body.read_sizes == []
+    assert transport.redirect_body.was_closed
 
 
 @pytest.mark.parametrize(

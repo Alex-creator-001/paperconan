@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import string
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -113,6 +114,26 @@ def resolve_http_url(base_url, target, message="HTTP URL is invalid"):
     return validate_http_url(resolved, message)
 
 
+def _normalize_redirect_location(location):
+    if (
+        not isinstance(location, str)
+        or not location
+        or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in location
+        )
+    ):
+        raise URLPolicyError("HTTP redirect URL is invalid")
+    try:
+        return urllib.parse.quote(
+            location,
+            encoding="iso-8859-1",
+            safe=string.punctuation,
+        )
+    except (TypeError, UnicodeError):
+        raise URLPolicyError("HTTP redirect URL is invalid") from None
+
+
 class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         target = resolve_http_url(
@@ -136,11 +157,14 @@ class ValidatedHTTPRedirectHandler(urllib.request.HTTPRedirectHandler):
         try:
             target = resolve_http_url(
                 req.full_url,
-                location,
+                _normalize_redirect_location(location),
                 "HTTP redirect URL is invalid",
             )
         except URLPolicyError:
-            fp.close()
+            try:
+                fp.close()
+            except Exception:
+                pass
             raise
         parts = urllib.parse.urlsplit(target)
         if not parts.path and parts.netloc:
