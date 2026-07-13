@@ -6,6 +6,7 @@ import io
 import os
 import stat
 import threading
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -527,6 +528,155 @@ def test_margin_trim_falls_back_when_content_is_too_small():
     trimmed = _diagnostics._trim_low_information_margins(image)
 
     assert trimmed.shape == image.shape
+
+
+def test_similarity_downsamples_both_inputs_before_margin_analysis(monkeypatch):
+    seen_shapes = []
+    original_trim = _diagnostics._trim_low_information_margins
+
+    def bounded_trim(image):
+        seen_shapes.append(image.shape)
+        return original_trim(image)
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "_trim_low_information_margins",
+        bounded_trim,
+    )
+    left = np.zeros((1200, 1600, 3), dtype=np.uint8)
+    right = np.zeros((1600, 1200, 3), dtype=np.uint8)
+
+    score, transform = _diagnostics.transform_robust_similarity(left, right)
+
+    assert np.isfinite(score)
+    assert isinstance(transform, str)
+    assert seen_shapes[:2] == [
+        (768, 1024, 3),
+        (1024, 768, 3),
+    ]
+    assert seen_shapes[0][0] * left.shape[1] == (
+        seen_shapes[0][1] * left.shape[0]
+    )
+    assert seen_shapes[1][0] * right.shape[1] == (
+        seen_shapes[1][1] * right.shape[0]
+    )
+
+
+def test_similarity_does_not_upscale_small_inputs_before_margin_analysis(
+    monkeypatch,
+):
+    seen = []
+    original_trim = _diagnostics._trim_low_information_margins
+
+    def track_trim(image):
+        seen.append(image)
+        return original_trim(image)
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "_trim_low_information_margins",
+        track_trim,
+    )
+    left = np.zeros((120, 160, 3), dtype=np.uint8)
+    right = np.zeros((160, 120, 3), dtype=np.uint8)
+
+    _diagnostics.transform_robust_similarity(left, right)
+
+    assert seen[0] is left
+    assert seen[1] is right
+    assert seen[0].shape == (120, 160, 3)
+    assert seen[1].shape == (160, 120, 3)
+
+
+def test_similarity_releases_each_transform_before_generating_the_next(
+    monkeypatch,
+):
+    cv2 = _diagnostics._cv2()
+    created_names = []
+    created_refs = []
+    scored_names = []
+    transpose_names = iter(("transpose_main", "transpose_anti"))
+
+    class TransformResult:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, key):
+            assert key == (
+                slice(None, None, -1),
+                slice(None, None, -1),
+            )
+            return self
+
+    def features(image):
+        if isinstance(image, TransformResult):
+            scored_names.append(image.name)
+        values = np.ones((4, 4), dtype=np.float32)
+        return values, values
+
+    def make_result(name):
+        if created_refs:
+            assert created_refs[-1]() is None
+            assert scored_names == created_names
+        result = TransformResult(name)
+        created_names.append(name)
+        created_refs.append(weakref.ref(result))
+        return result
+
+    def flip(image, code):
+        name = "flip" if code == 1 else "flip_vertical"
+        return make_result(name)
+
+    def rotate(image, code):
+        names = {
+            cv2.ROTATE_90_CLOCKWISE: "rotate90",
+            cv2.ROTATE_180: "rotate180",
+            cv2.ROTATE_90_COUNTERCLOCKWISE: "rotate270",
+        }
+        return make_result(names[code])
+
+    def transpose(image):
+        return make_result(next(transpose_names))
+
+    monkeypatch.setattr(_diagnostics, "_comparison_features", features)
+    monkeypatch.setattr(cv2, "flip", flip)
+    monkeypatch.setattr(cv2, "rotate", rotate)
+    monkeypatch.setattr(cv2, "transpose", transpose)
+
+    _diagnostics.transform_robust_similarity(
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        np.zeros((8, 8, 3), dtype=np.uint8),
+    )
+
+    assert created_names == [
+        "flip",
+        "flip_vertical",
+        "rotate90",
+        "rotate180",
+        "rotate270",
+        "transpose_main",
+        "transpose_anti",
+    ]
+    assert scored_names == created_names
+    assert all(reference() is None for reference in created_refs)
+
+
+def test_similarity_ties_choose_lexicographically_largest_transform(
+    monkeypatch,
+):
+    def equal_features(image):
+        values = np.ones((4, 4), dtype=np.float32)
+        return values, values
+
+    monkeypatch.setattr(_diagnostics, "_comparison_features", equal_features)
+    image = np.zeros((8, 8, 3), dtype=np.uint8)
+
+    results = [
+        _diagnostics.transform_robust_similarity(image, image)
+        for _ in range(5)
+    ]
+
+    assert results == [(1.0, "transpose_main")] * 5
 
 
 def test_diagnostics_decode_registered_bytes_with_imdecode(tmp_path, monkeypatch):

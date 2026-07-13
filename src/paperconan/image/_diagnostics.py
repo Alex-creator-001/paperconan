@@ -29,6 +29,7 @@ _MAX_PANEL_CANDIDATES = 64
 _MAX_PANEL_PAIR_COMPARISONS = 4096
 _DEFAULT_MAX_IMAGE_FINDINGS = 200
 _DEFAULT_MAX_IMAGE_COMPARISONS = 100_000
+_MAX_SIMILARITY_SIDE = 1024
 
 
 class _BoundedCandidates:
@@ -174,6 +175,22 @@ def _normalized_feature(values: np.ndarray) -> np.ndarray:
     return normalized / std if std > 1.0 else normalized
 
 
+def _bounded_similarity_input(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    longest_side = max(height, width)
+    if longest_side <= _MAX_SIMILARITY_SIDE:
+        return image
+    scale = _MAX_SIMILARITY_SIDE / longest_side
+    target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
+    cv2 = _cv2()
+    return cv2.resize(
+        image,
+        (target_width, target_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def _comparison_features(
     image: np.ndarray,
     size: int = 128,
@@ -198,21 +215,44 @@ def transform_robust_similarity(
     a: np.ndarray,
     b: np.ndarray,
 ) -> tuple[float, str]:
-    cv2 = _cv2()
-    left_intensity, left_edges = _comparison_features(a)
-    variants = {
-        "identity": b,
-        "flip": cv2.flip(b, 1),
-        "flip_vertical": cv2.flip(b, 0),
-        "rotate90": cv2.rotate(b, cv2.ROTATE_90_CLOCKWISE),
-        "rotate180": cv2.rotate(b, cv2.ROTATE_180),
-        "rotate270": cv2.rotate(b, cv2.ROTATE_90_COUNTERCLOCKWISE),
-        "transpose_main": cv2.transpose(b),
-        "transpose_anti": cv2.flip(cv2.transpose(b), -1),
-    }
-    scored = []
-    for name, value in variants.items():
+    left = _bounded_similarity_input(a)
+    right = _bounded_similarity_input(b)
+    left_intensity, left_edges = _comparison_features(left)
+
+    variant_factories = (
+        ("identity", lambda: right),
+        ("flip", lambda: _cv2().flip(right, 1)),
+        ("flip_vertical", lambda: _cv2().flip(right, 0)),
+        (
+            "rotate90",
+            lambda: _cv2().rotate(
+                right,
+                _cv2().ROTATE_90_CLOCKWISE,
+            ),
+        ),
+        (
+            "rotate180",
+            lambda: _cv2().rotate(right, _cv2().ROTATE_180),
+        ),
+        (
+            "rotate270",
+            lambda: _cv2().rotate(
+                right,
+                _cv2().ROTATE_90_COUNTERCLOCKWISE,
+            ),
+        ),
+        ("transpose_main", lambda: _cv2().transpose(right)),
+        (
+            "transpose_anti",
+            lambda: _cv2().transpose(right)[::-1, ::-1],
+        ),
+    )
+
+    best = (-float("inf"), "")
+    for name, factory in variant_factories:
+        value = factory()
         right_intensity, right_edges = _comparison_features(value)
+        del value
         intensity_score = float(
             (left_intensity * right_intensity).mean()
         )
@@ -221,8 +261,9 @@ def transform_robust_similarity(
             -1.0,
             min(1.0, intensity_score * 0.75 + edge_score * 0.25),
         )
-        scored.append((score, name))
-    return max(scored, key=lambda item: (item[0], item[1]))
+        candidate = score, name
+        best = max(best, candidate)
+    return best
 
 
 def _finding_id(payload: dict) -> str:
