@@ -14,16 +14,23 @@ from paperconan.fetch import _download
 
 
 class _Resp(io.BytesIO):
-    def __init__(self, data, ctype="application/octet-stream"):
+    def __init__(
+        self,
+        data,
+        ctype="application/octet-stream",
+        final_url="https://cdn.example.test/download",
+    ):
         super().__init__(data)
         self.headers = {"Content-Type": ctype}
+        self.final_url = final_url
     def __enter__(self): return self
     def __exit__(self, *a): self.close()
     def info(self): return self.headers
+    def geturl(self): return self.final_url
 
 
 def test_download_file_rejects_html_error_page(monkeypatch, tmp_path):
-    monkeypatch.setattr(_download.urllib.request, "urlopen",
+    monkeypatch.setattr(_download, "_open_download_request",
                         lambda req, timeout=None: _Resp(b"<html>nope</html>", "text/html"))
     res = _download.download_file("https://x/t.xlsx", str(tmp_path / "t.xlsx"))
     assert res["ok"] is False
@@ -32,7 +39,7 @@ def test_download_file_rejects_html_error_page(monkeypatch, tmp_path):
 
 
 def test_download_file_saves_bytes(monkeypatch, tmp_path):
-    monkeypatch.setattr(_download.urllib.request, "urlopen",
+    monkeypatch.setattr(_download, "_open_download_request",
                         lambda req, timeout=None: _Resp(b"col\n1\n2\n", "text/csv"))
     dest = tmp_path / "t.csv"
     res = _download.download_file("https://x/t.csv", str(dest))
@@ -44,7 +51,7 @@ def test_download_file_auth_required_message(monkeypatch, tmp_path):
     import urllib.error
     def boom(req, timeout=None):
         raise urllib.error.HTTPError("https://x/t.csv", 401, "Unauthorized", {}, None)
-    monkeypatch.setattr(_download.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(_download, "_open_download_request", boom)
     res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"))
     assert res["ok"] is False
     assert "auth" in res["skipped_reason"].lower()
@@ -167,12 +174,92 @@ def test_download_file_rejects_non_http_scheme(tmp_path):
     assert not (tmp_path / "x.csv").exists()
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:secret@example.test/data.csv",
+        "https:///missing-host.csv",
+        "https://example.test:not-a-port/data.csv",
+        "https://[2001:db8::1/data.csv",
+    ],
+)
+def test_download_file_rejects_invalid_initial_http_url(
+    monkeypatch,
+    tmp_path,
+    url,
+):
+    def reject_open(*args, **kwargs):
+        raise AssertionError("invalid initial URL must not be opened")
+
+    monkeypatch.setattr(_download, "_open_download_request", reject_open)
+
+    res = _download.download_file(url, str(tmp_path / "x.csv"), retries=1)
+
+    assert res["ok"] is False
+    assert res["skipped_reason"] == "invalid download URL"
+    assert not (tmp_path / "x.csv").exists()
+
+
+@pytest.mark.parametrize(
+    "final_url",
+    [
+        "ftp://cdn.example.test/data.csv",
+        "https://user:secret@cdn.example.test/data.csv",
+        "https:///missing-host.csv",
+        "https://cdn.example.test:not-a-port/data.csv",
+        "https://[2001:db8::1/data.csv",
+    ],
+)
+def test_download_file_rejects_invalid_final_redirect_url(
+    monkeypatch,
+    tmp_path,
+    final_url,
+):
+    response = _Resp(b"a,b\n1,2\n", "text/csv", final_url=final_url)
+    monkeypatch.setattr(
+        _download,
+        "_open_download_request",
+        lambda req, timeout=None: response,
+    )
+
+    res = _download.download_file(
+        "https://repository.example.test/data.csv",
+        str(tmp_path / "data.csv"),
+        retries=1,
+    )
+
+    assert res["ok"] is False
+    assert "response URL is invalid" in res["skipped_reason"]
+    assert not (tmp_path / "data.csv").exists()
+
+
+def test_download_file_allows_https_cdn_final_url(monkeypatch, tmp_path):
+    final_url = "https://cdn.example.net/files/data.csv"
+    response = _Resp(b"a,b\n1,2\n", "text/csv", final_url=final_url)
+    monkeypatch.setattr(
+        _download,
+        "_open_download_request",
+        lambda req, timeout=None: response,
+    )
+    destination = tmp_path / "data.csv"
+
+    res = _download.download_file(
+        "https://repository.example.test/data.csv",
+        str(destination),
+        retries=1,
+    )
+
+    assert res["ok"] is True
+    assert res["source_url"] == final_url
+    assert destination.read_bytes() == b"a,b\n1,2\n"
+
+
 def test_download_file_rejects_oversize_via_content_length(monkeypatch, tmp_path):
     def big(req, timeout=None):
         r = _Resp(b"x", "text/csv")
         r.headers["Content-Length"] = "999999999"
         return r
-    monkeypatch.setattr(_download.urllib.request, "urlopen", big)
+    monkeypatch.setattr(_download, "_open_download_request", big)
     res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"), max_bytes=1000)
     assert res["ok"] is False
     assert "max_bytes" in res["skipped_reason"]
@@ -181,7 +268,7 @@ def test_download_file_rejects_oversize_via_content_length(monkeypatch, tmp_path
 
 def test_download_file_rejects_oversize_via_body(monkeypatch, tmp_path):
     payload = b"a" * 50
-    monkeypatch.setattr(_download.urllib.request, "urlopen",
+    monkeypatch.setattr(_download, "_open_download_request",
                         lambda req, timeout=None: _Resp(payload, "text/csv"))
     res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"), max_bytes=10)
     assert res["ok"] is False
@@ -193,7 +280,7 @@ def test_download_file_403_message(monkeypatch, tmp_path):
     import urllib.error
     def boom(req, timeout=None):
         raise urllib.error.HTTPError("https://x/t.csv", 403, "Forbidden", {}, None)
-    monkeypatch.setattr(_download.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(_download, "_open_download_request", boom)
     res = _download.download_file("https://x/t.csv", str(tmp_path / "t.csv"))
     assert res["ok"] is False
     assert "auth" in res["skipped_reason"].lower()
@@ -1090,8 +1177,8 @@ def test_download_file_replaces_destination_symlink_without_following_it(
     dest = tmp_path / "data.csv"
     dest.symlink_to(sentinel)
     monkeypatch.setattr(
-        _download.urllib.request,
-        "urlopen",
+        _download,
+        "_open_download_request",
         lambda req, timeout=None: _Resp(b"a,b\n1,2\n", "text/csv"),
     )
 
@@ -4389,8 +4476,8 @@ def test_direct_download_rejects_same_inode_growth_with_bounded_staging_read(
             yield GrowingReader(source)
 
     monkeypatch.setattr(
-        _download.urllib.request,
-        "urlopen",
+        _download,
+        "_open_download_request",
         lambda req, timeout=None: _Resp(payload, "text/csv"),
     )
     monkeypatch.setattr(
@@ -4465,8 +4552,8 @@ def test_direct_download_rejects_same_size_staging_mutation_after_read(
             yield MutatingReader(source, staging)
 
     monkeypatch.setattr(
-        _download.urllib.request,
-        "urlopen",
+        _download,
+        "_open_download_request",
         lambda req, timeout=None: _Resp(payload, "text/csv"),
     )
     monkeypatch.setattr(

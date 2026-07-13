@@ -72,8 +72,24 @@ def _dryad_candidate(doi):
         files = _http.get_json(f"{_DRYAD}{vhref}/files")
         for f in files.get("_embedded", {}).get("stash:files", []):
             dl = f.get("_links", {}).get("stash:download", {}).get("href")
-            all_files.append(make_fileref(f.get("path"), f.get("size"),
-                                          f"{_DRYAD}{dl}" if dl else None))
+            if not isinstance(dl, str) or not dl.strip():
+                continue
+            try:
+                raw_download_url = dl.strip()
+                raw_parts = _urlparse.urlsplit(raw_download_url)
+                if (
+                    (raw_parts.scheme or raw_parts.netloc)
+                    and not _http._is_valid_http_url(raw_download_url)
+                ):
+                    continue
+                download_url = _urlparse.urljoin(_DRYAD, raw_download_url)
+            except ValueError:
+                continue
+            if not _http._is_valid_http_url(download_url):
+                continue
+            all_files.append(
+                make_fileref(f.get("path"), f.get("size"), download_url)
+            )
     authors = [f"{a.get('firstName','')} {a.get('lastName','')}".strip()
                for a in ds.get("authors", [])]
     related = [w.get("identifier") for w in ds.get("relatedWorks", []) if w.get("identifier")]

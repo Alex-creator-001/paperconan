@@ -21,6 +21,7 @@ import urllib.request
 import zipfile
 import zlib
 
+from . import _http
 from ._files import asset_type
 
 # Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
@@ -728,6 +729,10 @@ def _dir_size(path):
     return total
 
 
+def _open_download_request(req, timeout):
+    return _http._open_http(req, timeout=timeout)
+
+
 def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                   retries=3, backoff=2.0):
     """Download to disk with redirects, size cap, HTML sniffing, and retry/backoff.
@@ -739,7 +744,18 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
         else None
     )
     result_path = staging.display_path if staging is not None else dest_path
-    if not url.lower().startswith(("https://", "http://")):
+    if not _http._is_valid_http_url(url):
+        try:
+            scheme = urllib.parse.urlsplit(url).scheme.lower()
+        except (AttributeError, TypeError, ValueError):
+            scheme = (
+                url.split(":", 1)[0].lower()
+                if isinstance(url, str) and ":" in url
+                else ""
+            )
+        if scheme in {"http", "https"}:
+            return {"ok": False, "path": result_path,
+                    "skipped_reason": "invalid download URL"}
         return {"ok": False, "path": result_path,
                 "skipped_reason": f"unsupported URL scheme: {url!r}"}
     req = urllib.request.Request(url, headers={"User-Agent": _UA})
@@ -748,7 +764,8 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
         fd = -1
         temp_path = None
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _open_download_request(req, timeout=timeout) as resp:
+                final_url = _http._require_valid_response_url(resp)
                 ctype = (resp.info().get("Content-Type") or "").lower()
                 if "text/html" in ctype:
                     return {"ok": False, "path": result_path,
@@ -801,7 +818,7 @@ def download_file(url, dest_path, timeout=180, max_bytes=_DEFAULT_MAX,
                     "path": result_path,
                     "size": total,
                     "content_type": ctype.split(";", 1)[0].strip(),
-                    "source_url": url,
+                    "source_url": final_url,
                 }
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
