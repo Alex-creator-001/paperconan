@@ -2371,18 +2371,28 @@ def test_archive_reconciliation_never_removes_replacement_inode(
     def publish_then_replace_entry(output, name, data, **kwargs):
         nonlocal original_identity
         published = real_write(output, name, data, **kwargs)
-        original_identity = published.identity
-        os.unlink(published.filename, dir_fd=output.fd)
-        replacement_fd = os.open(
+        original_fd = os.open(
             published.filename,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
+            os.O_RDONLY | os.O_NOFOLLOW,
             dir_fd=output.fd,
         )
         try:
-            os.write(replacement_fd, replacement)
+            opened = os.fstat(original_fd)
+            original_identity = (opened.st_dev, opened.st_ino)
+            assert original_identity == published.identity
+            os.unlink(published.filename, dir_fd=output.fd)
+            replacement_fd = os.open(
+                published.filename,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=output.fd,
+            )
+            try:
+                os.write(replacement_fd, replacement)
+            finally:
+                os.close(replacement_fd)
         finally:
-            os.close(replacement_fd)
+            os.close(original_fd)
         return published
 
     monkeypatch.setattr(
