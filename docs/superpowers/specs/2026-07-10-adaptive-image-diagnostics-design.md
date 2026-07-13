@@ -116,6 +116,16 @@ PaperConan 可以提供：
 - 原始像素区域对和证据缩略图；
 - 诊断参数、分数和定位框。
 
+确定性配对只在一个登记资产内部进行。比较预处理会裁掉低信息边缘，并对归一化强度与
+边缘一致性加权评分，覆盖恒等变换、水平/垂直翻转、90/180/270 度旋转、主对角线转置和
+副对角线转置共八种二面体变换；`0.92` finding 阈值不降低。`regions` 与原始 evidence
+仍保留 native proposal boxes，裁边不改写定位坐标。裁边结果过小或变化不足时使用确定性
+fallback，继续比较原 proposal。跨资产比较由外部多模态 Agent 完成。
+
+图像 `profile_action: "kept"` 仅作信息标记，不经过数值 prefilter。来源身份仍稳定但
+evidence 预算或发布失败时，finding 以 `evidence: null` 保留并写入 `scan_errors`；评分后
+来源身份改变时抑制 finding。
+
 这些结果进入 `image_findings[]`，作用是帮助 Agent 放大、交叉检查和排序。它们不能：
 
 - 从 `image_assets[]` 删除资产；
@@ -229,10 +239,10 @@ paperconan <input-dir> --images
   "kind": "image_pair_similarity_signal",
   "severity": "medium",
   "rule": "two image regions retain high structural similarity under a horizontal flip",
-  "asset_ids": ["img:a", "img:b"],
+  "asset_ids": ["img:a"],
   "regions": [
     {"asset_id": "img:a", "box": [120, 80, 740, 610]},
-    {"asset_id": "img:b", "box": [40, 55, 660, 585]}
+    {"asset_id": "img:a", "box": [820, 80, 1440, 610]}
   ],
   "method": "panel_pair_similarity",
   "score": 0.94,
@@ -245,7 +255,8 @@ paperconan <input-dir> --images
 ```
 
 `image_findings[]` 是确定性统计信号。Agent 的最终判断不回写这里，而是进入
-`verdict.json findings[]`。
+`verdict.json findings[]`。确定性 finding 只引用一个资产；跨资产 observation 由外部
+多模态 Agent 使用 `image_refs` 创建。所有数值与图像 finding 最终进入同一个统一报告。
 
 ## 9. 统一 verdict 与报告
 

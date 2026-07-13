@@ -12,10 +12,12 @@ import numpy as np
 
 from ._budget import ImageArtifactBudget
 from ._evidence import (
+    ImageEvidenceSourceChangedError,
     _max_image_bytes,
     _max_image_pixels,
     _open_registered_artifact_regular,
     _registered_relative_parts,
+    verify_native_image_source_identity,
     write_native_pair_evidence,
 )
 
@@ -123,13 +125,72 @@ def propose_panels(image: np.ndarray) -> list[tuple[int, int, int, int]]:
     return boxes
 
 
-def _normalized_gray(image: np.ndarray, size: int = 128) -> np.ndarray:
+def _trim_low_information_margins(image: np.ndarray) -> np.ndarray:
     cv2 = _cv2()
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, (size, size)).astype(np.float32)
-    gray -= gray.mean()
-    std = gray.std()
-    return gray / std if std > 1.0 else gray
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    height, width = gray.shape
+    if height < 3 or width < 3:
+        return image
+    border = np.concatenate((
+        gray[0, :],
+        gray[-1, :],
+        gray[:, 0],
+        gray[:, -1],
+    ))
+    background = float(np.median(border))
+    contrast = np.abs(gray - background)
+    gradient = cv2.magnitude(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+    )
+    informative = (contrast >= 8.0) | (gradient >= 8.0)
+    row_minimum = max(2, int(np.ceil(width * 0.01)))
+    column_minimum = max(2, int(np.ceil(height * 0.01)))
+    rows = np.flatnonzero(informative.sum(axis=1) >= row_minimum)
+    columns = np.flatnonzero(informative.sum(axis=0) >= column_minimum)
+    if not rows.size or not columns.size:
+        return image
+    y0 = max(0, int(rows[0]) - 1)
+    y1 = min(height, int(rows[-1]) + 2)
+    x0 = max(0, int(columns[0]) - 1)
+    x1 = min(width, int(columns[-1]) + 2)
+    trimmed_height = y1 - y0
+    trimmed_width = x1 - x0
+    if (
+        trimmed_height < 8
+        or trimmed_width < 8
+        or trimmed_height * trimmed_width < height * width * 0.05
+        or trimmed_height * trimmed_width >= height * width * 0.90
+    ):
+        return image
+    return image[y0:y1, x0:x1]
+
+
+def _normalized_feature(values: np.ndarray) -> np.ndarray:
+    normalized = values.astype(np.float32)
+    normalized -= normalized.mean()
+    std = normalized.std()
+    return normalized / std if std > 1.0 else normalized
+
+
+def _comparison_features(
+    image: np.ndarray,
+    size: int = 128,
+) -> tuple[np.ndarray, np.ndarray]:
+    cv2 = _cv2()
+    trimmed = _trim_low_information_margins(image)
+    gray = cv2.cvtColor(trimmed, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(
+        gray,
+        (size, size),
+        interpolation=cv2.INTER_AREA,
+    ).astype(np.float32)
+    intensity = _normalized_feature(gray)
+    edge_magnitude = cv2.magnitude(
+        cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3),
+    )
+    return intensity, _normalized_feature(edge_magnitude)
 
 
 def transform_robust_similarity(
@@ -137,18 +198,29 @@ def transform_robust_similarity(
     b: np.ndarray,
 ) -> tuple[float, str]:
     cv2 = _cv2()
-    left = _normalized_gray(a)
+    left_intensity, left_edges = _comparison_features(a)
     variants = {
         "identity": b,
         "flip": cv2.flip(b, 1),
+        "flip_vertical": cv2.flip(b, 0),
         "rotate90": cv2.rotate(b, cv2.ROTATE_90_CLOCKWISE),
         "rotate180": cv2.rotate(b, cv2.ROTATE_180),
         "rotate270": cv2.rotate(b, cv2.ROTATE_90_COUNTERCLOCKWISE),
+        "transpose_main": cv2.transpose(b),
+        "transpose_anti": cv2.flip(cv2.transpose(b), -1),
     }
-    scored = [
-        (float((left * _normalized_gray(value)).mean()), name)
-        for name, value in variants.items()
-    ]
+    scored = []
+    for name, value in variants.items():
+        right_intensity, right_edges = _comparison_features(value)
+        intensity_score = float(
+            (left_intensity * right_intensity).mean()
+        )
+        edge_score = float((left_edges * right_edges).mean())
+        score = max(
+            -1.0,
+            min(1.0, intensity_score * 0.75 + edge_score * 0.25),
+        )
+        scored.append((score, name))
     return max(scored, key=lambda item: (item[0], item[1]))
 
 
@@ -402,32 +474,68 @@ def diagnose_image_assets(
         })
 
     candidates = retained.best()
+    budget_ready = True
     if candidates:
         try:
             budget.initialize_from_root(root)
         except ValueError as exc:
             errors.append({"error": str(exc)})
-            return [], errors
+            budget_ready = False
 
     findings = []
     for candidate in candidates:
         evidence_id = candidate["finding_id"].replace(":", "-")
-        try:
-            evidence = write_native_pair_evidence(
-                candidate["_native"],
-                candidate["_box_a"],
-                candidate["_box_b"],
-                artifact_dir,
-                evidence_id,
-                artifact_budget=budget,
-                expected_sha256=candidate["_source_sha256"],
-            )
-        except Exception as exc:
-            errors.append({
-                "file": candidate["_file"],
-                "error": f"image evidence unavailable: {exc}",
-            })
-            continue
+        evidence = None
+        evidence_error = None
+        if budget_ready:
+            try:
+                evidence = write_native_pair_evidence(
+                    candidate["_native"],
+                    candidate["_box_a"],
+                    candidate["_box_b"],
+                    artifact_dir,
+                    evidence_id,
+                    artifact_budget=budget,
+                    expected_sha256=candidate["_source_sha256"],
+                )
+            except ImageEvidenceSourceChangedError as exc:
+                errors.append({
+                    "file": candidate["_file"],
+                    "error": f"image evidence unavailable: {exc}",
+                })
+                continue
+            except Exception as exc:
+                evidence_error = exc
+        if evidence is None:
+            try:
+                verify_native_image_source_identity(
+                    candidate["_native"],
+                    artifact_dir,
+                    candidate["_source_sha256"],
+                )
+            except ImageEvidenceSourceChangedError as exc:
+                errors.append({
+                    "file": candidate["_file"],
+                    "error": f"image evidence unavailable: {exc}",
+                })
+                continue
+            except Exception as exc:
+                detail = (
+                    f"{evidence_error}; " if evidence_error is not None else ""
+                )
+                errors.append({
+                    "file": candidate["_file"],
+                    "error": (
+                        "image evidence unavailable: "
+                        f"{detail}source stability recheck unavailable: {exc}"
+                    ),
+                })
+                continue
+            if evidence_error is not None:
+                errors.append({
+                    "file": candidate["_file"],
+                    "error": f"image evidence unavailable: {evidence_error}",
+                })
         finding = {
             key: value
             for key, value in candidate.items()

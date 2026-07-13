@@ -32,6 +32,12 @@ SDK，也不声称自主完成语义判断。标准顺序是：
 5. Agent 可以在 `image_findings` 为空时用 `image_refs` 写入图像 finding；这类
    Agent-only finding 与数值 finding 放在同一个 `verdict.json findings[]`。
 
+确定性 `image_findings` 只比较一个登记资产内的区域；跨资产比较由外部多模态 Agent
+完成。其 `profile_action: "kept"` 只是信息字段，不经过数值 prefilter。若原始来源身份
+仍稳定但 evidence 预算或发布失败，finding 仍会以 `evidence: null` 保留，并在
+`scan_errors` 中记录限制；若来源在评分后改变，该 finding 会被抑制。数值 finding、
+确定性提示和 Agent-only 图像 finding 最终都保留在同一份统一报告中。
+
 没有本地图像能力时，Agent 应写
 `image_review.status: "unavailable_no_multimodal"`，说明图像语义复核未完成，并继续数值
 复核。`image_review.status: "completed"` 表示覆盖记账完成，不表示每个图像问题都已解释。

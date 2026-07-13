@@ -35,7 +35,8 @@ contains figures that should be reviewed with the numeric material:
    deterministic hints are useful.
 2. Read every entry in `image_assets`; deterministic `image_findings` are hints
    and never the complete review set. An empty `image_findings` list does not
-   mean that every image question was resolved.
+   mean that every image question was resolved. Deterministic pair hints compare
+   two regions within one registered asset only; they do not compare assets.
 3. Confirm the current Agent can open local images.
    - If yes, inspect the whole image first, then use a native-pixel crop for
      small panels or unresolved detail.
@@ -49,9 +50,10 @@ contains figures that should be reviewed with the numeric material:
 5. Check figure labels, channels, processing steps, shared controls, insets,
    before/after layouts, figure legends, and Methods before escalating an image
    similarity signal.
-6. The Agent may create an image finding using `image_refs` even when
-   `image_findings` is empty. Such Agent-only image findings belong in the
-   verdict, not in deterministic `scan.json`.
+6. The external multimodal Agent is responsible for cross-asset comparison and
+   may create an image finding using `image_refs` even when `image_findings` is
+   empty. Such Agent-only image findings belong in the verdict, not in
+   deterministic `scan.json`.
 7. Put numeric and image findings in the same `verdict.json findings[]`, then
    generate a single unified report with `paperconan report`.
 
@@ -161,6 +163,10 @@ Prefer candidates with `doi_in_related: true`. Repository search can return unre
 
 When a finding has `profile_action: "demoted"` or `profile_action: "hidden"`, the active profile changed the visible severity. Use `prefilter_reason`, `prefilter_flags`, and `false_positive_context` to explain why, then decide whether the filter reason actually fits the table context.
 
+For deterministic image hints, `profile_action: "kept"` is informational.
+Image hints do not pass through the numeric prefilter and are not demoted or
+hidden by `review`, `forensic`, or `triage`.
+
 ## Reference Routing
 
 Load references only when needed:
@@ -213,8 +219,9 @@ For adaptive image review, `scan.json image_assets[]` is the complete registered
 asset inventory while `image_findings[]` contains only optional deterministic
 hints. Add Agent conclusions as `finding_type: "image"` entries with
 `image_refs`, and add top-level `image_review` coverage. Numeric and image
-entries stay in the same `findings[]`; do not create a separate image verdict
-or a second user-facing report.
+entries, including Agent-only cross-asset observations, all remain in the same
+`findings[]` and the single unified report; do not create a separate image
+verdict or a second user-facing report.
 
 When a verdict JSON already exists, `paperconan report <scan.json> --verdict
 <verdict.json> --out <html>` renders a separate adjudicated report. Do not

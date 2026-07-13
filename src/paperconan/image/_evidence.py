@@ -40,6 +40,10 @@ class _EvidenceEncodingLimitError(ValueError):
     pass
 
 
+class ImageEvidenceSourceChangedError(ValueError):
+    """Raised when the scored image source no longer has the same identity."""
+
+
 class _BoundedBytesIO(io.BytesIO):
     def __init__(self, max_bytes: int):
         super().__init__()
@@ -747,6 +751,68 @@ def _registered_artifact_location(
     return root, candidate, relative
 
 
+def _native_source_location(
+    image_path: str,
+    output_root: str,
+) -> tuple[Path, Path]:
+    root = Path(os.path.abspath(output_root))
+    source = Path(os.path.abspath(image_path))
+    try:
+        source_relative = source.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("image evidence source escapes artifact root") from exc
+    if not source_relative.parts:
+        raise ValueError("image evidence source escapes artifact root")
+    return root, source_relative
+
+
+def _source_stability_error(exc: ValueError) -> bool:
+    message = str(exc)
+    return (
+        message.startswith("registered evidence path is not stable")
+        or message.startswith("image artifact root changed")
+        or message.startswith("image evidence destination escapes artifact root")
+    )
+
+
+def verify_native_image_source_identity(
+    image_path: str,
+    output_root: str,
+    expected_sha256: str,
+) -> None:
+    root, source_relative = _native_source_location(image_path, output_root)
+    try:
+        with _pinned_artifact_root(root) as root_fd:
+            with _open_artifact_regular_from_root_fd(
+                root,
+                root_fd,
+                source_relative,
+                verify_stable=True,
+            ) as source_fh:
+                if os.fstat(source_fh.fileno()).st_size > _max_image_bytes():
+                    raise ImageEvidenceSourceChangedError(
+                        "registered image changed after scoring"
+                    )
+                digest = hashlib.sha256()
+                for chunk in iter(
+                    lambda: source_fh.read(1024 * 1024),
+                    b"",
+                ):
+                    digest.update(chunk)
+                if digest.hexdigest() != expected_sha256:
+                    raise ImageEvidenceSourceChangedError(
+                        "registered image changed after scoring"
+                    )
+    except ImageEvidenceSourceChangedError:
+        raise
+    except ValueError as exc:
+        if _source_stability_error(exc):
+            raise ImageEvidenceSourceChangedError(
+                "registered image changed after scoring"
+            ) from exc
+        raise
+
+
 def _validated_crop_box(
     box: object,
     *,
@@ -947,59 +1013,66 @@ def write_native_pair_evidence(
         or "\\" in evidence_id
     ):
         raise ValueError("evidence_id must be a single path-safe name")
-    root = Path(os.path.abspath(output_root))
     budget = artifact_budget or ImageArtifactBudget.from_environment()
-    source = Path(os.path.abspath(image_path))
-    try:
-        source_relative = source.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("image evidence source escapes artifact root") from exc
-    if not source_relative.parts:
-        raise ValueError("image evidence source escapes artifact root")
+    root, source_relative = _native_source_location(image_path, output_root)
     out_dir = root / "images" / "evidence"
     with _pinned_artifact_root(root) as pinned_root_fd:
-        with _open_artifact_regular_from_root_fd(
-            root,
-            pinned_root_fd,
-            source_relative,
-            verify_stable=expected_sha256 is not None,
-        ) as source_fh:
-            if os.fstat(source_fh.fileno()).st_size > _max_image_bytes():
-                raise ValueError(
-                    "registered image exceeds PAPERCONAN_MAX_IMAGE_MB"
-                )
-            if expected_sha256 is not None:
-                digest = hashlib.sha256()
-                for chunk in iter(lambda: source_fh.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                if digest.hexdigest() != expected_sha256:
-                    raise ValueError("registered image changed after scoring")
-                source_fh.seek(0)
-            with Image.open(source_fh) as image:
-                max_pixels = _max_image_pixels()
-                if (
-                    image.width <= 0
-                    or image.height <= 0
-                    or image.width * image.height > max_pixels
-                ):
+        try:
+            with _open_artifact_regular_from_root_fd(
+                root,
+                pinned_root_fd,
+                source_relative,
+                verify_stable=expected_sha256 is not None,
+            ) as source_fh:
+                if os.fstat(source_fh.fileno()).st_size > _max_image_bytes():
                     raise ValueError(
-                        "registered image exceeds "
-                        "PAPERCONAN_MAX_IMAGE_PIXELS"
+                        "registered image exceeds PAPERCONAN_MAX_IMAGE_MB"
                     )
-                validated_a = _validated_crop_box(
-                    box_a,
-                    width=image.width,
-                    height=image.height,
-                    max_pixels=max_pixels,
-                )
-                validated_b = _validated_crop_box(
-                    box_b,
-                    width=image.width,
-                    height=image.height,
-                    max_pixels=max_pixels,
-                )
-                crop_a = image.crop(validated_a)
-                crop_b = image.crop(validated_b)
+                if expected_sha256 is not None:
+                    digest = hashlib.sha256()
+                    for chunk in iter(
+                        lambda: source_fh.read(1024 * 1024),
+                        b"",
+                    ):
+                        digest.update(chunk)
+                    if digest.hexdigest() != expected_sha256:
+                        raise ImageEvidenceSourceChangedError(
+                            "registered image changed after scoring"
+                        )
+                    source_fh.seek(0)
+                with Image.open(source_fh) as image:
+                    max_pixels = _max_image_pixels()
+                    if (
+                        image.width <= 0
+                        or image.height <= 0
+                        or image.width * image.height > max_pixels
+                    ):
+                        raise ValueError(
+                            "registered image exceeds "
+                            "PAPERCONAN_MAX_IMAGE_PIXELS"
+                        )
+                    validated_a = _validated_crop_box(
+                        box_a,
+                        width=image.width,
+                        height=image.height,
+                        max_pixels=max_pixels,
+                    )
+                    validated_b = _validated_crop_box(
+                        box_b,
+                        width=image.width,
+                        height=image.height,
+                        max_pixels=max_pixels,
+                    )
+                    crop_a = image.crop(validated_a)
+                    crop_b = image.crop(validated_b)
+        except ImageEvidenceSourceChangedError:
+            raise
+        except ValueError as exc:
+            if expected_sha256 is not None and _source_stability_error(exc):
+                raise ImageEvidenceSourceChangedError(
+                    "registered image changed after scoring"
+                ) from exc
+            raise
         suffix_a, format_a, save_a = _crop_encoding(crop_a)
         suffix_b, format_b, save_b = _crop_encoding(crop_b)
         crop_a_path = out_dir / f"{evidence_id}-a{suffix_a}"
@@ -1099,6 +1172,12 @@ def write_native_pair_evidence(
                     except Exception:
                         if not active_error:
                             raise
+        if expected_sha256 is not None:
+            verify_native_image_source_identity(
+                image_path,
+                output_root,
+                expected_sha256,
+            )
     return {
         "crop_a_path": _relative_path(crop_a_path, root),
         "crop_b_path": _relative_path(crop_b_path, root),

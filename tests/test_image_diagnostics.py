@@ -34,6 +34,42 @@ def _two_panel(path: Path):
     Image.fromarray(canvas).save(path)
 
 
+def _asymmetric_panel(seed: int, *, height: int = 180, width: int = 260):
+    rng = np.random.default_rng(seed)
+    panel = rng.integers(0, 2, size=(height, width), dtype=np.uint8) * 255
+    panel[15:55, 20:75] = 40 + seed * 10
+    panel[95:160, 150:235] = 180 - seed * 10
+    return np.repeat(panel[:, :, None], 3, axis=2)
+
+
+def _offset_duplicate_figure(path: Path):
+    first = _asymmetric_panel(1)
+    canvas = np.full((650, 900, 3), 255, dtype=np.uint8)
+    canvas[60:240, 60:320] = first
+    canvas[50:230, 550:810] = _asymmetric_panel(2)
+    canvas[360:540, 40:300] = _asymmetric_panel(3)
+    canvas[380:560, 560:820] = first
+    Image.fromarray(canvas).save(path)
+
+
+def _blurred_noise_pair_at_mirrored_offsets():
+    cv2 = _diagnostics._cv2()
+
+    def blurred_panel(seed: int):
+        rng = np.random.default_rng(seed)
+        raw = rng.normal(size=(180, 260)).astype(np.float32)
+        blurred = cv2.GaussianBlur(raw, (0, 0), 15)
+        scaled = (blurred - blurred.min()) / (blurred.max() - blurred.min())
+        gray = (scaled * 180 + 30).astype(np.uint8)
+        return np.repeat(gray[:, :, None], 3, axis=2)
+
+    left = np.full((280, 410, 3), 255, dtype=np.uint8)
+    right = np.full((280, 410, 3), 255, dtype=np.uint8)
+    left[20:200, 20:280] = blurred_panel(132)
+    right[80:260, 130:390] = blurred_panel(10_132)
+    return left, right
+
+
 def _diagnostic_asset(root: Path) -> tuple[Path, list[dict]]:
     out = root / "audit"
     native = out / "images" / "native" / "Fig1.png"
@@ -388,6 +424,108 @@ def test_diagnostics_find_transform_related_panels_and_keep_assets(tmp_path):
     assert finding["transform"] == "flip"
     assert finding["score"] >= 0.92
     assert len(finding["regions"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("expected_transform", "make_variant"),
+    [
+        ("identity", lambda cv2, image: image.copy()),
+        ("flip", lambda cv2, image: cv2.flip(image, 1)),
+        ("flip_vertical", lambda cv2, image: cv2.flip(image, 0)),
+        (
+            "rotate90",
+            lambda cv2, image: cv2.rotate(
+                image,
+                cv2.ROTATE_90_COUNTERCLOCKWISE,
+            ),
+        ),
+        (
+            "rotate180",
+            lambda cv2, image: cv2.rotate(image, cv2.ROTATE_180),
+        ),
+        (
+            "rotate270",
+            lambda cv2, image: cv2.rotate(
+                image,
+                cv2.ROTATE_90_CLOCKWISE,
+            ),
+        ),
+        ("transpose_main", lambda cv2, image: cv2.transpose(image)),
+        (
+            "transpose_anti",
+            lambda cv2, image: cv2.flip(cv2.transpose(image), -1),
+        ),
+    ],
+)
+def test_similarity_covers_all_dihedral_variants(
+    expected_transform,
+    make_variant,
+):
+    cv2 = _diagnostics._cv2()
+    panel = _asymmetric_panel(4, height=96, width=128)
+    variant = make_variant(cv2, panel)
+
+    score, transform = _diagnostics.transform_robust_similarity(
+        panel,
+        variant,
+    )
+
+    assert score >= _diagnostics._SIMILARITY_THRESHOLD
+    assert transform == expected_transform
+
+
+def test_diagnostics_trim_margins_for_scoring_but_keep_native_boxes(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _offset_duplicate_figure(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    expected_boxes = [
+        (20, 25, 435, 300),
+        (435, 25, 860, 300),
+        (20, 300, 435, 605),
+        (435, 300, 860, 605),
+    ]
+    expected_regions = [
+        {"asset_id": assets[0]["asset_id"], "box": list(expected_boxes[0])},
+        {"asset_id": assets[0]["asset_id"], "box": list(expected_boxes[3])},
+    ]
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert diagnostic_errors == []
+    matching = [
+        finding
+        for finding in findings
+        if finding["regions"] == expected_regions
+    ]
+    assert len(matching) == 1
+    finding = matching[0]
+    assert finding["score"] >= _diagnostics._SIMILARITY_THRESHOLD
+    assert finding["asset_ids"] == [assets[0]["asset_id"]]
+    assert finding["evidence"] is not None
+    with Image.open(out / finding["evidence"]["crop_a_path"]) as crop_a:
+        assert crop_a.size == (415, 275)
+    with Image.open(out / finding["evidence"]["crop_b_path"]) as crop_b:
+        assert crop_b.size == (425, 305)
+
+
+def test_similarity_rejects_reviewed_blurred_noise_non_duplicate():
+    left, right = _blurred_noise_pair_at_mirrored_offsets()
+
+    score, _ = _diagnostics.transform_robust_similarity(left, right)
+
+    assert score < _diagnostics._SIMILARITY_THRESHOLD
+
+
+def test_margin_trim_falls_back_when_content_is_too_small():
+    image = np.full((100, 120, 3), 255, dtype=np.uint8)
+    image[49:51, 59:61] = 0
+
+    trimmed = _diagnostics._trim_low_information_margins(image)
+
+    assert trimmed.shape == image.shape
 
 
 def test_diagnostics_decode_registered_bytes_with_imdecode(tmp_path, monkeypatch):
@@ -857,7 +995,8 @@ def test_candidate_evidence_write_error_is_non_gating(tmp_path, monkeypatch):
 
     findings, errors = diagnose_image_assets(assets, str(out))
 
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0]["evidence"] is None
     assert errors == [{
         "file": "Fig1.png",
         "error": "image evidence unavailable: synthetic evidence write error",
@@ -903,6 +1042,39 @@ def test_diagnostics_reject_evidence_when_scored_asset_is_replaced(
     assert not (out / "images" / "evidence").exists()
 
 
+def test_diagnostics_rechecks_source_after_publication_failure(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(replacement)
+
+    def replace_then_fail(*args, **kwargs):
+        replacement.replace(native)
+        raise OSError("synthetic evidence publication error")
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "write_native_pair_evidence",
+        replace_then_fail,
+    )
+
+    findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
+
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+
+
 def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
     tmp_path,
     monkeypatch,
@@ -924,12 +1096,43 @@ def test_diagnostic_evidence_respects_remaining_total_artifact_budget(
 
     findings, diagnostic_errors = diagnose_image_assets(assets, str(out))
 
-    assert findings == []
+    assert len(findings) == 1
+    assert findings[0]["evidence"] is None
     assert len(diagnostic_errors) == 1
     assert "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in diagnostic_errors[0]["error"]
     assert "budget exhausted" in diagnostic_errors[0]["error"]
     evidence_dir = out / "images" / "evidence"
     assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
+
+
+def test_budget_initialization_failure_retains_stable_findings(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    budget = ImageArtifactBudget(1024 * 1024)
+
+    def unavailable(root):
+        raise ValueError("synthetic artifact budget unavailable")
+
+    monkeypatch.setattr(budget, "initialize_from_root", unavailable)
+
+    findings, diagnostic_errors = diagnose_image_assets(
+        assets,
+        str(out),
+        artifact_budget=budget,
+    )
+
+    assert len(findings) == 1
+    assert findings[0]["evidence"] is None
+    assert diagnostic_errors == [{
+        "error": "synthetic artifact budget unavailable",
+    }]
 
 
 def test_evidence_budget_fresh_accounting_counts_visible_insertion(tmp_path):
@@ -1090,7 +1293,8 @@ def test_scan_records_total_artifact_budget_exhaustion_without_losing_assets(
     )
 
     assert len(scan["image_assets"]) == 1
-    assert scan["image_findings"] == []
+    assert len(scan["image_findings"]) == 1
+    assert scan["image_findings"][0]["evidence"] is None
     assert any(
         "PAPERCONAN_MAX_IMAGE_TOTAL_MB" in item["error"]
         for item in scan["scan_errors"]
@@ -1275,6 +1479,30 @@ def test_native_evidence_rejects_oversized_replacement_before_hash_or_decode(
             (4, 4, 8, 8),
             str(out),
             "image-pair-oversized-replacement",
+            expected_sha256=expected_sha256,
+        )
+
+    assert not (out / "images" / "evidence").exists()
+
+
+def test_native_evidence_raises_typed_source_change_after_scoring(tmp_path):
+    out = tmp_path / "audit"
+    native = out / "images" / "native" / "source.png"
+    native.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(native)
+    expected_sha256 = hashlib.sha256(native.read_bytes()).hexdigest()
+    Image.new("RGB", (8, 8), (0, 0, 255)).save(native)
+
+    with pytest.raises(
+        _evidence.ImageEvidenceSourceChangedError,
+        match="registered image changed after scoring",
+    ):
+        write_native_pair_evidence(
+            str(native),
+            (0, 0, 4, 4),
+            (4, 4, 8, 8),
+            str(out),
+            "image-pair-source-changed",
             expected_sha256=expected_sha256,
         )
 

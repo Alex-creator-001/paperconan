@@ -121,7 +121,19 @@ image hints:
 ```
 
 The current deterministic helper compares two native-coordinate regions within
-one registered asset. It does not emit cross-asset comparisons.
+one registered asset. It does not emit cross-asset comparisons; those belong
+to the external multimodal Agent.
+
+The proposal boxes in `regions` remain native coordinates. Low-information
+margins are trimmed only in comparison preprocessing, where normalized
+intensity and edge agreement are scored across all eight dihedral variants.
+`evidence` may be `null` when the scored source is still stable but evidence
+publication or its artifact budget is unavailable; the corresponding reason is
+recorded in `scan_errors`. If the registered source identity changes after
+scoring, the deterministic finding is suppressed instead.
+
+For image hints, `profile_action: "kept"` is informational. The numeric
+prefilter does not demote or hide `image_findings`.
 
 These are optional, non-gating statistical signals. They are hints, not the
 complete image review set. An empty `image_findings` list means only that the
@@ -131,8 +143,8 @@ optional helper emitted no registered hint; it does not resolve the
 ## `verdict.json` image contract
 
 The external Agent writes image and numeric conclusions into the same
-paper-level `findings[]`. An image entry can refer to a deterministic hint and
-registered image regions:
+paper-level `findings[]`, and all findings remain in the unified report. An
+image entry can refer to a deterministic hint and registered image regions:
 
 ```json
 {
@@ -238,9 +250,9 @@ A complete mixed verdict still has one `findings[]` and produces one report:
 - `severity`: `"high"` | `"medium"` | `"low"`
 - `rule`: human-readable rule string e.g. `col[27] ≡ col[28] in 9/10 rows`
 - `n`: sample size for the rule
-- `evidence`: block snippet `{headers, rows, highlight_cols, ...}` — used by report.html, but you can also surface a few highlighted values if useful
+- `evidence`: numeric block snippet `{headers, rows, highlight_cols, ...}`, or an image path block; deterministic image hints may use `null` when evidence publication fails while source identity remains stable
 - `likely_benign` (optional): a common innocent explanation for this kind — surface it to the user alongside the finding so a signal is never reported as a verdict
-- `profile_action`: `"kept"` | `"demoted"` | `"hidden"` — what the active profile did to this finding. `"demoted"`/`"hidden"` means the current `severity` is the **filter's** downgrade, not the detector's raw verdict (always `"kept"` under `--profile forensic`). See the Profiles section in SKILL.md.
+- `profile_action`: `"kept"` | `"demoted"` | `"hidden"` — what the active profile did to a numeric finding. `"demoted"`/`"hidden"` means the current `severity` is the **filter's** downgrade, not the detector's raw verdict (always `"kept"` under `--profile forensic`). Image hints use informational `"kept"` and are not numeric-prefiltered. See the Profiles section in SKILL.md.
 - `false_positive_context` (list): machine tags for *why* it was demoted — e.g. `axis_or_scan_column`, `censoring_or_boundary_value`, `derived_or_unit_conversion`, `same_data_replot_or_duplicate_upload`, `omics_or_large_matrix_boundary_flood`. Map these back to the "常见误报" notes in [detectors.md](detectors.md).
 - `prefilter_reason` (optional): deterministic triage explanation, especially for within-column findings. Treat it as a structured clue, not a final answer. It can explain why a pattern was kept, demoted, or considered a likely structural false positive.
 - `prefilter_flags` (optional object): deterministic flags supporting the prefilter decision, such as axis/index-like labels, percentage/ratio/normalized/model-output context, low cardinality, boundary/floor/ceiling values, fixed-denominator hints, or repeated fill values. Use these with [judgment-rubric.md](judgment-rubric.md) before surfacing prefiltered hits.

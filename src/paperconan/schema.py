@@ -63,7 +63,7 @@ class ImageFinding(TypedDict, total=False):
     method: str
     score: float
     transform: str
-    evidence: dict[str, str]
+    evidence: dict[str, str] | None
     profile_action: ProfileAction
 
 

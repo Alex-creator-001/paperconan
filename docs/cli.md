@@ -32,6 +32,12 @@ python -m paperconan path/to/dir/                   # 等价 module 形式
 `image_findings[]`；它要求同时传 `--images`。`image_findings` 不是完整图像复核清单，
 为空也不能解读成所有图像问题都已解决。
 
+确定性提示只比较同一个登记资产内的两个区域，不做跨资产比较；跨资产比较属于外部多模态
+Agent。区域框和 evidence 保留原始像素坐标，低信息边缘只在比较预处理中裁掉。图像
+`profile_action: "kept"` 仅作信息标记，不经过数值 prefilter。若来源身份仍稳定但 evidence
+预算或发布失败，finding 仍保留且 `evidence` 为 `null`，原因写入 `scan_errors`；评分后
+来源身份改变时则不保留该 finding。
+
 PaperConan 不配置模型 API、密钥或 provider SDK，也不自主做图像语义判断。外部多模态
 Agent 应先确认能读取本地图像，先看整图，再对小面板使用原始像素裁剪，并把每个资产
 记为 reviewed、unresolved、unreadable 或 deferred。
@@ -87,7 +93,8 @@ CLI 的统一报告命令是：
 paperconan report data/audit/scan.json --verdict verdict.json --out adjudication.html
 ```
 
-数值 finding 与 Agent 图像 finding 应写在同一个 `verdict.json findings[]`；不要拆成第二份图像报告。
+数值 finding、确定性图像提示和 Agent 图像 finding 最终都保留在统一工作流中；Agent
+判断应写在同一个 `verdict.json findings[]`，并只生成一份统一报告。
 
 ## 内存 / 输出保护
 
