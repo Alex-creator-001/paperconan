@@ -17,6 +17,7 @@ from ._evidence import (
     _max_image_pixels,
     _open_registered_artifact_regular,
     _registered_relative_parts,
+    remove_published_evidence_if_owned,
     verify_native_image_source_identity,
     write_native_pair_evidence,
 )
@@ -483,10 +484,45 @@ def diagnose_image_assets(
             budget_ready = False
 
     findings = []
+    invalid_asset_ids = set()
+    evidence_receipts_by_asset: dict[
+        str,
+        list[dict[str, tuple[int, int]]],
+    ] = {}
+
+    def invalidate_asset(candidate: dict, exc: Exception) -> None:
+        asset_id = candidate["asset_ids"][0]
+        invalid_asset_ids.add(asset_id)
+        findings[:] = [
+            finding
+            for finding in findings
+            if asset_id not in finding["asset_ids"]
+        ]
+        receipts = evidence_receipts_by_asset.pop(asset_id, [])
+        try:
+            remove_published_evidence_if_owned(
+                artifact_dir,
+                receipts,
+                artifact_budget=budget,
+            )
+        except Exception as cleanup_exc:
+            errors.append({
+                "file": candidate["_file"],
+                "error": f"image evidence rollback unavailable: {cleanup_exc}",
+            })
+        errors.append({
+            "file": candidate["_file"],
+            "error": f"image evidence unavailable: {exc}",
+        })
+
     for candidate in candidates:
+        asset_id = candidate["asset_ids"][0]
+        if asset_id in invalid_asset_ids:
+            continue
         evidence_id = candidate["finding_id"].replace(":", "-")
         evidence = None
         evidence_error = None
+        publication_receipt: dict[str, tuple[int, int]] = {}
         if budget_ready:
             try:
                 evidence = write_native_pair_evidence(
@@ -497,15 +533,23 @@ def diagnose_image_assets(
                     evidence_id,
                     artifact_budget=budget,
                     expected_sha256=candidate["_source_sha256"],
+                    publication_receipt=publication_receipt,
                 )
             except ImageEvidenceSourceChangedError as exc:
-                errors.append({
-                    "file": candidate["_file"],
-                    "error": f"image evidence unavailable: {exc}",
-                })
+                if publication_receipt:
+                    evidence_receipts_by_asset.setdefault(
+                        asset_id,
+                        [],
+                    ).append(publication_receipt)
+                invalidate_asset(candidate, exc)
                 continue
             except Exception as exc:
                 evidence_error = exc
+        if publication_receipt:
+            evidence_receipts_by_asset.setdefault(
+                asset_id,
+                [],
+            ).append(publication_receipt)
         if evidence is None:
             try:
                 verify_native_image_source_identity(
@@ -514,10 +558,7 @@ def diagnose_image_assets(
                     candidate["_source_sha256"],
                 )
             except ImageEvidenceSourceChangedError as exc:
-                errors.append({
-                    "file": candidate["_file"],
-                    "error": f"image evidence unavailable: {exc}",
-                })
+                invalidate_asset(candidate, exc)
                 continue
             except Exception as exc:
                 detail = (

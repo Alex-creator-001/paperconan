@@ -535,6 +535,69 @@ def _publish_staged_images(
         ) from publication_error
 
 
+def _published_evidence_receipt(
+    evidence_fd: int,
+    staged: list[tuple[str, int, str]],
+) -> dict[str, tuple[int, int]]:
+    receipt = {}
+    for _, _, final_name in staged:
+        current = os.stat(
+            final_name,
+            dir_fd=evidence_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(current.st_mode):
+            raise _EvidencePublicationRecoveryError(
+                "image evidence publication retained uncertain visible entry: "
+                f"images/evidence/{final_name}"
+            )
+        receipt[f"images/evidence/{final_name}"] = (
+            current.st_dev,
+            current.st_ino,
+        )
+    return receipt
+
+
+def remove_published_evidence_if_owned(
+    output_root: str,
+    receipts: list[dict[str, tuple[int, int]]],
+    *,
+    artifact_budget: ImageArtifactBudget,
+) -> None:
+    if not receipts:
+        return
+    root = Path(os.path.abspath(output_root))
+    with _evidence_output_directory(root) as directory_fds:
+        root_fd, images_fd, evidence_fd = directory_fds
+        with image_publication_lock(root_fd):
+            for receipt in receipts:
+                for relative_path, expected_identity in receipt.items():
+                    parts = _registered_relative_parts(relative_path)
+                    if (
+                        parts is None
+                        or len(parts) != 3
+                        or parts[:2] != ("images", "evidence")
+                    ):
+                        continue
+                    final_name = parts[2]
+                    try:
+                        current = os.stat(
+                            final_name,
+                            dir_fd=evidence_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        continue
+                    if (
+                        stat.S_ISREG(current.st_mode)
+                        and (current.st_dev, current.st_ino)
+                        == expected_identity
+                    ):
+                        os.unlink(final_name, dir_fd=evidence_fd)
+            artifact_budget.resynchronize_from_images_fd(images_fd)
+            artifact_budget.ensure_within_limit()
+
+
 def _max_image_bytes() -> int:
     name = "PAPERCONAN_MAX_IMAGE_MB"
     raw = os.environ.get(name, str(_DEFAULT_MAX_IMAGE_MB))
@@ -1003,6 +1066,7 @@ def write_native_pair_evidence(
     evidence_id: str,
     artifact_budget: ImageArtifactBudget | None = None,
     expected_sha256: str | None = None,
+    publication_receipt: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, str]:
     from PIL import Image
 
@@ -1160,6 +1224,14 @@ def write_native_pair_evidence(
                         existing_size=existing_size,
                         staged_size=staged_size,
                     )
+                    if publication_receipt is not None:
+                        publication_receipt.clear()
+                        publication_receipt.update(
+                            _published_evidence_receipt(
+                                evidence_fd,
+                                staged,
+                            )
+                        )
                 finally:
                     active_error = sys.exc_info()[0] is not None
                     for temp_name, temp_fd, _ in staged:

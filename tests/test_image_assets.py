@@ -112,6 +112,26 @@ def test_prepare_image_assets_preserves_native_pixels_and_stable_ids(tmp_path):
     assert first[0]["path"] != first[0]["preview_path"]
 
 
+def test_prepare_image_assets_preserves_process_global_pillow_pixel_limit(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    original_limit = PIL.MAX_IMAGE_PIXELS
+    monkeypatch.setenv("PAPERCONAN_MAX_IMAGE_PIXELS", "123456")
+
+    assets, errors = _assets.prepare_image_assets(
+        str(source),
+        str(tmp_path / "audit"),
+    )
+
+    assert errors == []
+    assert len(assets) == 1
+    assert PIL.MAX_IMAGE_PIXELS == original_limit
+
+
 def test_prepare_image_assets_orders_assets_by_stable_source_name(
     tmp_path,
     monkeypatch,
@@ -1229,6 +1249,36 @@ def test_rerun_retains_stale_native_and_preview_files(tmp_path):
     assert "retained existing visible entry" in rerun_errors[0]["error"]
     assert native.read_bytes() == b"stale-native"
     assert preview.read_bytes() == b"stale-preview"
+
+
+def test_preview_only_mismatch_reports_deterministic_rescan_remediation(
+    tmp_path,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _image(source / "FigA.png")
+    output = tmp_path / "audit"
+    assets, errors = _assets.prepare_image_assets(str(source), str(output))
+    assert errors == []
+    native = output / assets[0]["path"]
+    preview = output / assets[0]["preview_path"]
+    native_bytes = native.read_bytes()
+    preview.write_bytes(b"preview-from-another-encoder")
+
+    rerun_assets, rerun_errors = _assets.prepare_image_assets(
+        str(source),
+        str(output),
+    )
+
+    assert rerun_assets == []
+    assert len(rerun_errors) == 1
+    assert native.read_bytes() == native_bytes
+    assert preview.read_bytes() == b"preview-from-another-encoder"
+    error = rerun_errors[0]["error"]
+    assert (
+        f"delete {assets[0]['preview_path']} and rescan"
+        in error
+    )
 
 
 def test_rerun_retains_final_asset_symlinks_without_touching_targets(tmp_path):

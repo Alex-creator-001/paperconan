@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import os
+import stat
 import threading
 from pathlib import Path
 
@@ -1073,6 +1074,152 @@ def test_diagnostics_rechecks_source_after_publication_failure(
         "file": "Fig1.png",
         "error": "image evidence unavailable: registered image changed after scoring",
     }]
+
+
+def test_source_change_rolls_back_all_findings_and_owned_evidence_for_asset(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(replacement)
+    boxes = [
+        (0, 0, 100, 100),
+        (105, 0, 205, 100),
+        (210, 0, 310, 100),
+    ]
+    original_write = _diagnostics.write_native_pair_evidence
+    write_calls = 0
+
+    def publish_once_then_replace(*args, **kwargs):
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 2:
+            replacement.replace(native)
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "_propose_panels_bounded",
+        lambda image: (boxes, False),
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "transform_robust_similarity",
+        lambda left, right: (0.99, "identity"),
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "write_native_pair_evidence",
+        publish_once_then_replace,
+    )
+    budget = ImageArtifactBudget(1024 * 1024 * 1024)
+
+    findings, diagnostic_errors = diagnose_image_assets(
+        assets,
+        str(out),
+        artifact_budget=budget,
+    )
+
+    assert write_calls == 2
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+    evidence_dir = out / "images" / "evidence"
+    assert not evidence_dir.exists() or list(evidence_dir.iterdir()) == []
+    visible_bytes = sum(
+        path.stat().st_size
+        for path in (out / "images").rglob("*")
+        if stat.S_ISREG(path.lstat().st_mode)
+    )
+    assert budget.used_bytes == visible_bytes
+
+
+def test_source_change_rollback_retains_concurrent_evidence_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    _two_panel(source / "Fig1.png")
+    out = tmp_path / "audit"
+    assets, errors = prepare_image_assets(str(source), str(out))
+    assert errors == []
+    native = out / assets[0]["path"]
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (310, 140), (20, 80, 140)).save(replacement)
+    concurrent_target = tmp_path / "concurrent-evidence.bin"
+    concurrent_bytes = b"concurrent evidence replacement"
+    concurrent_target.write_bytes(concurrent_bytes)
+    boxes = [
+        (0, 0, 100, 100),
+        (105, 0, 205, 100),
+        (210, 0, 310, 100),
+    ]
+    original_write = _diagnostics.write_native_pair_evidence
+    write_calls = 0
+    concurrent_final = None
+
+    def publish_replace_one_then_change_source(*args, **kwargs):
+        nonlocal write_calls, concurrent_final
+        write_calls += 1
+        if write_calls == 2:
+            replacement.replace(native)
+            return original_write(*args, **kwargs)
+        evidence = original_write(*args, **kwargs)
+        concurrent_final = out / evidence["crop_a_path"]
+        concurrent_final.unlink()
+        concurrent_final.symlink_to(concurrent_target)
+        return evidence
+
+    monkeypatch.setattr(
+        _diagnostics,
+        "_propose_panels_bounded",
+        lambda image: (boxes, False),
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "transform_robust_similarity",
+        lambda left, right: (0.99, "identity"),
+    )
+    monkeypatch.setattr(
+        _diagnostics,
+        "write_native_pair_evidence",
+        publish_replace_one_then_change_source,
+    )
+    budget = ImageArtifactBudget(1024 * 1024 * 1024)
+
+    findings, diagnostic_errors = diagnose_image_assets(
+        assets,
+        str(out),
+        artifact_budget=budget,
+    )
+
+    assert findings == []
+    assert diagnostic_errors == [{
+        "file": "Fig1.png",
+        "error": "image evidence unavailable: registered image changed after scoring",
+    }]
+    assert concurrent_final is not None
+    assert concurrent_final.is_symlink()
+    assert concurrent_final.readlink() == concurrent_target
+    assert concurrent_target.read_bytes() == concurrent_bytes
+    evidence_entries = list((out / "images" / "evidence").iterdir())
+    assert evidence_entries == [concurrent_final]
+    visible_bytes = sum(
+        path.stat().st_size
+        for path in (out / "images").rglob("*")
+        if stat.S_ISREG(path.lstat().st_mode)
+    )
+    assert budget.used_bytes == visible_bytes
 
 
 def test_diagnostic_evidence_respects_remaining_total_artifact_budget(

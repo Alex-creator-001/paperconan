@@ -11,6 +11,8 @@ import sys
 
 import pytest
 
+pytest.importorskip("cv2")
+
 from paperconan import scan_dir
 from paperconan import _audit
 from paperconan._html import write_html_report

@@ -124,12 +124,12 @@ git commit -m "fix(fetch): bound redirects and API responses"
 - Consumes: registered assets, bounded panel proposals, scan-wide comparison and finding caps
 - Produces: eight transform variants, margin-trimmed structural scoring, typed source-integrity failures, and findings that survive other evidence failures
 
-- [ ] Add failing tests for vertical/transpose transforms, offset duplicated content, the reviewed non-duplicate calibration case, budget-limited evidence, and source replacement after scoring.
-- [ ] Run focused tests and confirm recall, calibration, and evidence behavior fail as reviewed.
-- [ ] Trim low-information margins for scoring only, combine intensity and edge agreement without lowering the finding threshold, and add all dihedral transforms.
-- [ ] Add a typed source-integrity evidence failure; emit `evidence: null` for other evidence failures only when the scored source remains stable, and suppress findings after source replacement.
-- [ ] State that deterministic comparisons are within one asset, image profile fields are informational and not prefiltered, and cross-asset review belongs to the external Agent.
-- [ ] Run image diagnostics/report/workflow tests and commit.
+- [x] Add failing tests for vertical/transpose transforms, offset duplicated content, the reviewed non-duplicate calibration case, budget-limited evidence, and source replacement after scoring.
+- [x] Run focused tests and confirm recall, calibration, and evidence behavior fail as reviewed.
+- [x] Trim low-information margins for scoring only, combine intensity and edge agreement without lowering the finding threshold, and add all dihedral transforms.
+- [x] Add a typed source-integrity evidence failure; emit `evidence: null` for other evidence failures only when the scored source remains stable, and suppress findings after source replacement.
+- [x] State that deterministic comparisons are within one asset, image profile fields are informational and not prefiltered, and cross-asset review belongs to the external Agent.
+- [x] Run image diagnostics/report/workflow tests and commit.
 
 Run:
 
@@ -154,10 +154,11 @@ git commit -m "fix(image): calibrate deterministic similarity hints"
 - Consumes: Pillow decoding and no-replace asset publication
 - Produces: unchanged host Pillow globals, actionable preview mismatch errors, and partial-install-safe tests
 
-- [ ] Add failing tests that `Image.MAX_IMAGE_PIXELS` is unchanged and preview-only mismatch errors include deterministic remediation.
-- [ ] Run focused tests and confirm current behavior mutates the global and lacks remediation.
-- [ ] Remove the process-global mutation, add bounded remediation text, and add the cv2 import skip to the dependency test module.
-- [ ] Run all image tests and commit.
+- [x] Add failing tests that `Image.MAX_IMAGE_PIXELS` is unchanged and preview-only mismatch errors include deterministic remediation.
+- [x] Run focused tests and confirm current behavior mutates the global and lacks remediation.
+- [x] Remove the process-global mutation, add bounded remediation text, and add the cv2 import skip to the dependency test module.
+- [x] Roll back every finding for an asset when its scored source changes, clean only identity-matching evidence, and resynchronize the artifact budget.
+- [x] Run all image tests and commit.
 
 Run:
 

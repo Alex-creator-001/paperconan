@@ -100,7 +100,6 @@ def _load_pillow(max_image_pixels: int):
         raise ImageDependencyError(
             'image support requires `pip install "paperconan[image]"`'
         ) from exc
-    Image.MAX_IMAGE_PIXELS = max_image_pixels
     return Image, ImageOps
 
 
@@ -676,6 +675,12 @@ def _existing_asset_matches_staged(
                 f"because it changed during verification: {relative_name}"
             )
         if not matches:
+            if relative_name.startswith("images/preview/"):
+                raise _AssetPublicationRecoveryError(
+                    f"delete {relative_name} and rescan if the native asset "
+                    "still matches the source; image asset publication retained "
+                    "the existing preview because it differs from prepared output"
+                )
             raise _AssetPublicationRecoveryError(
                 "image asset publication retained existing visible entry "
                 f"because it differs from prepared output: {relative_name}"
