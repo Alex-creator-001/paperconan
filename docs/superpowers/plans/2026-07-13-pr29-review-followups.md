@@ -59,10 +59,10 @@ git commit -m "fix(report): enforce neutral language at CLI boundaries"
 - Consumes: existing archive reconciliation and `download_candidate`
 - Produces: per-archive skipped outcomes, reserved sidecar filtering, and visible sidecar failures
 
-- [ ] Add failing tests for unsupported/encrypted/corrupt ZIP processing, truncated TAR/gzip processing, a remote reserved sidecar name, and a sidecar write returning unavailable.
-- [ ] Run the focused tests and confirm the exceptions currently escape or the provenance outcome is incorrect.
-- [ ] Add explicit ZIP/TAR exception tuples, skip the reserved basename before publication, and record a warning when sidecar publication returns unavailable.
-- [ ] Run fetch tests and commit.
+- [x] Add failing tests for unsupported/encrypted/corrupt ZIP processing, truncated TAR/gzip processing, a remote reserved sidecar name, and a sidecar write returning unavailable.
+- [x] Run the focused tests and confirm the exceptions currently escape or the provenance outcome is incorrect.
+- [x] Add explicit ZIP/TAR exception tuples, skip the reserved basename before publication, and record a warning when sidecar publication returns unavailable.
+- [x] Run fetch tests and commit.
 
 Run:
 
