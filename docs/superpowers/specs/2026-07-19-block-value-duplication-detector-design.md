@@ -1,7 +1,7 @@
 # 设计：block/panel 级「高精度数值重复指纹」detector
 
 - 日期：2026-07-19
-- 触发案例：JCI179845（天津医大 刘铭 Trapα），**Fig. 2B**（源数据 sheet `F2`）
+- 触发案例：一份真实 supplementary 源数据 workbook 里的一个 **5×10 生物学重复面板**（下称 Panel-2B；具体论文不入库）
 - 定位：补上「大量高精度连续值散落在本该独立的格子里精确重复」这类**分布式重复指纹**的检测缺口。与既有的
   `detect_within_column_patterns`（单列内部重复）互补，是纯**加法**改动。
 
@@ -46,7 +46,7 @@ detector 建成通用 block/panel 级检测器后可一并补上该 pubpeer-loop
 构成的"复制指纹"。
 
 **Out of scope（另立 detector，不在本 spec）：**
-- 组间**定数偏移**（3A：Con→KO 严格 +5）、**比率**（S4D：B≈1.13·A、论文24：×100）——属"组对关系"，
+- 组间**定数偏移**（如 Con→KO 严格 +c）、**比率**（如 B≈k·A、跨面板 ×100）——属"组对关系"，
   应走 `detect_relations` 的跨组扩展，与本 spec 正交。
 - 行内**小数尾复用**（论文23 尾数高频）已有 `within_col_decimal_repetition` 覆盖。
 - `find_numeric_blocks` 的 `min_rows` 床值调整（会波及全 golden，另议）。
@@ -139,14 +139,13 @@ detect_block_value_duplication(sheet, r0, r1, c0, c1, header, min_hp=12, alpha=1
 
 ### 4.1 实测发现：panel 级有真价值，但需额外的共享轴 FP 守卫（block 级完成后处理）
 
-在 10 篇批次上原型验证 panel 级（合并行区间重叠的兄弟块再打指纹）：**多抓到 13 处 block 级漏掉的真信号**，
-最强的是 p19 `Fig. 7A and 7C`（跨 5 块、m=1217、p=1e-16，正是文章指认的同队列复制）。**但同时重新暴露了
-共享轴 FP**：p19 `Fig. 2B, 2C`/`2E`/`4E` 的 `Fa`（combination-index 的 fraction-affected 剂量轴）在子面板间
-复用属良性，panel union 会把它当重复报。
+在一组真实 supplementary workbook 上原型验证 panel 级（合并行区间重叠的兄弟块再打指纹）：**多抓到若干 block 级
+漏掉的真信号**，最强的是一个跨 5 块、m=1217、p=1e-16 的整队列复制面板。**但同时重新暴露了共享轴 FP**：某些
+combination-index 的 fraction-affected 剂量轴（`Fa` 列）在子面板间复用属良性，panel union 会把它当重复报。
 
 结论：panel 级的 FP 控制**不能只沿用 block 级**——必须先做**跨兄弟块的"同一列=共享轴"抑制**（复用既有
 `cross_sheet_findings` 的 axis-like 判定 / `_demote_reused_progressions` 思路）。因此 panel 级独立于 block 级
-落地，待共享轴守卫设计确定后再实现。block 级已单独覆盖用户指定的 Fig 2B 目标。
+落地，待共享轴守卫设计确定后再实现。block 级已单独覆盖 Panel-2B 目标。
 
 ### 4.2 panel 定义与打分（实现时）
 
@@ -182,10 +181,10 @@ detect_block_value_duplication(sheet, r0, r1, c0, c1, header, min_hp=12, alpha=1
 关键点：泊松显著性同时拿下"整块复制"和"只复制几个数"（后者 fraction 极低、旧硬闸门必漏），而对粗粒度良性块
 （N_eff 小、λ 大）自动不显著。唯一样本量 floor 是 `min_hp=12`；`N_eff >= 20·m` 是**有效性**闸门（非样本量）。
 
-**真实批次验证（10 篇 JCI sdval，`N_eff/m` 判别 + 支持闸门后）：** 本 detector 独立复现文章逐条指认——
-p19 `Sup Fig.4B`(high)、p20 `Fig 2B`(high, N_eff/m=45)、p23 `Fig 7D/7G/7H`(high)、p24 `Fig 1M`(medium)、
-p27 `Fig 6T`(high)；而对 p28 `Figure 1`（2 位小数肿瘤体积 [0,2]，N_eff/m≈1–4）从 27 个误报降到 0，
-p25 从 7 个 high 降到 1。p22 正确地 0（其信号是 sum≈0 / 组间偏移的 relation 类，非重复指纹）。
+**真实批次验证（一组 supplementary sdval workbook，`N_eff/m` 判别 + 支持闸门后；逐篇结果不入库）：** 本
+detector 独立复现了这些 workbook 里被指认的重复指纹信号（含 Panel-2B 的 high, N_eff/m=45），且**有效性闸门**
+把一份 2 位小数窄域数据集（N_eff/m≈1–4）从 27 个误报降到 0；对信号本质是 sum≈0 / 组间偏移的 relation 类
+workbook 正确地 0 触发（非重复指纹）。
 
 ---
 
@@ -205,7 +204,7 @@ p25 从 7 个 high 降到 1。p22 正确地 0（其信号是 sum≈0 / 组间偏
   "p_value": 2.2e-16,
   "dup_fraction": 0.739,
   "severity": "high",
-  "repeated_values_sample": [[0.2077,5],[0.4657,5],[0.2475,5]],  // 上限 <=8 条
+  "repeated_values_sample": [[0.4813,5],[0.5127,5],[0.3388,5]],  // 合成示例；上限 <=8 条
   "example_cells": [[1,3],[1,9]],        // 1-based (row,col), <=24 条
   "severity": "high",
   "rule": "block 内 24 个高精度值各 >=2 次（44 个精确碰撞对，泊松期望 λ=0.39，p=2e-16）——数据不一致，请作者澄清原始记录。"
@@ -216,11 +215,11 @@ p25 从 7 个 high 降到 1。p22 正确地 0（其信号是 sum≈0 / 组间偏
 
 ## 7. 测试计划
 
-- **golden 正例**：`JCI179845 F2` 的 2B Male block（frac 0.74）必须触发 high；panel 级对该 panel 也触发。
-  固定 fixture（截取该 block 的最小数值矩阵，不含 DOI/敏感信息）。
-- **golden 负例**：2A（frac 0.15）、SF4 GTT 块、Fig1B/1E —— 必须**不**触发。
+- **正例**：一个复现 Panel-2B 结构的**合成** 5×10 面板（每行 5 值各 2 次、随机高精度值；frac~0.9）必须触发 high。
+  用合成数据而非论文真实矩阵（遵守不入库论文数据的红线）。
+- **负例**：独立高精度块、2 位小数窄域块（如体重/GTT 型）、整数块 —— 必须**不**触发。
 - **单元测试**：`n_repeated_values` / `excess` / `dup_fraction` 计算；高精度过滤把整数/1dp 排除；
-  量化粒度对 `0.4657` vs `0.46570001` 归并正确。
+  量化粒度对 `0.4813` vs `0.48130001` 归并正确。
 - **确定性**：同输入同输出（golden 依赖）。
 - 无需 brute-force oracle（指标是纯计数，非统计推断）。
 
@@ -252,5 +251,4 @@ p25 从 7 个 high 降到 1。p22 正确地 0（其信号是 sum≈0 / 组间偏
   copy-paste 漂移）；结构列签名循环每格只读一次 `cell()`；输出字段从 `positions` 派生（去掉与 6dp 网格不一致的
   4dp Counter 二次遍历）。
 
-全套 1161 passed；golden 无变化；批次结论不变（p19 S4B / p20 2B / p23 7D-7H / p24 1M / p27 2G·6T 仍独立复现，
-p28 粗粒度仍 0 误报）。
+全套 1161 passed；golden 无变化；批次结论不变（被指认的重复指纹信号仍独立复现，2 位小数窄域块仍 0 误报）。

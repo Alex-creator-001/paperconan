@@ -1594,9 +1594,9 @@ def detect_block_value_duplication(sheet, r0, r1, c0, c1, header,
     Complements the column-scoped detectors (`detect_within_column_patterns`,
     `detect_dispersed_repeats`): it aggregates ALL cells in the block, so it sees
     a copy fingerprint that is spread across different rows AND columns — the
-    signal those column detectors are structurally blind to (JCI179845 Fig 2B:
-    each row's 10 "independent replicates" are 5 distinct values each repeated
-    twice; no single column repeats).
+    signal those column detectors are structurally blind to (e.g. a 5x10 replicate
+    panel where each row's 10 "independent replicates" are 5 distinct values each
+    repeated twice; no single column repeats).
 
     FP is controlled by a Poisson birthday-significance test, not a hard
     sample-size floor: under independence the expected number of coincidental

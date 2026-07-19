@@ -1,7 +1,8 @@
 """block_value_duplication: many DISTINCT high-precision values each recurring
 across different rows/columns of ONE block — a distributed copy fingerprint the
 column-scoped detectors (within_col_value_duplication / within_col_dispersed_repeats)
-are structurally blind to (JCI179845 Fig 2B). 统计信号, not a verdict.
+are structurally blind to (a real 5x10 replicate panel: each row's 10 "independent
+replicates" are 5 distinct values each repeated twice). 统计信号, not a verdict.
 
 FP control is a Poisson birthday-significance test (no hard sample-size floor),
 so it fires on BOTH a whole-panel permuted copy (2B) and a big block where only a
@@ -97,7 +98,7 @@ def test_coarse_2decimal_narrow_range_does_not_fire():
 def test_coarse_clustered_narrow_range_does_not_fire():
     # Real-world FP class: 2-decimal tumor-volume-like values, narrow range [0,2],
     # CLUSTERED (not uniform) -> natural collisions exceed the uniform birthday
-    # model. The N_eff >= K*m validity gate must reject it (JCI186291 Figure 1).
+    # model. The N_eff >= K*m validity gate must reject it (a real 2-decimal panel).
     rng = np.random.default_rng(101)
     # clustered around a growth curve: many values land on the same 2-decimal ticks
     base = [0.1, 0.3, 0.5, 0.9, 1.2, 1.3, 1.48, 2.02]
