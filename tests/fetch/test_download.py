@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
 
 from paperconan.fetch import _download, _http
 
@@ -27,6 +28,15 @@ class _Resp(io.BytesIO):
     def __exit__(self, *a): self.close()
     def info(self): return self.headers
     def geturl(self): return self.final_url
+
+
+def _minimal_xlsx_bytes():
+    payload = io.BytesIO()
+    workbook = Workbook()
+    workbook.active["A1"] = "synthetic"
+    workbook.save(payload)
+    workbook.close()
+    return payload.getvalue()
 
 
 def test_download_file_rejects_html_error_page(monkeypatch, tmp_path):
@@ -5093,6 +5103,7 @@ def test_jci_fallback_downloads_official_table_after_archive_failure(
 ):
     page_url = "https://www.jci.org/articles/view/123456/sd/3"
     attachment_url = "https://cdn.example.test/supporting/table.xlsx"
+    xlsx_bytes = _minimal_xlsx_bytes()
 
     def stub_get_text(url, **kwargs):
         assert url == page_url
@@ -5113,11 +5124,11 @@ def test_jci_fallback_downloads_official_table_after_archive_failure(
                 "skipped_reason": "HTTP 404: Not Found",
             }
         assert url == attachment_url
-        Path(destination).write_bytes(b"synthetic xlsx")
+        Path(destination).write_bytes(xlsx_bytes)
         return {
             "ok": True,
             "path": str(destination),
-            "size": 14,
+            "size": len(xlsx_bytes),
             "content_type": (
                 "application/vnd.openxmlformats-officedocument."
                 "spreadsheetml.sheet"
@@ -5156,7 +5167,7 @@ def test_jci_fallback_downloads_official_table_after_archive_failure(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
         "asset_type": "tabular",
-        "size": 14,
+        "size": len(xlsx_bytes),
     }]
 
 
@@ -5213,3 +5224,199 @@ def test_jci_fallback_reports_no_supported_table_without_erasing_archive_failure
 
     assert "HTTP 404: Not Found" in reasons
     assert any("no supported tabular attachment" in reason for reason in reasons)
+
+
+def test_all_mode_still_tries_archive_when_direct_non_tabular_succeeds(
+    monkeypatch,
+    tmp_path,
+):
+    archive_payload = io.BytesIO()
+    with zipfile.ZipFile(archive_payload, "w") as archive:
+        archive.writestr("table.csv", b"a,b\n1,2\n")
+
+    def stub_download(url, destination, **kwargs):
+        if url.endswith("paper.pdf"):
+            payload = b"%PDF-1.7 synthetic"
+            content_type = "application/pdf"
+        else:
+            payload = archive_payload.getvalue()
+            content_type = "application/zip"
+        Path(destination).write_bytes(payload)
+        return {
+            "ok": True,
+            "path": str(destination),
+            "size": len(payload),
+            "content_type": content_type,
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "doi": "10.1000/SYNTHETIC",
+        "tabular_files": [],
+        "all_files": [{
+            "name": "paper.pdf",
+            "download_url": "https://example.test/paper.pdf",
+        }],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles",
+            "name": "PMC1_supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(
+        candidate,
+        str(tmp_path),
+        tabular_only=False,
+    )
+
+    assert sorted(Path(path).name for path in summary["downloaded"]) == [
+        "paper.pdf",
+        "table.csv",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("attachment_name", "payload", "expected_reason"),
+    [
+        (
+            "table.xlsx",
+            b"<html><body>not a workbook</body></html>",
+            "appears to be HTML",
+        ),
+        (
+            "table.xlsx",
+            b"%PDF-1.7 not a workbook",
+            "not a valid XLSX workbook",
+        ),
+        (
+            "table.csv",
+            b"%PDF-1.7 not delimited text",
+            "does not look like delimited text",
+        ),
+    ],
+)
+def test_jci_fallback_rejects_non_tabular_attachment_content(
+    monkeypatch,
+    tmp_path,
+    attachment_name,
+    payload,
+    expected_reason,
+):
+    monkeypatch.setattr(
+        _http,
+        "get_text",
+        lambda url, **kwargs: (
+            '<a href="https://cdn.example.test/supporting/'
+            f'{attachment_name}">source data</a>'
+        ),
+    )
+
+    def stub_download(url, destination, **kwargs):
+        Path(destination).write_bytes(payload)
+        return {
+            "ok": True,
+            "path": str(destination),
+            "size": len(payload),
+            "content_type": "application/octet-stream",
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "doi": "10.1172/JCI123456",
+        "tabular_files": [],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == []
+    assert any(
+        item["name"] == attachment_name
+        and expected_reason in item["reason"]
+        for item in summary["skipped"]
+    )
+
+
+def test_jci_fallback_is_not_resolved_after_direct_table_success(
+    monkeypatch,
+    tmp_path,
+):
+    def reject_resolver(*args, **kwargs):
+        raise AssertionError("successful direct table must suppress JCI fallback")
+
+    monkeypatch.setattr(_download, "_resolve_jci_tabular_files", reject_resolver)
+    monkeypatch.setattr(
+        _download,
+        "download_file",
+        lambda url, destination, **kwargs: (
+            Path(destination).write_bytes(b"a,b\n1,2\n"),
+            {
+                "ok": True,
+                "path": str(destination),
+                "size": 8,
+                "content_type": "text/csv",
+                "source_url": url,
+            },
+        )[1],
+    )
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "doi": "10.1172/JCI123456",
+        "tabular_files": [{
+            "name": "direct.csv",
+            "download_url": "https://example.test/direct.csv",
+        }],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["direct.csv"]
+
+
+def test_jci_resolver_filters_unsafe_and_non_tabular_links(monkeypatch):
+    monkeypatch.setattr(
+        _http,
+        "get_text",
+        lambda url, **kwargs: """
+            <a href="javascript:alert(1)">script</a>
+            <a href="https://user:secret@example.test/table.xlsx">credential</a>
+            <a href="/supporting/figure.pdf">figure</a>
+            <a href="/supporting/table.xlsx">table</a>
+            <a href="/supporting/table.xlsx">duplicate</a>
+        """,
+    )
+
+    files, reason = _download._resolve_jci_tabular_files({
+        "doi": "10.1172/JCI123456",
+    })
+
+    assert reason is None
+    assert files == [{
+        "name": "table.xlsx",
+        "ext": "xlsx",
+        "size": None,
+        "download_url": (
+            "https://www.jci.org/supporting/table.xlsx"
+        ),
+        "validate_tabular_content": True,
+    }]
+
+
+def test_jci_resolver_requires_ascii_doi_prefix(monkeypatch):
+    monkeypatch.setattr(
+        _http,
+        "get_text",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("non-ASCII DOI prefix must not be fetched")
+        ),
+    )
+
+    assert _download._resolve_jci_tabular_files({
+        "doi": "10.1172/JCı123456",
+    }) == ([], None)

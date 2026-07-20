@@ -71,7 +71,10 @@ _ZIP_MAX_COMMENT_BYTES = 0xFFFF
 _ZIP16_SENTINEL = 0xFFFF
 _ZIP32_SENTINEL = 0xFFFFFFFF
 _URL_POLICY_SKIP_REASON = "download URL rejected by HTTP(S) policy"
-_JCI_DOI = re.compile(r"^10\.1172/JCI(\d+)$", re.IGNORECASE)
+_JCI_DOI = re.compile(
+    r"^10\.1172/JCI(\d+)$",
+    re.IGNORECASE | re.ASCII,
+)
 _JCI_PAGE_MAX_BYTES = 2 * 1024 * 1024
 _JCI_MAX_LINKS = 4096
 
@@ -2293,7 +2296,9 @@ def _resolve_jci_tabular_files(cand) -> tuple[list[dict], str | None]:
         if asset_type(name) != "tabular" or download_url in seen_urls:
             continue
         seen_urls.add(download_url)
-        files.append(make_fileref(name, None, download_url))
+        ref = make_fileref(name, None, download_url)
+        ref["validate_tabular_content"] = True
+        files.append(ref)
         if len(files) >= _MAX_PUBLISHED_FILES_PER_CANDIDATE:
             break
     if not files:
@@ -2330,6 +2335,48 @@ def _provenance_entry(path, source_url, content_type=None, size=None):
     }
 
 
+def _tabular_content_error(name: str, data: bytes) -> str | None:
+    prefix = data.lstrip()[:512].lower()
+    if prefix.startswith(b"<!doctype html") or prefix.startswith(b"<html"):
+        return "downloaded attachment appears to be HTML, not tabular data"
+
+    kind = asset_type(name)
+    extension = os.path.splitext(name)[1].lower()
+    if extension == ".xlsx":
+        source = io.BytesIO(data)
+        try:
+            _preflight_zip_entry_count(
+                source,
+                max_entries=_MAX_RAW_ZIP_ENTRIES_PER_ARCHIVE,
+            )
+            source.seek(0, os.SEEK_SET)
+            with zipfile.ZipFile(source) as workbook:
+                members = set(workbook.namelist())
+        except (
+            OSError,
+            ValueError,
+            zipfile.BadZipFile,
+            zipfile.LargeZipFile,
+        ):
+            return "downloaded attachment is not a valid XLSX workbook"
+        if not {"[Content_Types].xml", "xl/workbook.xml"} <= members:
+            return "downloaded attachment is not a valid XLSX workbook"
+        return None
+
+    if kind == "tabular":
+        if (
+            not data
+            or b"\x00" in data[:65536]
+            or prefix.startswith((b"%pdf-", b"pk\x03\x04"))
+            or any(
+                byte < 32 and byte not in {9, 10, 12, 13}
+                for byte in data[:65536]
+            )
+        ):
+            return "downloaded attachment does not look like delimited text"
+    return None
+
+
 def _download_direct_files(
     files,
     *,
@@ -2337,7 +2384,6 @@ def _download_direct_files(
     published_outputs,
     skipped,
     provenance_files,
-    direct_asset_types,
     cardinality,
     max_bytes,
 ):
@@ -2394,6 +2440,14 @@ def _download_direct_files(
                         ),
                     })
                     continue
+                if f.get("validate_tabular_content"):
+                    content_error = _tabular_content_error(f["name"], data)
+                    if content_error is not None:
+                        skipped.append({
+                            "name": f["name"],
+                            "reason": content_error,
+                        })
+                        continue
                 try:
                     published = _write_collision_safe(
                         output,
@@ -2417,7 +2471,6 @@ def _download_direct_files(
                     continue
                 cardinality.record_publication()
                 published_outputs.append(published)
-                direct_asset_types.add(asset_type(f.get("name") or ""))
                 provenance_files.append(_provenance_entry(
                     published.filename,
                     res.get("source_url") or f.get("download_url"),
@@ -2454,7 +2507,6 @@ def download_candidate(
     with _pinned_output_directory(out_dir) as output:
         published_outputs, skipped = [], []
         provenance_files = []
-        direct_asset_types = set()
         cardinality = _CandidateCardinality(
             max_published_files=_MAX_PUBLISHED_FILES_PER_CANDIDATE,
             max_archive_members=_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE,
@@ -2465,7 +2517,6 @@ def download_candidate(
             published_outputs=published_outputs,
             skipped=skipped,
             provenance_files=provenance_files,
-            direct_asset_types=direct_asset_types,
             cardinality=cardinality,
             max_bytes=max_bytes,
         )
@@ -2489,11 +2540,14 @@ def download_candidate(
                 for entry in extracted
             )
         arch = cand.get("supplementary_archive")
-        needs_archive = not published_outputs
+        published_asset_types = {
+            asset_type(entry.filename)
+            for entry in published_outputs
+        }
+        required_archive_types = {"tabular"}
         if include_images:
-            needs_archive = needs_archive or bool(
-                {"tabular", "image", "document"} - direct_asset_types
-            )
+            required_archive_types.update({"image", "document"})
+        needs_archive = bool(required_archive_types - published_asset_types)
         if needs_archive and arch and arch.get("url"):
             extracted = _download_supplementary_archive(
                 arch,
@@ -2534,7 +2588,6 @@ def download_candidate(
                     published_outputs=published_outputs,
                     skipped=skipped,
                     provenance_files=provenance_files,
-                    direct_asset_types=direct_asset_types,
                     cardinality=cardinality,
                     max_bytes=max_bytes,
                 )

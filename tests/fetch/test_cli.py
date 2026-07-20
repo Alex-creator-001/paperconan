@@ -4,6 +4,18 @@ from pathlib import Path
 from paperconan.fetch import _cli, _download, _http
 
 
+def _minimal_xlsx_bytes():
+    import io
+    from openpyxl import Workbook
+
+    payload = io.BytesIO()
+    workbook = Workbook()
+    workbook.active["A1"] = "synthetic"
+    workbook.save(payload)
+    workbook.close()
+    return payload.getvalue()
+
+
 def test_fetch_list_prints_candidates_json(monkeypatch, capsys):
     cands = [{"cand_id": "zenodo:1", "source": "zenodo", "doi": "10.x/z",
               "title": "T", "tabular_files": [{"name": "a.xlsx"}],
@@ -199,6 +211,7 @@ def test_fetch_auto_uses_jci_fallback_after_archive_failure(
             "source data</a>"
         ),
     )
+    xlsx_bytes = _minimal_xlsx_bytes()
 
     def stub_download(url, destination, **kwargs):
         if url.endswith("/supplementaryFiles"):
@@ -207,11 +220,11 @@ def test_fetch_auto_uses_jci_fallback_after_archive_failure(
                 "path": str(destination),
                 "skipped_reason": "HTTP 404: Not Found",
             }
-        Path(destination).write_bytes(b"synthetic xlsx")
+        Path(destination).write_bytes(xlsx_bytes)
         return {
             "ok": True,
             "path": str(destination),
-            "size": 14,
+            "size": len(xlsx_bytes),
             "content_type": (
                 "application/vnd.openxmlformats-officedocument."
                 "spreadsheetml.sheet"

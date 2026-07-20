@@ -42,6 +42,23 @@ def _coordinate_sheet():
     return Sheet.from_rows(rows)
 
 
+def _sparse_coordinate_sheet():
+    rows = [
+        [f"row-{row + 1}", *_fill(17, row + 31)]
+        for row in range(18)
+    ]
+    segment = [0.5024, 0.4866, 0.2077, 0.4269]
+    rows.append([
+        "target",
+        segment[0], "gap", segment[1], "gap",
+        segment[2], "gap", segment[3],
+        9.1234, 8.2345,
+        segment[0], "gap", segment[1], "gap",
+        segment[2], "gap", segment[3],
+    ])
+    return Sheet.from_rows(rows)
+
+
 def test_detects_within_row_repeated_segment():
     # seg appears at cols 2-6 and 8-12 (non-overlapping), a spacer value between the groups.
     row = [1.785714, *SEG, 5.714286, *SEG]
@@ -68,12 +85,16 @@ def test_repeated_segment_reports_exact_excel_coordinates():
             "row": 19,
             "col_start": 2,
             "col_end": 5,
+            "columns": [2, 3, 4, 5],
+            "ranges": ["B:E"],
             "range": "B:E",
         },
         {
             "row": 19,
             "col_start": 8,
             "col_end": 11,
+            "columns": [8, 9, 10, 11],
+            "ranges": ["H:K"],
             "range": "H:K",
         },
     ]
@@ -104,6 +125,36 @@ def test_html_summary_shows_repeated_segment_coordinates(tmp_path):
 
     assert "row 19" in summary
     assert "B:E ↔ H:K" in summary
+
+
+def test_sparse_repeated_segment_reports_exact_physical_columns():
+    finding = next(
+        item
+        for item in detect_recurring_row_vectors({
+            ("synthetic.xlsx", "Fig. 2"): _sparse_coordinate_sheet(),
+        })
+        if item["kind"] == "within_row_repeated_segment"
+    )
+
+    assert finding["occurrences"] == [
+        {
+            "row": 19,
+            "col_start": 2,
+            "col_end": 8,
+            "columns": [2, 4, 6, 8],
+            "ranges": ["B", "D", "F", "H"],
+            "range": "B,D,F,H",
+        },
+        {
+            "row": 19,
+            "col_start": 11,
+            "col_end": 17,
+            "columns": [11, 13, 15, 17],
+            "ranges": ["K", "M", "O", "Q"],
+            "range": "K,M,O,Q",
+        },
+    ]
+    assert "(B,D,F,H ↔ K,M,O,Q)" in finding["rule"]
 
 
 def test_no_false_positive_on_non_repeating_row():

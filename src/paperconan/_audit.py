@@ -102,6 +102,21 @@ def trailing_decimal_digits(x, k=2):
     return frac[-k:] if len(frac) >= k else None
 
 
+def _excel_column_ranges(columns):
+    groups = []
+    for column in columns:
+        if groups and column == groups[-1][-1] + 1:
+            groups[-1].append(column)
+        else:
+            groups.append([column])
+    ranges = []
+    for group in groups:
+        start = openpyxl.utils.get_column_letter(group[0])
+        end = openpyxl.utils.get_column_letter(group[-1])
+        ranges.append(start if start == end else f"{start}:{end}")
+    return ranges
+
+
 def _decimals_of(x, cap=6):
     """Number of significant decimal places in x's shortest float repr, capped.
 
@@ -3025,12 +3040,12 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                 if len(chosen) >= 2 and max(row_freq[v] for v in vec) <= 2 * len(chosen):
                     cells = {(fname, sname, r, seq[s + o][0])
                              for s in chosen for o in range(len(vec))}
-                    source_ranges = [
-                        (seq[s][0], seq[s + len(vec) - 1][0])
+                    source_columns = [
+                        [seq[s + offset][0] for offset in range(len(vec))]
                         for s in chosen
                     ]
                     wr_cands.append((
-                        vec, fname, sname, fk, r, chosen, cells, source_ranges,
+                        vec, fname, sname, fk, r, chosen, cells, source_columns,
                     ))
             if wr_budget <= 0:
                 break
@@ -3048,19 +3063,18 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                for kc in wr_kept):
             continue
         wr_kept.append(c)
-    for vec, fn, sn, fk, r, chosen, _cells, source_ranges in wr_kept:
+    for vec, fn, sn, fk, r, chosen, _cells, source_columns in wr_kept:
         occurrences = []
-        for source_start, source_end in source_ranges:
-            col_start = source_start + 1
-            col_end = source_end + 1
+        for zero_based_columns in source_columns:
+            columns = [column + 1 for column in zero_based_columns]
+            ranges = _excel_column_ranges(columns)
             occurrences.append({
                 "row": r + 1,
-                "col_start": col_start,
-                "col_end": col_end,
-                "range": (
-                    f"{openpyxl.utils.get_column_letter(col_start)}:"
-                    f"{openpyxl.utils.get_column_letter(col_end)}"
-                ),
+                "col_start": columns[0],
+                "col_end": columns[-1],
+                "columns": columns,
+                "ranges": ranges,
+                "range": ",".join(ranges),
             })
         coordinate_text = " ↔ ".join(
             occurrence["range"]
