@@ -3025,7 +3025,13 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                 if len(chosen) >= 2 and max(row_freq[v] for v in vec) <= 2 * len(chosen):
                     cells = {(fname, sname, r, seq[s + o][0])
                              for s in chosen for o in range(len(vec))}
-                    wr_cands.append((vec, fname, sname, fk, r, chosen, cells))
+                    source_ranges = [
+                        (seq[s][0], seq[s + len(vec) - 1][0])
+                        for s in chosen
+                    ]
+                    wr_cands.append((
+                        vec, fname, sname, fk, r, chosen, cells, source_ranges,
+                    ))
             if wr_budget <= 0:
                 break
         if wr_budget <= 0:
@@ -3042,12 +3048,30 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
                for kc in wr_kept):
             continue
         wr_kept.append(c)
-    for vec, fn, sn, fk, r, chosen, _cells in wr_kept:
+    for vec, fn, sn, fk, r, chosen, _cells, source_ranges in wr_kept:
+        occurrences = []
+        for source_start, source_end in source_ranges:
+            col_start = source_start + 1
+            col_end = source_end + 1
+            occurrences.append({
+                "row": r + 1,
+                "col_start": col_start,
+                "col_end": col_end,
+                "range": (
+                    f"{openpyxl.utils.get_column_letter(col_start)}:"
+                    f"{openpyxl.utils.get_column_letter(col_end)}"
+                ),
+            })
+        coordinate_text = " ↔ ".join(
+            occurrence["range"]
+            for occurrence in occurrences
+        )
         findings.append(dict(
             kind="within_row_repeated_segment",
             file=fn, file_a=fn, file_b=fn, same_file=True,
             sheet=sn, sheet_a=sn, sheet_b=sn, same_sheet=True,
             vector=[float(v) for v in vec],
+            row=r + 1, row_idx=r, occurrences=occurrences,
             # same_position_count = matched CELLS (values x copies), consistent with the sibling
             # cross-sheet kinds, so evidence weighting isn't driven by the bare copy count.
             size_a=len(vec) * len(chosen), size_b=len(vec) * len(chosen),
@@ -3058,7 +3082,8 @@ def detect_recurring_row_vectors(grid_sheets, profile="review",
             examples=[{"value": float(v)} for v in vec],
             severity="high",
             rule=(f"the {len(vec)}-value segment {[round(float(v), 6) for v in vec]} repeats at "
-                  f"{len(chosen)} non-overlapping positions within one row of {sn}")))
+                  f"{len(chosen)} non-overlapping positions within row {r + 1} of {sn} "
+                  f"({coordinate_text})")))
         if len(findings) >= max_findings:
             break
 

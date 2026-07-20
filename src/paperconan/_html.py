@@ -369,6 +369,15 @@ def _render_finding_card(
                 f' · same-pos={_esc(f.get("same_position_count"))}'
                 f'/{_esc(min(f.get("size_a", 0), f.get("size_b", 0)))}'
             )
+        if kind == "within_row_repeated_segment" and f.get("row") is not None:
+            ranges = " ↔ ".join(
+                str(occurrence.get("range"))
+                for occurrence in f.get("occurrences") or []
+                if occurrence.get("range")
+            )
+            extra_meta += f' · row {_esc(f.get("row"))}'
+            if ranges:
+                extra_meta += f' · {_esc(ranges)}'
     else:
         evidence_html = _render_evidence_table(f.get("evidence"))
         loc = f"{_esc(file_)} :: {_esc(sheet)} · rows {_esc(block_rows)}"

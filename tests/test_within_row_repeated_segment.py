@@ -9,7 +9,7 @@ verdict — same family, same gates (>=3 distinct values, no ladders), extended 
 """
 from __future__ import annotations
 
-from paperconan import scan_dir
+from paperconan import scan_dir, write_html_report
 from paperconan._audit import detect_recurring_row_vectors
 from paperconan._sheet import Sheet
 
@@ -32,6 +32,16 @@ def _row_sheet(row, name="Supplemental Figure 2"):
     ])
 
 
+def _coordinate_sheet():
+    rows = [
+        [f"row-{row + 1}", *_fill(10, row + 11)]
+        for row in range(18)
+    ]
+    segment = [0.5024, 0.4866, 0.2077, 0.4269]
+    rows.append(["target", *segment, 9.1234, 8.2345, *segment])
+    return Sheet.from_rows(rows)
+
+
 def test_detects_within_row_repeated_segment():
     # seg appears at cols 2-6 and 8-12 (non-overlapping), a spacer value between the groups.
     row = [1.785714, *SEG, 5.714286, *SEG]
@@ -39,6 +49,61 @@ def test_detects_within_row_repeated_segment():
     wr = [f for f in findings if f["kind"] == "within_row_repeated_segment"]
     assert len(wr) == 1, f"expected one within-row repeated segment, got {findings}"
     assert wr[0]["severity"] == "high"
+
+
+def test_repeated_segment_reports_exact_excel_coordinates():
+    findings = detect_recurring_row_vectors({
+        ("synthetic.xlsx", "Fig. 2"): _coordinate_sheet(),
+    })
+    finding = next(
+        item
+        for item in findings
+        if item["kind"] == "within_row_repeated_segment"
+    )
+
+    assert finding["row"] == 19
+    assert finding["row_idx"] == 18
+    assert finding["occurrences"] == [
+        {
+            "row": 19,
+            "col_start": 2,
+            "col_end": 5,
+            "range": "B:E",
+        },
+        {
+            "row": 19,
+            "col_start": 8,
+            "col_end": 11,
+            "range": "H:K",
+        },
+    ]
+    assert "within row 19" in finding["rule"]
+    assert "(B:E ↔ H:K)" in finding["rule"]
+
+
+def test_html_summary_shows_repeated_segment_coordinates(tmp_path):
+    finding = next(
+        item
+        for item in detect_recurring_row_vectors({
+            ("synthetic.xlsx", "Fig. 2"): _coordinate_sheet(),
+        })
+        if item["kind"] == "within_row_repeated_segment"
+    )
+    report = tmp_path / "report.html"
+    write_html_report({
+        "input_dir": "synthetic",
+        "n_files": 1,
+        "relations_blocks": [],
+        "cross_sheet_findings": [finding],
+        "digit_distribution": [],
+        "decimal_endings": [],
+    }, str(report))
+
+    html = report.read_text(encoding="utf-8")
+    summary = html.split("<summary>", 1)[1].split("</summary>", 1)[0]
+
+    assert "row 19" in summary
+    assert "B:E ↔ H:K" in summary
 
 
 def test_no_false_positive_on_non_repeating_row():

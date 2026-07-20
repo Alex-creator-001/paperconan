@@ -1,5 +1,7 @@
 import json
-from paperconan.fetch import _cli
+from pathlib import Path
+
+from paperconan.fetch import _cli, _download, _http
 
 
 def test_fetch_list_prints_candidates_json(monkeypatch, capsys):
@@ -168,3 +170,64 @@ def test_fetch_images_passes_additive_option(monkeypatch, tmp_path):
     ])
     assert rc == 0
     assert captured["include_images"] is True
+
+
+def test_fetch_auto_uses_jci_fallback_after_archive_failure(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "doi": "10.1172/JCI123456",
+        "title": "Synthetic JCI paper",
+        "all_files_count": 1,
+        "match_signals": {"doi_in_related": True},
+        "tabular_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles",
+            "name": "PMC1_supplementary.zip",
+        },
+    }
+    monkeypatch.setattr(_cli, "search_all", lambda q, per_source=5: [candidate])
+    monkeypatch.setattr(
+        _http,
+        "get_text",
+        lambda url, **kwargs: (
+            '<a href="https://cdn.example.test/supporting/table.xlsx">'
+            "source data</a>"
+        ),
+    )
+
+    def stub_download(url, destination, **kwargs):
+        if url.endswith("/supplementaryFiles"):
+            return {
+                "ok": False,
+                "path": str(destination),
+                "skipped_reason": "HTTP 404: Not Found",
+            }
+        Path(destination).write_bytes(b"synthetic xlsx")
+        return {
+            "ok": True,
+            "path": str(destination),
+            "size": 14,
+            "content_type": (
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            "source_url": url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+
+    rc = _cli.fetch_main([
+        "10.1172/JCI123456",
+        "--auto",
+        "--out",
+        str(tmp_path),
+    ])
+
+    assert rc == 0
+    assert "downloaded 1 file(s)" in capsys.readouterr().out
+    assert (tmp_path / "table.xlsx").exists()

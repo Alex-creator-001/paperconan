@@ -5,6 +5,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import gzip
 import hashlib
+from html.parser import HTMLParser
 import io
 import json
 import os
@@ -22,7 +23,7 @@ import zipfile
 import zlib
 
 from . import _http
-from ._files import asset_type
+from ._files import asset_type, make_fileref
 
 # Provenance sidecar written next to downloads; read back by scan_dir to stamp scan.json.
 SOURCE_SIDECAR = "paperconan_source.json"
@@ -70,6 +71,9 @@ _ZIP_MAX_COMMENT_BYTES = 0xFFFF
 _ZIP16_SENTINEL = 0xFFFF
 _ZIP32_SENTINEL = 0xFFFFFFFF
 _URL_POLICY_SKIP_REASON = "download URL rejected by HTTP(S) policy"
+_JCI_DOI = re.compile(r"^10\.1172/JCI(\d+)$", re.IGNORECASE)
+_JCI_PAGE_MAX_BYTES = 2 * 1024 * 1024
+_JCI_MAX_LINKS = 4096
 
 
 class _UnstableRegularFileError(OSError):
@@ -94,6 +98,24 @@ class _ArchiveReadError(Exception):
 
 class _PublicationRecoveryError(OSError):
     pass
+
+
+class _JCIHrefParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.casefold() != "a" or len(self.hrefs) >= _JCI_MAX_LINKS:
+            return
+        for name, value in attrs:
+            if (
+                name.casefold() == "href"
+                and isinstance(value, str)
+                and value.strip()
+            ):
+                self.hrefs.append(value.strip())
+                return
 
 
 @dataclass(frozen=True)
@@ -2233,6 +2255,52 @@ def _write_source_sidecar(cand, out_dir, downloads=None):
                 pass
 
 
+def _resolve_jci_tabular_files(cand) -> tuple[list[dict], str | None]:
+    match = _JCI_DOI.fullmatch(str(cand.get("doi") or "").strip())
+    if match is None:
+        return [], None
+    page_url = f"https://www.jci.org/articles/view/{match.group(1)}/sd/3"
+    try:
+        page = _http.get_text(
+            page_url,
+            timeout=30,
+            max_bytes=_JCI_PAGE_MAX_BYTES,
+            allowed_origins={"https://www.jci.org"},
+        )
+        parser = _JCIHrefParser()
+        parser.feed(page)
+        parser.close()
+    except Exception as exc:
+        detail = str(exc).replace("\n", " ").strip()[:240]
+        reason = "JCI supporting-data page unavailable"
+        if detail:
+            reason += f": {detail}"
+        return [], reason
+
+    files = []
+    seen_urls = set()
+    for href in parser.hrefs:
+        try:
+            download_url = _http.resolve_http_url(
+                page_url,
+                href,
+                "JCI attachment URL is invalid",
+            )
+            path = urllib.parse.urlsplit(download_url).path
+        except (_http.URLPolicyError, ValueError):
+            continue
+        name = os.path.basename(urllib.parse.unquote(path))
+        if asset_type(name) != "tabular" or download_url in seen_urls:
+            continue
+        seen_urls.add(download_url)
+        files.append(make_fileref(name, None, download_url))
+        if len(files) >= _MAX_PUBLISHED_FILES_PER_CANDIDATE:
+            break
+    if not files:
+        return [], "JCI supporting-data page has no supported tabular attachment"
+    return files, None
+
+
 def _selected_files(cand, *, tabular_only: bool, include_images: bool) -> list[dict]:
     if not tabular_only:
         return list(cand.get("all_files") or cand.get("tabular_files") or [])
@@ -2262,6 +2330,114 @@ def _provenance_entry(path, source_url, content_type=None, size=None):
     }
 
 
+def _download_direct_files(
+    files,
+    *,
+    output,
+    published_outputs,
+    skipped,
+    provenance_files,
+    direct_asset_types,
+    cardinality,
+    max_bytes,
+):
+    for f in files:
+        if _is_reserved_source_sidecar(f["name"]):
+            skipped.append({
+                "name": f["name"],
+                "reason": _RESERVED_SOURCE_SIDECAR_REASON,
+            })
+            continue
+        if not cardinality.can_publish():
+            skipped.append({
+                "name": f["name"],
+                "reason": _published_file_limit_reason(cardinality),
+            })
+            break
+        if _paper_data_size(output) > _MAX_PAPER_BYTES:
+            skipped.append({
+                "name": f["name"],
+                "reason": "paper data exceeds per-paper cap",
+            })
+            continue
+        suffix = os.path.splitext(os.path.basename(f["name"]))[1]
+        try:
+            staging = _download_staging_file(
+                output,
+                prefix=".paperconan-download-",
+                suffix=suffix,
+            )
+        except (OSError, ValueError) as exc:
+            skipped.append({
+                "name": f["name"],
+                "reason": f"secure download staging failed: {exc}",
+            })
+            continue
+        try:
+            res = download_file(
+                f["download_url"],
+                staging,
+                max_bytes=max_bytes,
+            )
+            if res.get("ok"):
+                try:
+                    data = _read_verified_download_staging(
+                        staging,
+                        max_bytes=max_bytes,
+                    )
+                except (_UnstableRegularFileError, ValueError) as exc:
+                    skipped.append({
+                        "name": f["name"],
+                        "reason": (
+                            "downloaded file is not a stable regular file: "
+                            f"{exc}"
+                        ),
+                    })
+                    continue
+                try:
+                    published = _write_collision_safe(
+                        output,
+                        f["name"],
+                        data,
+                        _return_entry=True,
+                        max_total_bytes=_MAX_PAPER_BYTES,
+                        transient_files=(staging,),
+                    )
+                except _PaperDataLimitError as exc:
+                    skipped.append({
+                        "name": f["name"],
+                        "reason": str(exc),
+                    })
+                    continue
+                except (OSError, ValueError) as exc:
+                    skipped.append({
+                        "name": f["name"],
+                        "reason": f"secure publication failed: {exc}",
+                    })
+                    continue
+                cardinality.record_publication()
+                published_outputs.append(published)
+                direct_asset_types.add(asset_type(f.get("name") or ""))
+                provenance_files.append(_provenance_entry(
+                    published.filename,
+                    res.get("source_url") or f.get("download_url"),
+                    content_type=res.get("content_type"),
+                    size=published.size,
+                ))
+            else:
+                skipped.append({
+                    "name": f["name"],
+                    "reason": res.get("skipped_reason"),
+                })
+        finally:
+            cleanup_context = _cleanup_download_staging(staging)
+            if cleanup_context is not None:
+                skipped.append({
+                    "name": f["name"],
+                    "reason": cleanup_context,
+                })
+
+
 def download_candidate(
     cand,
     out_dir,
@@ -2283,101 +2459,16 @@ def download_candidate(
             max_published_files=_MAX_PUBLISHED_FILES_PER_CANDIDATE,
             max_archive_members=_MAX_ARCHIVE_MEMBERS_PER_CANDIDATE,
         )
-        for f in files:
-            if _is_reserved_source_sidecar(f["name"]):
-                skipped.append({
-                    "name": f["name"],
-                    "reason": _RESERVED_SOURCE_SIDECAR_REASON,
-                })
-                continue
-            if not cardinality.can_publish():
-                skipped.append({
-                    "name": f["name"],
-                    "reason": _published_file_limit_reason(cardinality),
-                })
-                break
-            if _paper_data_size(output) > _MAX_PAPER_BYTES:
-                skipped.append({
-                    "name": f["name"],
-                    "reason": "paper data exceeds per-paper cap",
-                })
-                continue
-            suffix = os.path.splitext(os.path.basename(f["name"]))[1]
-            try:
-                staging = _download_staging_file(
-                    output,
-                    prefix=".paperconan-download-",
-                    suffix=suffix,
-                )
-            except (OSError, ValueError) as exc:
-                skipped.append({
-                    "name": f["name"],
-                    "reason": f"secure download staging failed: {exc}",
-                })
-                continue
-            try:
-                res = download_file(
-                    f["download_url"],
-                    staging,
-                    max_bytes=max_bytes,
-                )
-                if res.get("ok"):
-                    try:
-                        data = _read_verified_download_staging(
-                            staging,
-                            max_bytes=max_bytes,
-                        )
-                    except (_UnstableRegularFileError, ValueError) as e:
-                        skipped.append({
-                            "name": f["name"],
-                            "reason": (
-                                "downloaded file is not a stable regular file: "
-                                f"{e}"
-                            ),
-                        })
-                        continue
-                    try:
-                        published = _write_collision_safe(
-                            output,
-                            f["name"],
-                            data,
-                            _return_entry=True,
-                            max_total_bytes=_MAX_PAPER_BYTES,
-                            transient_files=(staging,),
-                        )
-                    except _PaperDataLimitError as exc:
-                        skipped.append({
-                            "name": f["name"],
-                            "reason": str(exc),
-                        })
-                        continue
-                    except (OSError, ValueError) as exc:
-                        skipped.append({
-                            "name": f["name"],
-                            "reason": f"secure publication failed: {exc}",
-                        })
-                        continue
-                    cardinality.record_publication()
-                    published_outputs.append(published)
-                    direct_asset_types.add(asset_type(f.get("name") or ""))
-                    provenance_files.append(_provenance_entry(
-                        published.filename,
-                        res.get("source_url") or f.get("download_url"),
-                        content_type=res.get("content_type"),
-                        size=published.size,
-                    ))
-                else:
-                    skipped.append({
-                        "name": f["name"],
-                        "reason": res.get("skipped_reason"),
-                    })
-            finally:
-                cleanup_context = _cleanup_download_staging(staging)
-                if cleanup_context is not None:
-                    skipped.append({
-                        "name": f["name"],
-                        "reason": cleanup_context,
-                    })
+        _download_direct_files(
+            files,
+            output=output,
+            published_outputs=published_outputs,
+            skipped=skipped,
+            provenance_files=provenance_files,
+            direct_asset_types=direct_asset_types,
+            cardinality=cardinality,
+            max_bytes=max_bytes,
+        )
         pkg = cand.get("oa_package")
         if pkg and pkg.get("url"):
             extracted = _download_oa_package(
@@ -2422,6 +2513,31 @@ def download_candidate(
                 )
                 for entry in extracted
             )
+        has_tabular_output = any(
+            asset_type(entry.filename) == "tabular"
+            for entry in published_outputs
+        )
+        is_jci = _JCI_DOI.fullmatch(
+            str(cand.get("doi") or "").strip()
+        ) is not None
+        if not has_tabular_output and is_jci:
+            fallback_files, fallback_reason = _resolve_jci_tabular_files(cand)
+            if fallback_reason is not None:
+                skipped.append({
+                    "name": "JCI supporting data",
+                    "reason": fallback_reason,
+                })
+            if fallback_files:
+                _download_direct_files(
+                    fallback_files,
+                    output=output,
+                    published_outputs=published_outputs,
+                    skipped=skipped,
+                    provenance_files=provenance_files,
+                    direct_asset_types=direct_asset_types,
+                    cardinality=cardinality,
+                    max_bytes=max_bytes,
+                )
         by_file = {}
         for entry in provenance_files:
             by_file.setdefault(entry["file"], entry)

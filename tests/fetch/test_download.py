@@ -5085,3 +5085,131 @@ def test_unavailable_sidecar_publication_is_reported(monkeypatch, tmp_path):
         "name": _download.SOURCE_SIDECAR,
         "reason": "provenance sidecar publication unavailable",
     }]
+
+
+def test_jci_fallback_downloads_official_table_after_archive_failure(
+    monkeypatch,
+    tmp_path,
+):
+    page_url = "https://www.jci.org/articles/view/123456/sd/3"
+    attachment_url = "https://cdn.example.test/supporting/table.xlsx"
+
+    def stub_get_text(url, **kwargs):
+        assert url == page_url
+        assert kwargs["max_bytes"] == _download._JCI_PAGE_MAX_BYTES
+        assert kwargs["allowed_origins"] == {"https://www.jci.org"}
+        return (
+            '<html><body><a href="//cdn.example.test/supporting/table.xlsx">'
+            "download table</a></body></html>"
+        )
+
+    monkeypatch.setattr(_http, "get_text", stub_get_text)
+
+    def stub_download(url, destination, **kwargs):
+        if url.endswith("/supplementaryFiles"):
+            return {
+                "ok": False,
+                "path": str(destination),
+                "skipped_reason": "HTTP 404: Not Found",
+            }
+        assert url == attachment_url
+        Path(destination).write_bytes(b"synthetic xlsx")
+        return {
+            "ok": True,
+            "path": str(destination),
+            "size": 14,
+            "content_type": (
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            "source_url": attachment_url,
+        }
+
+    monkeypatch.setattr(_download, "download_file", stub_download)
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "doi": "10.1172/JCI123456",
+        "title": "Synthetic JCI paper",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles",
+            "name": "PMC1_supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    sidecar = json.loads(
+        (tmp_path / _download.SOURCE_SIDECAR).read_text(encoding="utf-8")
+    )
+
+    assert [Path(path).name for path in summary["downloaded"]] == ["table.xlsx"]
+    assert any(
+        item["name"] == "PMC1_supplementary.zip"
+        and item["reason"] == "HTTP 404: Not Found"
+        for item in summary["skipped"]
+    )
+    assert sidecar["downloads"] == [{
+        "file": "table.xlsx",
+        "source_url": attachment_url,
+        "content_type": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        "asset_type": "tabular",
+        "size": 14,
+    }]
+
+
+def test_non_jci_candidate_never_resolves_jci_fallback(monkeypatch, tmp_path):
+    def reject_resolver(*args, **kwargs):
+        raise AssertionError("non-JCI DOI must not invoke the JCI resolver")
+
+    monkeypatch.setattr(_download, "_resolve_jci_tabular_files", reject_resolver)
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "doi": "10.1000/SYNTHETIC",
+        "tabular_files": [],
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+
+    assert summary["downloaded"] == []
+
+
+def test_jci_fallback_reports_no_supported_table_without_erasing_archive_failure(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        _http,
+        "get_text",
+        lambda url, **kwargs: (
+            '<html><body><a href="/files/figure.pdf">figure</a></body></html>'
+        ),
+    )
+    monkeypatch.setattr(
+        _download,
+        "download_file",
+        lambda url, destination, **kwargs: {
+            "ok": False,
+            "path": str(destination),
+            "skipped_reason": "HTTP 404: Not Found",
+        },
+    )
+    candidate = {
+        "cand_id": "europepmc:PMC1",
+        "source": "europepmc",
+        "doi": "10.1172/jci123456",
+        "tabular_files": [],
+        "supplementary_archive": {
+            "url": "https://example.test/supplementaryFiles",
+            "name": "PMC1_supplementary.zip",
+        },
+    }
+
+    summary = _download.download_candidate(candidate, str(tmp_path))
+    reasons = [item["reason"] for item in summary["skipped"]]
+
+    assert "HTTP 404: Not Found" in reasons
+    assert any("no supported tabular attachment" in reason for reason in reasons)
