@@ -915,6 +915,11 @@ _SHORT_ROW_MIN_SIGFIGS = int(os.environ.get("PAPERCONAN_SHORT_ROW_MIN_SIGFIGS", 
 # Tighter than _ROW_REL_RTOL: a short ratio run has fewer cells to corroborate the
 # constant, so the constancy must be crisp to stay clear of chance.
 _SHORT_ROW_RTOL = float(os.environ.get("PAPERCONAN_SHORT_ROW_RTOL", "1e-4"))
+# A constant ratio between two ADJACENT rows is a smooth-curve step only when it spans ~the
+# whole row (every column scales together). A run over a proper sub-range is a copied+scaled
+# segment, not a curve — so the low-divisor pass fires only on runs BELOW this fraction of the
+# comparable (both-finite) columns.
+_SHORT_ROW_WHOLE_FRAC = float(os.environ.get("PAPERCONAN_SHORT_ROW_WHOLE_FRAC", "0.85"))
 # Per-sheet cap on high-precision candidate rows (bounds the O(rows^2) pair loop).
 _SHORT_ROW_MAX_ROWS_PER_SHEET = int(os.environ.get("PAPERCONAN_SHORT_ROW_MAX_ROWS", "400"))
 # A run value that recurs often across the sheet is QUANTIZED (a k/19 normalization grid,
@@ -3343,14 +3348,17 @@ def _longest_hp_identical_run(a, b):
     return best_len, a[best_start:best_start + best_len].astype(float)
 
 
-def _longest_hp_ratio_run(a, b):
-    """Longest contiguous run where b[c] == k * a[c] for a fixed k != 1, every cell
-    high-precision, k held to _SHORT_ROW_RTOL. Returns (k, run_len, x_run) or None."""
+def _scan_ratio_run(a, b, accept):
+    """Longest contiguous run where b[c] == k * a[c] for a fixed k != 1, held to
+    _SHORT_ROW_RTOL, over cells passing accept(av, bv). Shared core for the both-hp and
+    low-divisor ratio scanners so their k-anchoring / tolerance / mean-k finalization stay in
+    ONE place. Returns (k, run_len, a_run, b_run) or None; a_run is the divisor slice, b_run
+    the dividend slice."""
     best_len, best_start, best_k = 0, 0, None
     cur_len, cur_k, cur_start = 0, None, 0
     for i in range(len(a)):
         av, bv = a[i], b[i]
-        if not _is_short_hp(av) or not _is_short_hp(bv) or abs(av) <= 1e-12:
+        if math.isnan(av) or math.isnan(bv) or abs(av) <= 1e-12 or not accept(av, bv):
             cur_len, cur_k = 0, None
             continue
         r = bv / av
@@ -3362,11 +3370,36 @@ def _longest_hp_ratio_run(a, b):
             best_len, best_start, best_k = cur_len, cur_start, cur_k
     if best_len == 0 or best_k is None:
         return None
-    x_run = a[best_start:best_start + best_len].astype(float)
-    k = float(np.mean(b[best_start:best_start + best_len].astype(float) / x_run))
+    a_run = a[best_start:best_start + best_len].astype(float)
+    b_run = b[best_start:best_start + best_len].astype(float)
+    k = float(np.mean(b_run / a_run))
     if abs(k - 1.0) <= _SHORT_ROW_RTOL or abs(k) <= 1e-9:
         return None
-    return k, best_len, x_run
+    return k, best_len, a_run, b_run
+
+
+def _longest_hp_ratio_run(a, b):
+    """Longest contiguous run where b[c] == k * a[c] (k != 1), every cell high-precision.
+    Returns (k, run_len, x_run, y_run) or None (callers may use only the first three)."""
+    return _scan_ratio_run(a, b, lambda av, bv: _is_short_hp(av) and _is_short_hp(bv))
+
+
+def _lowdiv_accept(av, bv):
+    """A column may join a low-divisor ratio run iff the dividend is high-precision and the
+    divisor is a non-integer measurement. Shared by the run scanner's accept and the whole-row
+    eligibility gate so the two predicates cannot drift (the NaN / near-zero guards are applied
+    by the callers)."""
+    return _is_short_hp(bv) and av != math.floor(av)
+
+
+def _longest_lowdiv_ratio_run(divisor, dividend):
+    """Longest contiguous run where dividend[c] == k * divisor[c] (k != 1), where the DIVIDEND
+    cell is high-precision but the DIVISOR may be lower precision (non-integer). The copy-then-
+    scale case the both-sides-hp scanner drops (Group A at 4 sig figs, Group B at 6): the
+    constant exact ratio is pinned by the high-precision dividend, so one precise side suffices,
+    and the tight 1e-4 tolerance keeps a >=3-column run's chance ~(1e-4)^2. Returns
+    (k, run_len, divisor_run, dividend_run) or None. Used ONLY by the isolated low-divisor pass."""
+    return _scan_ratio_run(divisor, dividend, _lowdiv_accept)
 
 
 def _longest_hp_offset_run(a, b):
@@ -3469,6 +3502,32 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
             lo, hi = (ra, rb) if ra < rb else (rb, ra)
             return all(k in cand_idx for k in range(lo + 1, hi))
 
+        def _add_finding(a_label, b_label, a_row, b_row, kind, k, run_len, x_run):
+            rel = ("== row '{}'".format(b_label) if kind == "identical_row_reuse"
+                   else "= row '{}' + {:.6g}".format(b_label, k)
+                   if kind == "offset_row_reuse"
+                   else "= row '{}' * {:.6g}".format(b_label, k))
+            findings.append(dict(
+                kind=kind, short_run=True,
+                file=fname, file_a=fname, file_b=fname,
+                same_file=True, same_sheet=True,
+                sheet_a=sname, sheet_b=sname,
+                row_a=a_label, row_b=b_label,
+                size_a=run_len, size_b=run_len, same_position_count=run_len,
+                fraction_of_smaller=1.0, run_length=run_len,
+                ratio=(k if kind == "scaled_row_reuse" else None),
+                offset=(k if kind == "offset_row_reuse" else None),
+                figure_a=fig, figure_b=fig, same_figure=fig is not None,
+                delta={"pattern": {"identical_row_reuse": "identical_row",
+                                   "offset_row_reuse": "offset_row",
+                                   "scaled_row_reuse": "scaled_row"}[kind]},
+                block_a=f"row {a_row + 1}", block_b=f"row {b_row + 1}",
+                examples=[{"row": a_label, "col": None, "value": float(v)}
+                          for v in x_run[:5]],
+                severity="high",
+                rule=(f"row '{a_label}' {rel} over a short run of {run_len} "
+                      f"high-precision columns in {sname}")))
+
         for i in range(len(rows)):
             A = rows[i]
             for j in range(i + 1, len(rows)):
@@ -3509,34 +3568,94 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
                     kind, k, run_len, x_run = "scaled_row_reuse", ratio[0], ratio[1], ratio[2]
                 else:
                     continue
-                rel = ("== row '{}'".format(B["label"]) if kind == "identical_row_reuse"
-                       else "= row '{}' + {:.6g}".format(B["label"], k)
-                       if kind == "offset_row_reuse"
-                       else "= row '{}' * {:.6g}".format(B["label"], k))
-                findings.append(dict(
-                    kind=kind, short_run=True,
-                    file=fname, file_a=fname, file_b=fname,
-                    same_file=True, same_sheet=True,
-                    sheet_a=sname, sheet_b=sname,
-                    row_a=A["label"], row_b=B["label"],
-                    size_a=run_len, size_b=run_len, same_position_count=run_len,
-                    fraction_of_smaller=1.0, run_length=run_len,
-                    ratio=(k if kind == "scaled_row_reuse" else None),
-                    offset=(k if kind == "offset_row_reuse" else None),
-                    figure_a=fig, figure_b=fig, same_figure=fig is not None,
-                    delta={"pattern": {"identical_row_reuse": "identical_row",
-                                       "offset_row_reuse": "offset_row",
-                                       "scaled_row_reuse": "scaled_row"}[kind]},
-                    block_a=f"row {A['row'] + 1}", block_b=f"row {B['row'] + 1}",
-                    examples=[{"row": A["label"], "col": None, "value": float(v)}
-                              for v in x_run[:5]],
-                    severity="high",
-                    rule=(f"row '{A['label']}' {rel} over a short run of {run_len} "
-                          f"high-precision columns in {sname}")))
+                _add_finding(A["label"], B["label"], A["row"], B["row"],
+                             kind, k, run_len, x_run)
                 if len(findings) >= max_findings:
                     break
             if budget <= 0 or len(findings) >= max_findings:
                 break
+
+        # Second pass — isolated low-precision divisor case: B = k * A over a PARTIAL run where
+        # the divisor row A is an IMMEDIATE neighbor that is a fractional data row but not a
+        # high-precision candidate (Group A at 4 sig figs, Group B at 6). Bounded to
+        # O(candidates) and RATIO-only; it reads no shared state (candidate pool, cand_idx,
+        # freq, cap all unchanged) so identical/offset/scaled detection is untouched. Charges
+        # the SAME budget as pass 1 so total work stays bounded.
+        if len(findings) < max_findings and budget > 0:
+            sheet = grid_sheets[(fname, sname)]
+            for B in rows:                                     # hp candidates only
+                if budget <= 0:
+                    break
+                bvals = B["a"]
+                for nbr in (B["row"] - 1, B["row"] + 1):       # immediate neighbors only
+                    if nbr < 0 or nbr >= sheet.nrows or nbr in cand_idx:
+                        continue
+                    avals = sheet.numeric[nbr, :]
+                    m = min(len(avals), len(bvals))
+                    budget -= m
+                    if budget <= 0:
+                        break
+                    # A neighbor that itself qualifies as an hp candidate is NOT a low-precision
+                    # divisor: it is either already handled by the main both-hp loop (with its
+                    # _same_band curve-step guard) or was only dropped by the per-sheet candidate
+                    # cap — either way it must not be scaled here and bypass that guard.
+                    nbr_hp = [v for v in avals if _is_short_hp(v)]
+                    if len(nbr_hp) >= _SHORT_ROW_MIN_COLS and len(set(nbr_hp)) >= 3:
+                        continue
+                    frac = [v for v in avals if not math.isnan(v) and v != math.floor(v)]
+                    if len(frac) < _SHORT_ROW_MIN_COLS or len(set(round(v, 9) for v in frac)) < 3:
+                        continue                               # not a real fractional data row
+                    if _vector_is_patterned(frac):
+                        continue
+                    nlbl = _row_label(sheet, nbr, 1)
+                    if _AXIS_CONTEXT_LABEL_RE.search(nlbl):
+                        continue
+                    run = _longest_lowdiv_ratio_run(avals[:m], bvals[:m])
+                    if run is None:
+                        continue
+                    k, run_len, dv_run, yv_run = run
+                    # FP control (no sheet-wide scan): the tight 1e-4 tolerance makes a >=3-column
+                    # exact ratio ~(1e-4)^2 by chance even with a low-precision divisor; the
+                    # dividend `_rare` gate rejects a plateau/quantized DIVIDEND (and a divisor
+                    # grid scaled by k lands on a dividend grid, so it is caught there too);
+                    # `_vector_is_patterned` already dropped a progression divisor row above.
+                    # RESIDUAL (accepted): a smooth curve whose adjacent rows hold a near-constant
+                    # ratio over only a sub-range (not ~whole row) can still surface — rare under
+                    # the 1e-4 tolerance and empirically absent on the validation corpus.
+                    if (not _SHORT_ROW_MIN_COLS <= run_len < _ROW_REL_MIN_COLS  # SHORT runs only
+                            or len(np.unique(dv_run)) < 3
+                            or _near_power_of_ten(k)
+                            or not _rare(yv_run)):              # dividend (hp) not a plateau
+                        continue
+                    # partial run only: an adjacent WHOLE-row ratio is a smooth-curve step / global
+                    # rescale. "Whole-row" is judged by how many ELIGIBLE columns (both finite,
+                    # divisor non-integer) match the run's k — NOT by the longest contiguous run —
+                    # so integer gaps that merely split a whole-row scale into pieces still read as
+                    # whole-row, and a genuine copied SUB-range (some eligible columns not matching)
+                    # still reads as partial. Tolerance is 2x RTOL: run cells are anchored to the
+                    # run-START ratio (up to RTOL from the reported MEAN k), so a whole-row rescale
+                    # with ~RTOL per-column spread must not be undercounted into a false "partial".
+                    # Eligibility mirrors `_longest_lowdiv_ratio_run`'s accept predicate EXACTLY
+                    # (dividend hp, divisor finite non-integer non-zero) — a column the run scanner
+                    # could never include must not count against the whole-row fraction.
+                    elig_total = elig_match = 0
+                    for c in range(m):
+                        av, bv = avals[c], bvals[c]
+                        if (math.isnan(av) or math.isnan(bv) or abs(av) <= 1e-12
+                                or not _lowdiv_accept(av, bv)):
+                            continue
+                        elig_total += 1
+                        if abs(bv / av - k) <= 2 * _SHORT_ROW_RTOL * max(abs(k), 1e-300):
+                            elig_match += 1
+                    if elig_match >= _SHORT_ROW_WHOLE_FRAC * elig_total:
+                        continue
+                    _add_finding(nlbl, B["label"], nbr, B["row"],
+                                 "scaled_row_reuse", k, run_len, dv_run)
+                    if len(findings) >= max_findings:
+                        break
+                if len(findings) >= max_findings:
+                    break
+
         if budget <= 0 or len(findings) >= max_findings:
             break
     if budget <= 0:

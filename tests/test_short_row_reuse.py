@@ -11,6 +11,7 @@ ratio run, gated on >=5-significant-figure values so chance collisions stay
 negligible. Signal, not verdict — neutral language.
 """
 from __future__ import annotations
+import math
 
 from paperconan import scan_dir
 from paperconan._audit import detect_short_row_reuse
@@ -84,6 +85,90 @@ def test_detects_short_identical_row_across_genes():
     assert len(ident) == 1, f"expected SOX2==OCT4 identical row, got {findings}"
     assert ident[0]["run_length"] == 8
     assert {ident[0]["row_a"], ident[0]["row_b"]} == {"SOX2", "OCT4"}
+
+
+# --- low-precision divisor (isolated second pass): B = k * A over a partial run, where the
+#     divisor row A is a lower-precision ADJACENT neighbor, not a high-precision candidate. ---
+
+def test_partial_ratio_low_precision_adjacent_divisor_fires():
+    # Synthetic S4D shape: adjacent rows, B = 1.17 * A EXACTLY over a PARTIAL run (5 of 8),
+    # divisor A only 4 sig figs (never an hp candidate), dividend B high-precision. The 3
+    # non-run dividend cells are ALSO high-precision (like the real case) but at a DIFFERENT
+    # ratio, so the whole-row guard sees 5/8 eligible columns matching -> partial, not whole.
+    A = [42.13, 57.68, 31.94, 68.05, 25.47, 90.11, 33.22, 71.40]      # 4 sig figs (low prec)
+    B = [round(v * 1.17, 6) for v in A[:5]] + [88.5314, 12.8873, 44.1962]   # 1.17 on 5/8 only
+    sheet = Sheet.from_rows([["cond_A", *A], ["cond_B", *B]])
+    scaled = [f for f in detect_short_row_reuse({("f.xlsx", "S1"): sheet})
+              if f["kind"] == "scaled_row_reuse"]
+    assert len(scaled) == 1, f"expected the partial 1.17 low-divisor run, got {scaled}"
+    assert abs(scaled[0]["ratio"] - 1.17) < 1e-4 or abs(scaled[0]["ratio"] - 1 / 1.17) < 1e-4
+    assert scaled[0]["run_length"] == 5
+
+
+def test_low_divisor_long_run_not_labeled_short():
+    # A >=12-column low-divisor ratio belongs to the long-run detectors, not this "short"
+    # (3..11) one — the upper run-length gate must keep it out. (Values end in .13 so v*1.17
+    # terminates exactly and the ratio holds over all 13 columns.)
+    A = [round(i + 1.13, 2) for i in range(13)]                    # 1.13, 2.13, ... 13.13
+    B = [round(v * 1.17, 6) for v in A]                            # exact 1.17 over all 13
+    sheet = Sheet.from_rows([["cond_A", *A], ["cond_B", *B]])
+    scaled = [f for f in detect_short_row_reuse({("f.xlsx", "SL"): sheet})
+              if f["kind"] == "scaled_row_reuse"]
+    assert scaled == [], f"a 13-column run must not be reported as a short run, got {scaled}"
+
+
+def test_whole_fractional_row_with_integer_columns_suppressed():
+    # A whole-row smooth-curve step whose row has a few INTEGER columns: the integer columns
+    # must not dilute the whole-row denominator into a false "partial" run.
+    frac = [42.13, 57.68, 31.94, 68.05, 25.47]
+    A = frac[:2] + [10, 20] + frac[2:]                            # 5 fractional + 2 integer cols
+    B = [round(v * 1.17, 6) if v != math.floor(v) else v for v in A]
+    sheet = Sheet.from_rows([["a", *A], ["b", *B]])
+    assert [f for f in detect_short_row_reuse({("f.xlsx", "SW"): sheet})
+            if f["kind"] == "scaled_row_reuse"] == []
+
+
+def test_whole_row_adjacent_low_precision_ratio_suppressed():
+    # An adjacent WHOLE-row constant ratio is a smooth-curve step and stays suppressed.
+    A = [42.13, 57.68, 31.94, 68.05, 25.47]
+    B = [round(v * 1.17, 6) for v in A]                              # whole-row scale
+    sheet = Sheet.from_rows([["a", *A], ["b", *B]])
+    assert [f for f in detect_short_row_reuse({("f.xlsx", "S2"): sheet})
+            if f["kind"] == "scaled_row_reuse"] == []
+
+
+def test_non_adjacent_low_precision_divisor_not_fired():
+    # The low-divisor path only looks at IMMEDIATE neighbors: a divisor two rows away (with a
+    # blank/non-fractional row between) is out of scope and must not fire.
+    A = [42.13, 57.68, 31.94, 68.05, 25.47, 90.11, 33.22, 71.40]
+    B = [round(v * 1.17, 6) for v in A[:5]] + [51.03, 12.88, 44.19]
+    sheet = Sheet.from_rows([["cond_A", *A],
+                             ["header", None, None, None, None, None, None, None, None],
+                             ["cond_B", *B]])
+    assert [f for f in detect_short_row_reuse({("f.xlsx", "S3"): sheet})
+            if f["kind"] == "scaled_row_reuse"] == []
+
+
+def test_integer_only_divisor_not_used():
+    # An integer-only neighbor is not a fractional data row, so it cannot be a ratio divisor
+    # (integers collide by chance).
+    A = [10, 20, 30, 40, 50, 60, 70, 80]                             # integers
+    B = [round(v * 1.13, 6) for v in A[:5]] + [11.7, 3.9, 8.1]
+    sheet = Sheet.from_rows([["cond_A", *A], ["cond_B", *B]])
+    assert [f for f in detect_short_row_reuse({("f.xlsx", "S4"): sheet})
+            if f["kind"] == "scaled_row_reuse"] == []
+
+
+def test_low_divisor_pass_does_not_change_existing_hp_pairs():
+    # The second pass is additive: a normal hp-hp pair on two separated panels behaves exactly
+    # as before (one scaled finding, no duplicates from the low-divisor pass).
+    a = [12.345678, 56.789134, 34.567812, 78.912345, 23.456789]
+    b = [round(v * 0.84091, 6) for v in a]
+    sheet = Sheet.from_rows([["p1", None, None, None, None, None], ["x", *a],
+                             ["p2", None, None, None, None, None], ["y", *b]])
+    scaled = [f for f in detect_short_row_reuse({("f.xlsx", "S5"): sheet})
+              if f["kind"] == "scaled_row_reuse"]
+    assert len(scaled) == 1, f"expected exactly one hp-hp ratio finding, got {scaled}"
 
 
 def test_no_false_positive_on_small_integer_counts():
