@@ -3503,10 +3503,14 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
             return all(k in cand_idx for k in range(lo + 1, hi))
 
         def _add_finding(a_label, b_label, a_row, b_row, kind, k, run_len, x_run):
-            rel = ("== row '{}'".format(b_label) if kind == "identical_row_reuse"
-                   else "= row '{}' + {:.6g}".format(b_label, k)
-                   if kind == "offset_row_reuse"
-                   else "= row '{}' * {:.6g}".format(b_label, k))
+            # k is dividend/divisor (offset likewise), so the dividend row b = a <op> k. State
+            # the relation in that direction so the printed equation is numerically true.
+            if kind == "identical_row_reuse":
+                rel = "row '{}' == row '{}'".format(a_label, b_label)
+            elif kind == "offset_row_reuse":
+                rel = "row '{}' = row '{}' + {:.6g}".format(b_label, a_label, k)
+            else:
+                rel = "row '{}' = row '{}' * {:.6g}".format(b_label, a_label, k)
             findings.append(dict(
                 kind=kind, short_run=True,
                 file=fname, file_a=fname, file_b=fname,
@@ -3525,7 +3529,7 @@ def detect_short_row_reuse(grid_sheets, profile="review", max_findings=60):
                 examples=[{"row": a_label, "col": None, "value": float(v)}
                           for v in x_run[:5]],
                 severity="high",
-                rule=(f"row '{a_label}' {rel} over a short run of {run_len} "
+                rule=(f"{rel} over a short run of {run_len} "
                       f"high-precision columns in {sname}")))
 
         for i in range(len(rows)):

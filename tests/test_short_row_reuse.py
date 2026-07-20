@@ -103,6 +103,9 @@ def test_partial_ratio_low_precision_adjacent_divisor_fires():
     assert len(scaled) == 1, f"expected the partial 1.17 low-divisor run, got {scaled}"
     assert abs(scaled[0]["ratio"] - 1.17) < 1e-4 or abs(scaled[0]["ratio"] - 1 / 1.17) < 1e-4
     assert scaled[0]["run_length"] == 5
+    # rule must state the relation in the numerically-true direction: dividend = divisor * k,
+    # i.e. cond_B = cond_A * 1.17 (not the reversed cond_A = cond_B * 1.17).
+    assert "row 'cond_B' = row 'cond_A' *" in scaled[0]["rule"], scaled[0]["rule"]
 
 
 def test_low_divisor_long_run_not_labeled_short():
